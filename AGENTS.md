@@ -17,17 +17,21 @@ Follow the [OASA software standard](https://joinoasa.org/docs/software-standard/
 | Command | What it does |
 |---|---|
 | `cargo build --locked --bins --examples` | Build `oasa-radio` and the test relay |
-| `cargo fmt --check` and `cargo clippy --locked --all-targets -- -D warnings` | Format and lint. CI fails on warnings |
-| `cargo test --locked` | Unit tests, pseudo-terminal bridge tests, CLI tests (Linux) |
+| `cargo fmt --all --check` and `cargo clippy --locked --workspace --all-targets -- -D warnings` | Format and lint. CI fails on warnings |
+| `cargo test --locked --workspace` | Unit tests, pseudo-terminal bridge tests, CLI tests (Linux) |
 | `cargo deny --locked check` and `cargo audit` | License and advisory gates |
 | `OASA_SEC_BIN_DIR=<oasa-sec>/target/debug scripts/serial-e2e.sh` | Two real `oasa-link` processes through two serial bridges. Build oasa-sec first (`cargo build --locked --bins`) |
 | `oasa-radio bridge --radio serial --device DEV --udp-listen H:P --udp-send H:P` | Run a bridge. `oasa-radio info` lists adapters |
 
 Run all of these before every pull request. More: [README](README.md), [serial framing](docs/serial-framing.md).
 
+## Layout
+
+`src/` is the host tool. `firmware/modem-core/` is the `no_std` LoRa modem logic (in the workspace, tested on the host). `firmware/heltec-v3/` is the board crate (Xtensa, outside the workspace; see its README for the toolchain; `cargo build --release --locked` there, and `cargo deny` / `cargo fmt --check` too). Host framing and core framing must stay byte for byte equal; a test checks it.
+
 ## Adding an adapter
 
-Implement `Radio` in `src/adapters/`, register it in `src/cli.rs`, add tests and a README row. Never inspect, alter or log packet bytes (sizes and counts only). Any new crate goes in the README "Built on" table (permissive licenses only).
+Implement `Radio` in `src/adapters/`, register it in `src/cli.rs`, add tests and a README row. Never inspect, alter or log packet bytes (sizes and counts only). The one exception: `oasa-radio lora air --hex` prints captured frames for the lab, which are ciphertext. Any new crate goes in the README "Built on" table (permissive licenses only).
 
 ## Pull requests
 
