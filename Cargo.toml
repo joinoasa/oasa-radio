@@ -8,8 +8,17 @@ description = "OASA radio adapters (R-COM1): carry oasa-link's encrypted packets
 repository = "https://github.com/joinoasa/oasa-radio"
 publish = false
 
+[workspace]
+members = [".", "firmware/modem-core"]
+# The firmware has its own toolchain (Xtensa) and lock file.
+exclude = ["firmware/heltec-v3"]
+
 [dependencies]
+oasa-modem-core = { version = "0.1.0", path = "firmware/modem-core" }
 nix = { version = "0.31", default-features = false, features = ["term", "poll", "fs"] }
+
+[dev-dependencies]
+oasa-modem-core = { version = "0.1.0", path = "firmware/modem-core", features = ["sim"] }
 
 [[bin]]
 name = "oasa-radio"

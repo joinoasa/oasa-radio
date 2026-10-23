@@ -17,6 +17,7 @@ USAGE:
                     --udp-listen HOST:PORT --udp-send HOST:PORT
                     [--allow-remote-udp] [--duration SECS]
   oasa-radio info [--radio KIND [radio options]]
+  oasa-radio lora ACTION --device PATH [...]     (the OASA LoRa modem; see LORA MODEM below)
 
   --udp-listen   oasa-link's --remote points here. Packets from oasa-link go out the
                  radio. Must be a loopback address unless --allow-remote-udp is given.
@@ -33,7 +34,10 @@ RADIOS:
             --device PATH        for example /dev/ttyUSB0
             --baud N             default 57600
             --mtu BYTES          default 252, at most 65535. Give oasa-link the same --mtu.
-  lora, sdr  Planned. Not built yet.
+  lora    LoRa through the OASA modem firmware (firmware/heltec-v3): use `--radio serial
+          --baud 115200 --mtu 255` for packets and `oasa-radio lora` for settings.
+          Other LoRa boards (RNode): planned.
+  sdr     Planned. Not built yet.
 
 Prints one JSON line per event: start, drop, drops_suppressed, error. At most 10 drop lines
 a second are printed; a drops_suppressed line counts the rest. On exit prints
@@ -79,6 +83,7 @@ pub enum Command {
     Help,
     Bridge(RadioSpec, BridgeConfig),
     Info(Option<RadioSpec>),
+    Lora(crate::lora::LoraCommand),
 }
 
 /// About ten years, in seconds.
@@ -87,6 +92,16 @@ const MAX_SECS: u64 = 10 * 365 * 86_400;
 type R<T> = Result<T, String>;
 
 pub fn parse(args: &[String]) -> R<Command> {
+    if args.first().map(String::as_str) == Some("lora") {
+        if args
+            .get(1)
+            .map(String::as_str)
+            .is_none_or(|a| matches!(a, "-h" | "--help" | "help"))
+        {
+            return Ok(Command::Help);
+        }
+        return crate::lora::parse(&args[1..]).map(Command::Lora);
+    }
     let mut it = args.iter();
     let cmd = match it.next().map(String::as_str) {
         None | Some("-h" | "--help" | "help") => return Ok(Command::Help),
@@ -205,7 +220,12 @@ fn radio_spec(kind: &str, named: &mut BTreeMap<String, String>) -> R<RadioSpec> 
             )? as usize;
             Ok(RadioSpec::Serial(SerialSpec { device, baud, mtu }))
         }
-        "lora" | "sdr" => Err(format!(
+        "lora" => Err(
+            "there is no separate lora adapter: with the OASA modem firmware use --radio serial \
+             --baud 115200 --mtu 255 (settings: oasa-radio lora). RNode support is planned"
+                .to_string(),
+        ),
+        "sdr" => Err(format!(
             "radio {kind:?} is planned and not built yet; see the README (Adapters)"
         )),
         other => Err(format!("unknown radio {other:?}; use udp or serial")),

@@ -39,7 +39,7 @@ Packets from `oasa-link` arrive on `--udp-listen` and go out the radio. Packets 
 |---|---|---|
 | `udp` | Simulation (put the lab's simulated channel between two bridges), Wi-Fi, Ethernet | Works |
 | `serial` | SiK, mLRS, RFD900x, any transparent UART modem | Works. Framing: [docs/serial-framing.md](docs/serial-framing.md) |
-| `lora` | LoRa boards through RNode (KISS over USB serial) or our own firmware | Planned |
+| `lora` | Our LoRa modem firmware for the Heltec WiFi LoRa 32 V3. It speaks the serial framing: use `--radio serial --baud 115200 --mtu 255`, and `oasa-radio lora` for settings and counters | Works in simulation; real board untested. [firmware/heltec-v3](firmware/heltec-v3/README.md) |
 | `sdr` | OASA's own waveforms on SDRs | Planned |
 
 ## Quick start
@@ -102,5 +102,9 @@ CI runs both, plus `cargo fmt`, `clippy -D warnings`, `cargo deny` and `cargo au
 |---|---|---|---|
 | [nix](https://crates.io/crates/nix) | 0.31 | MIT | Safe terminal setup, `poll` and pseudo-terminals, so we need no `unsafe` for them |
 | libc, bitflags, cfg-if, cfg_aliases | via nix | MIT or Apache-2.0 | nix's own dependencies |
+| [embedded-hal](https://crates.io/crates/embedded-hal) | 1.0 | MIT or Apache-2.0 | SPI and pin traits for the `no_std` modem core |
+| esp-hal, esp-rtos, esp-bootloader-esp-idf, embassy-executor, embassy-time, embassy-futures, embassy-sync | see `firmware/heltec-v3/Cargo.toml` | MIT or Apache-2.0 | Heltec V3 firmware only (not in the host build) |
+
+`lora-phy` was looked at and not used: it reports a CRC-failed packet as good and cannot set an arbitrary sync word. The SX126x driver is in `firmware/modem-core/src/sx126x.rs`.
 
 COBS and CRC-16 are about 50 lines and are written here, with known-answer tests. `serialport` was left out: it is MPL-2.0, which our license set does not allow. The one `unsafe` block is the signal binding in `src/main.rs` (and the same in `examples/ptyrelay.rs`); everything else is `#![forbid(unsafe_code)]` or `deny`.

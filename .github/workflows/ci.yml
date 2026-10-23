@@ -16,16 +16,24 @@ jobs:
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
       - name: Format
-        run: cargo fmt --check
+        run: |
+          cargo fmt --all --check
+          (cd firmware/heltec-v3 && RUSTUP_TOOLCHAIN=stable cargo fmt --check)
       - name: Lint
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # Includes the modem core (no_std) and the host side against the real
+      # modem engine with a simulated radio.
       - name: Tests
-        run: cargo test --locked
+        run: cargo test --locked --workspace
       - name: Dependency gates (software standard v1.0)
         run: |
           cargo install --locked cargo-deny cargo-audit
           cargo deny --locked check
           cargo audit
+          # The firmware tree has its own lock file and three exceptions
+          # (firmware/heltec-v3/deny.toml).
+          (cd firmware/heltec-v3 && RUSTUP_TOOLCHAIN=stable cargo deny --locked --target xtensa-esp32s3-none-elf check)
+          cargo audit --file firmware/heltec-v3/Cargo.lock
 
   # Two real oasa-link processes through two serial bridges and a pty relay.
   serial-e2e:
@@ -42,9 +50,42 @@ jobs:
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Build oasa-sec
-        working-directory: oasa-sec
-        run: cargo build --locked --bins
+        # Move it out of this repo's Cargo workspace before building.
+        run: |
+          mv oasa-sec "$RUNNER_TEMP/oasa-sec"
+          cd "$RUNNER_TEMP/oasa-sec" && cargo build --locked --bins
       - name: Build oasa-radio
         run: cargo build --locked --bins --examples
       - name: Run
-        run: OASA_SEC_BIN_DIR="$GITHUB_WORKSPACE/oasa-sec/target/debug" scripts/serial-e2e.sh
+        run: OASA_SEC_BIN_DIR="$RUNNER_TEMP/oasa-sec/target/debug" scripts/serial-e2e.sh
+
+  # The firmware itself, for the Xtensa ESP32-S3. Needs Espressif's Rust fork,
+  # installed by espup through the esp-rs action. It has not run in CI yet, so
+  # it does not block merges; remove `continue-on-error` after the first green run.
+  firmware:
+    name: firmware build (xtensa-esp32s3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Xtensa Rust toolchain (espup)
+        uses: esp-rs/xtensa-toolchain@v1.6.0
+        with:
+          buildtargets: esp32s3
+          default: false
+      - name: Cache crates and build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            firmware/heltec-v3/target
+          key: firmware-${{ hashFiles('firmware/heltec-v3/Cargo.lock') }}
+          restore-keys: firmware-
+      - name: Build
+        working-directory: firmware/heltec-v3
+        run: cargo build --release --locked
+      - name: Size
+        working-directory: firmware/heltec-v3
+        run: ls -l target/xtensa-esp32s3-none-elf/release/oasa-lora-modem-heltec-v3

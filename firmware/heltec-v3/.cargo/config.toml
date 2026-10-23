@@ -1,0 +1,11 @@
+[target.xtensa-esp32s3-none-elf]
+# `cargo run --release` builds, flashes and opens the serial monitor.
+# The monitor shares UART0 with the modem frames, so it shows binary.
+runner = "espflash flash --chip esp32s3"
+
+[build]
+rustflags = ["-C", "link-arg=-nostartfiles"]
+target = "xtensa-esp32s3-none-elf"
+
+[unstable]
+build-std = ["core"]

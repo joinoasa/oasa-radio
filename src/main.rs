@@ -61,7 +61,7 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     match cli::parse(args)? {
         Command::Help => {
-            print!("{}", cli::USAGE);
+            print!("{}\nLORA MODEM:\n{}", cli::USAGE, oasa_radio::lora::USAGE);
             Ok(())
         }
         Command::Info(None) => {
@@ -76,7 +76,11 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     "ready",
                     "transparent serial radios: SiK, mLRS, RFD900x, UART modems",
                 ),
-                ("lora", "planned", "RNode (KISS) or our own firmware"),
+                (
+                    "lora",
+                    "ready",
+                    "OASA modem firmware (Heltec V3): --radio serial for packets, oasa-radio lora for settings. RNode planned",
+                ),
                 (
                     "sdr",
                     "planned",
@@ -106,6 +110,11 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 i.mtu
             );
             Ok(())
+        }
+        Command::Lora(c) => {
+            signals::install();
+            let mut out = std::io::stdout();
+            oasa_radio::lora::run(&c, &STOP, &mut out).map_err(Into::into)
         }
         Command::Bridge(spec, cfg) => {
             let mut radio = spec.open()?;

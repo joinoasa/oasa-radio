@@ -1,0 +1,40 @@
+# Dependency gates for the firmware. Same rules as the repo's deny.toml, plus
+# three exceptions that the esp-hal ecosystem needs. They need the owner's
+# approval (see the header of ../../deny.toml) and a software register entry.
+#
+# Run: RUSTUP_TOOLCHAIN=stable cargo deny --locked --target xtensa-esp32s3-none-elf check
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # paste is a proc-macro used by esp-hal at compile time. Nothing of it runs
+    # on the chip. Unmaintained, not a vulnerability.
+    { id = "RUSTSEC-2024-0436", reason = "build-time proc-macro in esp-hal; no code reaches the firmware" },
+    # unsafe-libyaml is reached only through esp-config's build script (it reads
+    # esp-hal's YAML config at build time). Unmaintained, not a vulnerability.
+    { id = "RUSTSEC-2024-0449", reason = "build script dependency of esp-config; no code reaches the firmware" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    # unicode-ident (a proc-macro dependency), "(MIT OR Apache-2.0) AND Unicode-3.0".
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
