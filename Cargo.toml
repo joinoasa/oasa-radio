@@ -10,3 +10,11 @@ publish = false
 
 [dependencies]
 nix = { version = "0.31", default-features = false, features = ["term", "poll", "fs"] }
+
+[[bin]]
+name = "oasa-radio"
+path = "src/main.rs"
+
+[[example]]
+name = "ptyrelay"
+path = "examples/ptyrelay.rs"
