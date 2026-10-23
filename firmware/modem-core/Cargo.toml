@@ -1,0 +1,16 @@
+[package]
+name = "oasa-modem-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "OASA LoRa modem core: serial framing, control protocol, settings, queue and SX126x driver. no_std, tested on the host."
+repository = "https://github.com/joinoasa/oasa-radio"
+publish = false
+
+[features]
+# A simulated radio and air for tests (needs std). Never enabled in firmware.
+sim = []
+
+[dependencies]
+embedded-hal = "1"
