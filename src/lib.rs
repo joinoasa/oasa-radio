@@ -5,7 +5,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adapters;
 pub mod framing;
 pub mod log;
 pub mod radio;
+pub mod relay;
 pub mod rng;
