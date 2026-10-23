@@ -1,0 +1,20 @@
+[package]
+name = "oasa-radio"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "OASA radio adapters (R-COM1): carry oasa-link's encrypted packets over UDP and serial radios"
+repository = "https://github.com/joinoasa/oasa-radio"
+publish = false
+
+[dependencies]
+nix = { version = "0.31", default-features = false, features = ["term", "poll", "fs"] }
+
+[[bin]]
+name = "oasa-radio"
+path = "src/main.rs"
+
+[[example]]
+name = "ptyrelay"
+path = "examples/ptyrelay.rs"

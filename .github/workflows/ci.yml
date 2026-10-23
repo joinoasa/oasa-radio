@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy && rustup default stable
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+      - name: Dependency gates (software standard v1.0)
+        run: |
+          cargo install --locked cargo-deny cargo-audit
+          cargo deny --locked check
+          cargo audit
+
+  # Two real oasa-link processes through two serial bridges and a pty relay.
+  serial-e2e:
+    name: serial end-to-end
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: joinoasa/oasa-sec
+          ref: main
+          path: oasa-sec
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Build oasa-sec
+        working-directory: oasa-sec
+        run: cargo build --locked --bins
+      - name: Build oasa-radio
+        run: cargo build --locked --bins --examples
+      - name: Run
+        run: OASA_SEC_BIN_DIR="$GITHUB_WORKSPACE/oasa-sec/target/debug" scripts/serial-e2e.sh
