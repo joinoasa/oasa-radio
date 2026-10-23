@@ -4,6 +4,10 @@
 //! zero from the body, so a zero byte always marks a frame edge. The length and
 //! CRC only detect line errors and let the receiver resync. They are not
 //! security: the link above authenticates every packet.
+//!
+//! A length of zero marks an **extended** frame, `00 00 | kind | n16 | body |
+//! crc16`, used by the LoRa modem for its control channel and air reports. A
+//! data frame never has length zero, so the two cannot be mixed up.
 
 /// Default largest packet (SiK radios carry 252 bytes per radio packet).
 pub const DEFAULT_MTU: usize = 252;
@@ -11,6 +15,21 @@ pub const DEFAULT_MTU: usize = 252;
 pub const MAX_MTU: usize = 65_535;
 /// Bytes added inside the COBS body: 2 length + 2 CRC.
 pub const INNER_OVERHEAD: usize = 4;
+/// Bytes an extended frame adds around its body: 2 zero, 1 kind, 2 length, 2 CRC.
+pub const EXT_OVERHEAD: usize = 7;
+/// Largest extended frame body the receiver reads.
+pub const EXT_MAX_BODY: usize = 512;
+/// Extended frame kinds (see `oasa_modem_core::frame`).
+pub use oasa_modem_core::frame::{KIND_AIR, KIND_REQUEST, KIND_RESPONSE};
+
+/// A frame taken off the line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Frame {
+    /// A packet.
+    Data(Vec<u8>),
+    /// A control or air frame.
+    Ext { kind: u8, body: Vec<u8> },
+}
 
 /// CRC-16/CCITT-FALSE: polynomial 0x1021, init 0xFFFF, no reflection, no final XOR.
 /// Check value: `crc16(b"123456789") == 0x29B1`.
@@ -108,8 +127,10 @@ impl std::error::Error for FrameError {}
 /// Frames received or rejected. `bad_frame` is the sum of the four reasons.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FrameStats {
-    /// Good frames delivered.
+    /// Good data frames delivered.
     pub frames: u64,
+    /// Good extended frames (control and air). Not counted in `bad_frame`.
+    pub ext_frames: u64,
     /// All rejected frames (noise between frames counts too).
     pub bad_frame: u64,
     /// Not valid COBS.
@@ -140,7 +161,7 @@ impl Framer {
         }
         Ok(Self {
             mtu,
-            max_body: cobs_max_len(mtu + INNER_OVERHEAD),
+            max_body: cobs_max_len((mtu + INNER_OVERHEAD).max(EXT_MAX_BODY + EXT_OVERHEAD)),
             buf: Vec::new(),
             overflow: false,
             stats: FrameStats::default(),
@@ -183,9 +204,42 @@ impl Framer {
         Ok(())
     }
 
-    /// Feed bytes from the line. Returns every packet they complete.
+    /// Append the wire frame for an extended frame to `out`.
+    pub fn encode_ext(&self, kind: u8, body: &[u8], out: &mut Vec<u8>) -> Result<(), FrameError> {
+        if body.len() > EXT_MAX_BODY {
+            return Err(FrameError::TooLarge {
+                len: body.len(),
+                mtu: EXT_MAX_BODY,
+            });
+        }
+        let mut inner = Vec::with_capacity(body.len() + EXT_OVERHEAD);
+        inner.extend_from_slice(&[0, 0, kind]);
+        // Fits: body.len() <= 512.
+        inner.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        inner.extend_from_slice(body);
+        let crc = crc16(&inner);
+        inner.extend_from_slice(&crc.to_be_bytes());
+        out.push(0);
+        cobs_encode(&inner, out);
+        out.push(0);
+        Ok(())
+    }
+
+    /// Feed bytes from the line. Returns every data packet they complete;
+    /// extended frames are counted and skipped (see [`Framer::push_frames`]).
     /// Bad frames are dropped and counted; the next zero byte resyncs.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        self.push_frames(bytes)
+            .into_iter()
+            .filter_map(|f| match f {
+                Frame::Data(p) => Some(p),
+                Frame::Ext { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Feed bytes from the line. Returns every frame they complete, in order.
+    pub fn push_frames(&mut self, bytes: &[u8]) -> Vec<Frame> {
         let mut done = Vec::new();
         for &b in bytes {
             if b != 0 {
@@ -207,9 +261,12 @@ impl Framer {
                 self.stats.oversize += 1;
             } else if !self.buf.is_empty() {
                 match self.decode_body() {
-                    Ok(p) => {
-                        self.stats.frames += 1;
-                        done.push(p);
+                    Ok(f) => {
+                        match f {
+                            Frame::Data(_) => self.stats.frames += 1,
+                            Frame::Ext { .. } => self.stats.ext_frames += 1,
+                        }
+                        done.push(f);
                     }
                     Err(r) => {
                         self.stats.bad_frame += 1;
@@ -227,23 +284,37 @@ impl Framer {
         done
     }
 
-    fn decode_body(&self) -> Result<Vec<u8>, Bad> {
+    fn decode_body(&self) -> Result<Frame, Bad> {
         let raw = cobs_decode(&self.buf).ok_or(Bad::Cobs)?;
         if raw.len() < INNER_OVERHEAD + 1 {
             return Err(Bad::Length);
         }
         let len = usize::from(u16::from_be_bytes([raw[0], raw[1]]));
-        if len + INNER_OVERHEAD != raw.len() {
+        let ext = len == 0;
+        if ext {
+            let n = raw.len();
+            if n < EXT_OVERHEAD
+                || usize::from(u16::from_be_bytes([raw[3], raw[4]])) + EXT_OVERHEAD != n
+            {
+                return Err(Bad::Length);
+            }
+        } else if len + INNER_OVERHEAD != raw.len() {
             return Err(Bad::Length);
         }
         let (body, crc) = raw.split_at(raw.len() - 2);
         if crc16(body) != u16::from_be_bytes([crc[0], crc[1]]) {
             return Err(Bad::Crc);
         }
+        if ext {
+            return Ok(Frame::Ext {
+                kind: raw[2],
+                body: raw[5..raw.len() - 2].to_vec(),
+            });
+        }
         if len > self.mtu {
             return Err(Bad::Oversize);
         }
-        Ok(raw[2..2 + len].to_vec())
+        Ok(Frame::Data(raw[2..2 + len].to_vec()))
     }
 }
 
@@ -611,5 +682,153 @@ mod tests {
         let w = frame(&f, &p);
         assert!(w.len() <= f.max_wire_len());
         assert_eq!(f.push(&w), vec![p]);
+    }
+
+    // ---- extended frames, and agreement with the firmware's codec ----
+
+    fn ext_frame(f: &Framer, kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        f.encode_ext(kind, body, &mut v).unwrap();
+        v
+    }
+
+    #[test]
+    fn extended_frames_round_trip_and_push_skips_them() {
+        let mut f = Framer::new(255).unwrap();
+        let mut rng = Rng::new(21);
+        let mut wire = Vec::new();
+        let mut want = Vec::new();
+        for i in 0..300 {
+            let body: Vec<u8> = (0..rng.below(300) as usize)
+                .map(|_| rng.next_u64() as u8)
+                .collect();
+            if i % 2 == 0 {
+                f.encode_ext(KIND_AIR, &body, &mut wire).unwrap();
+                want.push(Frame::Ext {
+                    kind: KIND_AIR,
+                    body,
+                });
+            } else if !body.is_empty() {
+                f.encode(&body, &mut wire).unwrap_or(());
+                if body.len() <= 255 {
+                    want.push(Frame::Data(body));
+                }
+            }
+        }
+        assert_eq!(f.push_frames(&wire), want);
+        assert_eq!(f.stats().bad_frame, 0);
+        let datas = want.iter().filter(|x| matches!(x, Frame::Data(_))).count();
+        assert_eq!(f.stats().frames as usize, datas);
+        assert_eq!(f.stats().ext_frames as usize, want.len() - datas);
+        // `push` gives only the data packets.
+        let mut g = Framer::new(255).unwrap();
+        let only: Vec<Vec<u8>> = want
+            .iter()
+            .filter_map(|x| match x {
+                Frame::Data(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(g.push(&wire), only);
+        assert_eq!(g.stats().bad_frame, 0);
+        assert!(f
+            .encode_ext(1, &vec![0; EXT_MAX_BODY + 1], &mut Vec::new())
+            .is_err());
+    }
+
+    #[test]
+    fn a_stray_zero_after_an_extended_frame_is_not_a_changed_frame() {
+        // CRC-16 of data followed by its own CRC is a constant, so without the
+        // length field a trailing zero would pass as a changed frame. Flip the
+        // closing delimiter to 01 and check nothing wrong is delivered.
+        let f = Framer::new(252).unwrap();
+        let w = ext_frame(&f, KIND_REQUEST, &[1, 2, 3]);
+        let mut bad = w.clone();
+        *bad.last_mut().unwrap() = 1;
+        bad.extend(frame(&f, &[9]));
+        let mut r = Framer::new(252).unwrap();
+        assert_eq!(r.push_frames(&bad), vec![Frame::Data(vec![9])]);
+    }
+
+    #[test]
+    fn extended_bit_flips_are_caught() {
+        let f = Framer::new(252).unwrap();
+        let after = frame(&f, &[1, 2, 3, 0, 4]);
+        for w in [
+            ext_frame(&f, KIND_REQUEST, &[3, 2]),
+            ext_frame(&f, KIND_AIR, &[0xFF; 100]),
+        ] {
+            let mut good = Framer::new(252).unwrap();
+            let orig = good.push_frames(&w);
+            assert_eq!(orig.len(), 1);
+            for bit in 0..w.len() * 8 {
+                let mut s = w.clone();
+                s[bit / 8] ^= 1 << (bit % 8);
+                s.extend_from_slice(&after);
+                let mut r = Framer::new(252).unwrap();
+                let got = r.push_frames(&s);
+                assert_eq!(
+                    got.last(),
+                    Some(&Frame::Data(vec![1, 2, 3, 0, 4])),
+                    "bit {bit}"
+                );
+                assert!(got.len() == 1 || got[0] == orig[0], "bit {bit}");
+            }
+        }
+    }
+
+    #[test]
+    fn host_and_firmware_codecs_agree_byte_for_byte() {
+        use oasa_modem_core::frame as core;
+        let f = Framer::new(255).unwrap();
+        let mut rng = Rng::new(22);
+        let mut out = vec![0u8; core::MAX_WIRE];
+        for _ in 0..500 {
+            let p = packet(&mut rng, 255);
+            let n = core::encode_data(&p, &mut out).unwrap();
+            assert_eq!(&out[..n], &frame(&f, &p)[..], "data {p:02x?}");
+            let kind = rng.below(255) as u8;
+            let n = core::encode_ext(kind, &p, &mut out).unwrap();
+            assert_eq!(&out[..n], &ext_frame(&f, kind, &p)[..], "ext {p:02x?}");
+        }
+        // And each reads what the other wrote.
+        let mut dec = core::Decoder::new();
+        let mut host = Framer::new(255).unwrap();
+        let mut wire = Vec::new();
+        let mut want = Vec::new();
+        for i in 0..200 {
+            let p = packet(&mut rng, 255);
+            if i % 2 == 0 {
+                f.encode(&p, &mut wire).unwrap();
+                want.push(Frame::Data(p));
+            } else {
+                f.encode_ext(7, &p, &mut wire).unwrap();
+                want.push(Frame::Ext { kind: 7, body: p });
+            }
+        }
+        let mut seen = Vec::new();
+        for &b in &wire {
+            match dec.push_byte(b) {
+                Some(core::Frame::Data(p)) => seen.push(Frame::Data(p.to_vec())),
+                Some(core::Frame::Ext { kind, body }) => seen.push(Frame::Ext {
+                    kind,
+                    body: body.to_vec(),
+                }),
+                None => {}
+            }
+        }
+        assert_eq!(seen, want);
+        assert_eq!(host.push_frames(&wire), want);
+        // The firmware encoder's output is read by the host.
+        let mut wire = Vec::new();
+        for fr in &want {
+            let n = match fr {
+                Frame::Data(p) => core::encode_data(p, &mut out).unwrap(),
+                Frame::Ext { kind, body } => core::encode_ext(*kind, body, &mut out).unwrap(),
+            };
+            wire.extend_from_slice(&out[..n]);
+        }
+        let mut host = Framer::new(255).unwrap();
+        assert_eq!(host.push_frames(&wire), want);
     }
 }

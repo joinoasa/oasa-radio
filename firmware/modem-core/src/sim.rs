@@ -101,6 +101,7 @@ impl Air {
 }
 
 /// One simulated radio.
+#[derive(Clone)]
 pub struct SimRadio {
     air: Air,
     id: usize,

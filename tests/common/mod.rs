@@ -2,6 +2,8 @@
 //! for oasa-link on the other side of it.
 #![allow(dead_code)]
 
+pub mod sim_modem;
+
 use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
