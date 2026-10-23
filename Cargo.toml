@@ -14,11 +14,11 @@ members = [".", "firmware/modem-core"]
 exclude = ["firmware/heltec-v3"]
 
 [dependencies]
-oasa-modem-core = { path = "firmware/modem-core" }
+oasa-modem-core = { version = "0.1.0", path = "firmware/modem-core" }
 nix = { version = "0.31", default-features = false, features = ["term", "poll", "fs"] }
 
 [dev-dependencies]
-oasa-modem-core = { path = "firmware/modem-core", features = ["sim"] }
+oasa-modem-core = { version = "0.1.0", path = "firmware/modem-core", features = ["sim"] }
 
 [[bin]]
 name = "oasa-radio"

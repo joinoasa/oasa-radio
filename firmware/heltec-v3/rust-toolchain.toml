@@ -1,0 +1,4 @@
+# The ESP32-S3 is an Xtensa chip, which needs Espressif's fork of Rust.
+# Install it with `espup install` (see README.md). espup names it "esp".
+[toolchain]
+channel = "esp"
