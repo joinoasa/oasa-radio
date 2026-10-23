@@ -50,12 +50,14 @@ jobs:
       - name: Toolchain
         run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: Build oasa-sec
-        working-directory: oasa-sec
-        run: cargo build --locked --bins
+        # Move it out of this repo's Cargo workspace before building.
+        run: |
+          mv oasa-sec "$RUNNER_TEMP/oasa-sec"
+          cd "$RUNNER_TEMP/oasa-sec" && cargo build --locked --bins
       - name: Build oasa-radio
         run: cargo build --locked --bins --examples
       - name: Run
-        run: OASA_SEC_BIN_DIR="$GITHUB_WORKSPACE/oasa-sec/target/debug" scripts/serial-e2e.sh
+        run: OASA_SEC_BIN_DIR="$RUNNER_TEMP/oasa-sec/target/debug" scripts/serial-e2e.sh
 
   # The firmware itself, for the Xtensa ESP32-S3. Needs Espressif's Rust fork,
   # installed by espup through the esp-rs action. It has not run in CI yet, so
