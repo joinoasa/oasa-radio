@@ -89,3 +89,16 @@ jobs:
       - name: Size
         working-directory: firmware/heltec-v3
         run: ls -l target/xtensa-esp32s3-none-elf/release/oasa-lora-modem-heltec-v3
+
+  # Validates oasa.toml. It downloads the tool from the website repo and checks node IDs against the
+  # live tech tree, so it fails until the OASA-FILES pull request merges and T-FILES1 is on the live tree.
+  oasa-toml:
+    name: oasa.toml
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate oasa.toml
+        run: |
+          curl -fsSLO https://raw.githubusercontent.com/joinoasa/website/main/tools/oasa-files/oasa_toml.py
+          python3 oasa_toml.py check --tree https://joinoasa.org/data/techtree.json
