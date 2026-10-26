@@ -1,0 +1,6 @@
+# All permissive (BSD-3-Clause / PSF-style). See README for licences.
+numpy>=2.0
+scipy>=1.13
+matplotlib>=3.8
+# test only
+pytest>=8
