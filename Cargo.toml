@@ -9,12 +9,13 @@ repository = "https://github.com/joinoasa/oasa-radio"
 publish = false
 
 [workspace]
-members = [".", "firmware/modem-core"]
+members = [".", "firmware/modem-core", "waveform"]
 # The firmware has its own toolchain (Xtensa) and lock file.
 exclude = ["firmware/heltec-v3"]
 
 [dependencies]
 oasa-modem-core = { version = "0.1.0", path = "firmware/modem-core" }
+oasa-waveform = { version = "0.1.0", path = "waveform" }
 nix = { version = "0.31", default-features = false, features = ["term", "poll", "fs"] }
 
 [dev-dependencies]
@@ -27,3 +28,8 @@ path = "src/main.rs"
 [[example]]
 name = "ptyrelay"
 path = "examples/ptyrelay.rs"
+
+# The modem's signal processing runs in the lab's debug builds and in `cargo test`; optimize
+# this one crate so Monte Carlo runs and the sliding correlator are fast there.
+[profile.dev.package.oasa-waveform]
+opt-level = 3

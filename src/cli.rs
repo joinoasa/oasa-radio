@@ -18,6 +18,7 @@ USAGE:
                     [--allow-remote-udp] [--duration SECS]
   oasa-radio info [--radio KIND [radio options]]
   oasa-radio lora ACTION --device PATH [...]     (the OASA LoRa modem; see LORA MODEM below)
+  oasa-radio waveform ber|iq|decode [...]        (OASA's own modem in simulation; see WAVEFORM below)
 
   --udp-listen   oasa-link's --remote points here. Packets from oasa-link go out the
                  radio. Must be a loopback address unless --allow-remote-udp is given.
@@ -78,12 +79,13 @@ impl RadioSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Help,
     Bridge(RadioSpec, BridgeConfig),
     Info(Option<RadioSpec>),
     Lora(crate::lora::LoraCommand),
+    Waveform(crate::waveform_cmd::WaveformCommand),
 }
 
 /// About ten years, in seconds.
@@ -101,6 +103,9 @@ pub fn parse(args: &[String]) -> R<Command> {
             return Ok(Command::Help);
         }
         return crate::lora::parse(&args[1..]).map(Command::Lora);
+    }
+    if args.first().map(String::as_str) == Some("waveform") {
+        return crate::waveform_cmd::parse(&args[1..]).map(Command::Waveform);
     }
     let mut it = args.iter();
     let cmd = match it.next().map(String::as_str) {
