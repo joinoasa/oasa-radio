@@ -7,6 +7,7 @@
 //! - [`adapters`]: `udp` and `serial`.
 //! - [`framing`]: how packets are framed on a byte stream.
 //! - [`lora`]: control of the OASA LoRa modem firmware (`oasa-radio lora`).
+//! - [`waveform_cmd`]: `oasa-radio waveform` (OASA's own modem, milestone W0; the DSP is in the `oasa-waveform` crate).
 //! - [`bridge`]: UDP on one side, a radio on the other.
 //! - [`relay`], [`rng`]: test tools (pty pairs, a lossy serial line, a seeded PRNG).
 
@@ -21,3 +22,4 @@ pub mod lora;
 pub mod radio;
 pub mod relay;
 pub mod rng;
+pub mod waveform_cmd;

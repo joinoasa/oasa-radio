@@ -61,7 +61,12 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     match cli::parse(args)? {
         Command::Help => {
-            print!("{}\nLORA MODEM:\n{}", cli::USAGE, oasa_radio::lora::USAGE);
+            print!(
+                "{}\nLORA MODEM:\n{}\n{}",
+                cli::USAGE,
+                oasa_radio::lora::USAGE,
+                oasa_radio::waveform_cmd::USAGE
+            );
             Ok(())
         }
         Command::Info(None) => {
@@ -115,6 +120,10 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             signals::install();
             let mut out = std::io::stdout();
             oasa_radio::lora::run(&c, &STOP, &mut out).map_err(Into::into)
+        }
+        Command::Waveform(c) => {
+            let mut out = std::io::stdout();
+            oasa_radio::waveform_cmd::run(&c, &mut out).map_err(Into::into)
         }
         Command::Bridge(spec, cfg) => {
             let mut radio = spec.open()?;

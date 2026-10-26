@@ -57,4 +57,9 @@ version = "0.1.0"
 dependencies = [
  "nix",
  "oasa-modem-core",
+ "oasa-waveform",
 ]
+
+[[package]]
+name = "oasa-waveform"
+version = "0.1.0"

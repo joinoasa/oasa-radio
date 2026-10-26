@@ -1,0 +1,11 @@
+[package]
+name = "oasa-waveform"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "OASA own-waveform modem (W0): 2-FSK, BPSK and QPSK with preamble sync, a channel model and theory curves. Pure Rust, no dependencies."
+repository = "https://github.com/joinoasa/oasa-radio"
+publish = false
+
+[dependencies]

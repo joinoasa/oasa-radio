@@ -27,7 +27,7 @@ Run all of these before every pull request. More: [README](README.md), [serial f
 
 ## Layout
 
-`src/` is the host tool. `firmware/modem-core/` is the `no_std` LoRa modem logic (in the workspace, tested on the host). `firmware/heltec-v3/` is the board crate (Xtensa, outside the workspace; see its README for the toolchain; `cargo build --release --locked` there, and `cargo deny` / `cargo fmt --check` too). Host framing and core framing must stay byte for byte equal; a test checks it.
+`src/` is the host tool. `waveform/` is OASA's own modem for SDRs (`oasa-waveform`: pure Rust, no dependencies, complex baseband in and out; `src/waveform_cmd.rs` is its command line; see [docs/waveform-w0.md](docs/waveform-w0.md)). `firmware/modem-core/` is the `no_std` LoRa modem logic (in the workspace, tested on the host). `firmware/heltec-v3/` is the board crate (Xtensa, outside the workspace; see its README for the toolchain; `cargo build --release --locked` there, and `cargo deny` / `cargo fmt --check` too). Host framing and core framing must stay byte for byte equal; a test checks it.
 
 ## Adding an adapter
 

@@ -170,3 +170,148 @@ fn sigterm_and_sigint_print_stats_and_exit_0() {
         );
     }
 }
+
+fn field<'a>(line: &'a str, key: &str) -> &'a str {
+    let pat = format!("\"{key}\":");
+    let i = line
+        .find(&pat)
+        .unwrap_or_else(|| panic!("no {key} in {line}"))
+        + pat.len();
+    let rest = &line[i..];
+    let end = rest.find([',', '}']).unwrap();
+    rest[..end].trim_matches('"')
+}
+
+#[test]
+fn waveform_ber_prints_json_lines_that_repeat_from_the_seed() {
+    let args = [
+        "waveform",
+        "ber",
+        "--mod",
+        "bpsk",
+        "--ebn0-db",
+        "2,4",
+        "--bits",
+        "20000",
+        "--seed",
+        "9",
+        "--json",
+    ];
+    let a = run(&args);
+    let b = run(&args);
+    assert!(a.status.success(), "{}", String::from_utf8_lossy(&a.stderr));
+    let (ta, tb) = (
+        String::from_utf8_lossy(&a.stdout).to_string(),
+        String::from_utf8_lossy(&b.stdout).to_string(),
+    );
+    let lines: Vec<&str> = ta.lines().collect();
+    assert_eq!(lines.len(), 2);
+    for (l, db) in lines.iter().zip(["2e0", "4e0"]) {
+        assert_eq!(field(l, "event"), "ber");
+        assert_eq!(field(l, "mod"), "bpsk");
+        assert_eq!(field(l, "ebn0_db"), db);
+        assert_eq!(field(l, "seed"), "9");
+        let (errors, bits): (u64, u64) = (
+            field(l, "errors").parse().unwrap(),
+            field(l, "bits").parse().unwrap(),
+        );
+        assert!(bits >= 20_000 && errors > 0 && errors < bits / 2);
+        for k in ["ber", "theory", "ci_lo", "ci_hi", "z"] {
+            field(l, k).parse::<f64>().unwrap();
+        }
+        assert_eq!(field(l, "detected"), field(l, "frames"));
+    }
+    // same seed, same numbers (the time stamp differs)
+    let strip = |t: &str| {
+        t.lines()
+            .map(|l| l.split_once(",\"event\"").unwrap().1.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(strip(&ta), strip(&tb));
+}
+
+#[test]
+fn waveform_iq_writes_a_sigmf_pair_that_decode_reads_back() {
+    let dir = std::env::temp_dir().join(format!("oasa-wf-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for m in ["bpsk", "qpsk", "fsk2"] {
+        let base = dir.join(format!("frame-{m}"));
+        let base_s = base.display().to_string();
+        let o = run(&[
+            "waveform",
+            "iq",
+            "--mod",
+            m,
+            "--out",
+            &base_s,
+            "--ebn0-db",
+            "20",
+            "--payload-hex",
+            "00ff10a5c3",
+            "--phase-deg",
+            "123",
+            "--delay",
+            "77",
+            "--frac-delay",
+            "0.4",
+            "--seed",
+            "3",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let line = String::from_utf8_lossy(&o.stdout).to_string();
+        let samples: usize = field(&line, "samples").parse().unwrap();
+        let data = std::fs::read(format!("{base_s}.sigmf-data")).unwrap();
+        assert_eq!(data.len(), samples * 8, "cf32_le is 8 bytes a sample");
+        let meta = std::fs::read_to_string(format!("{base_s}.sigmf-meta")).unwrap();
+        for want in [
+            "\"core:datatype\": \"cf32_le\"",
+            "\"core:sample_rate\": 200000.0",
+            "\"core:version\"",
+            "\"core:datetime\"",
+        ] {
+            assert!(meta.contains(want), "{want} missing from {meta}");
+        }
+        let d = run(&["waveform", "decode", "--mod", m, "--in", &base_s, "--hex"]);
+        let out = String::from_utf8_lossy(&d.stdout).to_string();
+        assert!(d.status.success());
+        let frame = out
+            .lines()
+            .find(|l| l.contains("\"event\":\"frame\""))
+            .unwrap_or_else(|| panic!("{m}: {out}"));
+        assert_eq!(field(frame, "crc_ok"), "true", "{m}");
+        assert_eq!(field(frame, "payload_hex"), "00ff10a5c3", "{m}");
+        // the wrong modulation finds nothing valid
+        let w = run(&[
+            "waveform",
+            "decode",
+            "--mod",
+            if m == "bpsk" { "fsk2" } else { "bpsk" },
+            "--in",
+            &base_s,
+        ]);
+        assert!(!String::from_utf8_lossy(&w.stdout).contains("\"crc_ok\":true"));
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn waveform_bad_arguments_fail_cleanly() {
+    for args in [
+        vec!["waveform", "ber", "--mod", "bpsk"],
+        vec!["waveform", "ber", "--mod", "16qam", "--ebn0-db", "3"],
+        vec![
+            "waveform",
+            "decode",
+            "--mod",
+            "bpsk",
+            "--in",
+            "/nonexistent/x",
+        ],
+    ] {
+        let o = run(&args);
+        assert!(!o.status.success(), "{args:?}");
+        assert!(String::from_utf8_lossy(&o.stderr).starts_with("error:"));
+    }
+    let o = run(&["waveform"]);
+    assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("WAVEFORM"));
+}
