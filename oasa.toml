@@ -1,3 +1,4 @@
+# OASA-FILES manifest: https://joinoasa.org/docs/oasa-files/
 oasa = "files/0"
 
 [project]
@@ -57,33 +58,45 @@ needs = ["cargo-audit", "network access to the advisory database"]
 # These two run on stable Rust. Building it needs the Xtensa toolchain (firmware-build below).
 [[check]]
 name = "firmware-fmt"
-run = "cd firmware/heltec-v3 && RUSTUP_TOOLCHAIN=stable cargo fmt --check"
+run = "cargo fmt --check"
+dir = "firmware/heltec-v3"
+env = { RUSTUP_TOOLCHAIN = "stable" }
 
 [[check]]
 name = "firmware-deny"
-run = "cd firmware/heltec-v3 && RUSTUP_TOOLCHAIN=stable cargo deny --locked --target xtensa-esp32s3-none-elf check && cd ../.. && cargo audit --file firmware/heltec-v3/Cargo.lock"
-needs = ["cargo-deny", "cargo-audit", "network access to the advisory database"]
+run = "cargo deny --locked --target xtensa-esp32s3-none-elf check"
+dir = "firmware/heltec-v3"
+env = { RUSTUP_TOOLCHAIN = "stable" }
+needs = ["cargo-deny"]
+
+[[check]]
+name = "firmware-audit"
+run = "cargo audit --file firmware/heltec-v3/Cargo.lock"
+needs = ["cargo-audit", "network access to the advisory database"]
 
 # T-RF3 array simulation (Python prototype). Nothing here touches the Rust code.
 [[check]]
 name = "t-rf3-pytest"
-run = "cd research/t-rf3-array && ../../.venv/bin/python -m pytest -q"
+run = "../../.venv/bin/python -m pytest -q"
+dir = "research/t-rf3-array"
 needs = ["numpy, scipy, matplotlib, pytest in .venv (the setup steps install them)"]
 
 # Two real oasa-link processes through two serial bridges. Needs oasa-sec binaries, which this
-# repo does not build: build oasa-sec first (cargo build --locked --bins) and point
-# OASA_SEC_BIN_DIR at its target/debug. CI does this in the "serial end-to-end" job.
+# repo does not build: build oasa-sec next to this repo first (cargo build --locked --bins).
+# OASA_SEC_BIN_DIR overrides where the binaries are. CI does this in the "serial end-to-end" job.
 [[check]]
 name = "serial-e2e"
-run = 'cargo build --locked --bins --examples && OASA_SEC_BIN_DIR="${OASA_SEC_BIN_DIR:-../oasa-sec/target/debug}" scripts/serial-e2e.sh'
+run = 'cargo build --locked --bins --examples && OASA_SEC_BIN_DIR="${OASA_SEC_BIN_DIR:-$OASA_ROOT_OASA_SEC/target/debug}" scripts/serial-e2e.sh'
 required = false
-needs = ["oasa-sec binaries (oasa-link, oasa-pair): clone and build joinoasa/oasa-sec, set OASA_SEC_BIN_DIR (default ../oasa-sec/target/debug)"]
+repos = ["oasa-sec"]
+needs = ["oasa-sec built with cargo build --locked --bins (oasa-link, oasa-pair)"]
 
 # The firmware itself. Not in the default dev container: it needs Espressif's Rust fork
 # (espup install; see firmware/heltec-v3/README.md).
 [[check]]
 name = "firmware-build"
-run = "cd firmware/heltec-v3 && cargo build --release --locked"
+run = "cargo build --release --locked"
+dir = "firmware/heltec-v3"
 required = false
 needs = ["Xtensa Rust toolchain (espup install)"]
 
