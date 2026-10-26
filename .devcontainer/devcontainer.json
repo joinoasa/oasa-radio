@@ -1,0 +1,16 @@
+{
+  // The default container builds, tests and lints everything except the Heltec V3 firmware.
+  // The firmware needs Espressif's Xtensa Rust fork (espup install); it is NOT in this container.
+  // See firmware/heltec-v3/README.md for that toolchain.
+  "name": "oasa-radio",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": { "version": "3.12" }
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer", "tamasfe.even-better-toml", "ms-python.python"]
+    }
+  }
+}

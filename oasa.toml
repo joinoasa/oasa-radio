@@ -1,0 +1,101 @@
+oasa = "files/0"
+
+[project]
+name = "oasa-radio"
+summary = "Radio adapters, radio settings and the OASA waveform modem"
+repo = "https://github.com/joinoasa/oasa-radio"
+license = "Apache-2.0"
+nodes = ["R-COM1", "R-COM2", "T-RF3"]
+docs = [
+  "README.md",
+  "AGENTS.md",
+  "SECURITY.md",
+  "docs/serial-framing.md",
+  "docs/waveform-w0.md",
+  "firmware/heltec-v3/README.md",
+  "research/t-rf3-array/README.md",
+]
+
+[review]
+# Not "critical" because nothing here does cryptography: adapters move ciphertext that
+# oasa-sec already encrypted, and never inspect, alter or log packet bytes. If a change ever
+# touches keys or encryption, it belongs in oasa-sec (critical).
+security = "standard"
+
+[setup]
+container = ".devcontainer/devcontainer.json"
+tools = ["rust >= 1.85", "python >= 3.11", "cargo-deny", "cargo-audit"]
+steps = [
+  "cargo build --locked --bins --examples",
+  "python3 -m venv .venv",
+  ".venv/bin/pip install -r research/t-rf3-array/requirements.txt",
+]
+
+[[check]]
+name = "fmt"
+run = "cargo fmt --all --check"
+
+[[check]]
+name = "clippy"
+run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
+
+[[check]]
+name = "test"
+run = "cargo test --locked --workspace"
+
+[[check]]
+name = "deny"
+run = "cargo deny --locked check"
+needs = ["cargo-deny"]
+
+[[check]]
+name = "audit"
+run = "cargo audit"
+needs = ["cargo-audit", "network access to the advisory database"]
+
+# The firmware crate is outside the workspace and has its own lock file and deny.toml.
+# These two run on stable Rust. Building it needs the Xtensa toolchain (firmware-build below).
+[[check]]
+name = "firmware-fmt"
+run = "cd firmware/heltec-v3 && RUSTUP_TOOLCHAIN=stable cargo fmt --check"
+
+[[check]]
+name = "firmware-deny"
+run = "cd firmware/heltec-v3 && RUSTUP_TOOLCHAIN=stable cargo deny --locked --target xtensa-esp32s3-none-elf check && cd ../.. && cargo audit --file firmware/heltec-v3/Cargo.lock"
+needs = ["cargo-deny", "cargo-audit", "network access to the advisory database"]
+
+# T-RF3 array simulation (Python prototype). Nothing here touches the Rust code.
+[[check]]
+name = "t-rf3-pytest"
+run = "cd research/t-rf3-array && ../../.venv/bin/python -m pytest -q"
+needs = ["numpy, scipy, matplotlib, pytest in .venv (the setup steps install them)"]
+
+# Two real oasa-link processes through two serial bridges. Needs oasa-sec binaries, which this
+# repo does not build: build oasa-sec first (cargo build --locked --bins) and point
+# OASA_SEC_BIN_DIR at its target/debug. CI does this in the "serial end-to-end" job.
+[[check]]
+name = "serial-e2e"
+run = 'cargo build --locked --bins --examples && OASA_SEC_BIN_DIR="${OASA_SEC_BIN_DIR:-../oasa-sec/target/debug}" scripts/serial-e2e.sh'
+required = false
+needs = ["oasa-sec binaries (oasa-link, oasa-pair): clone and build joinoasa/oasa-sec, set OASA_SEC_BIN_DIR (default ../oasa-sec/target/debug)"]
+
+# The firmware itself. Not in the default dev container: it needs Espressif's Rust fork
+# (espup install; see firmware/heltec-v3/README.md).
+[[check]]
+name = "firmware-build"
+run = "cd firmware/heltec-v3 && cargo build --release --locked"
+required = false
+needs = ["Xtensa Rust toolchain (espup install)"]
+
+# oasa-lab suites that use this repo's binaries. Run them from the oasa-lab repo with
+# OASA_RADIO_BIN_DIR=<this repo>/target/debug (and OASA_SEC_BIN_DIR for the link).
+[[lab]]
+suite = "l1-waveform-w0"
+
+[[lab]]
+suite = "l2-lora-link"
+hardware = true   # real run needs 2 LoRa modems and an RTL-SDR; OASA_LAB_SIM=1 runs it on the simulated bench
+
+[hardware]
+needed = false
+optional = ["2x Heltec LoRa V3", "RTL-SDR V4L", "Ettus E310 (T-RF3 hardware test)"]
