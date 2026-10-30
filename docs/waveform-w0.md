@@ -31,7 +31,7 @@ Overhead: 79 symbols of preamble and sync, plus 32 bits of header and CRC.
 | Sub-sample timing | PSK yes; 2-FSK to the nearest sample only | BER with random fractional delay: BPSK +0.9 %, QPSK +7 %, FSK +0.3 % over theory at 6 dB (400 000 bits, seed 3; QPSK z = +2.2) |
 | Carrier phase | Yes, any | all BER runs use a random phase per frame |
 | Gain | Yes (amplitude is estimated per frame) | test with gain 0.001 to 300 |
-| Carrier frequency offset | Default: up to about +-0.8 % of the symbol rate (detection limit). With `cfo_bins` (frequency search in 0.5 % steps): +-4 % tested. With `cfo_search` (coarse FFT search): +-2 symbol rates tested, up to half the sample rate | tables below. Residual drift over a frame is removed by the segment fit |
+| Carrier frequency offset | Default: up to about +-0.8 % of the symbol rate (detection limit). With `cfo_bins` (frequency search in 0.5 % steps): +-4 % tested. With `cfo_search` (coarse FFT search): +-2 symbol rates tested; the limit is just below half the sample rate | tables below. Residual drift over a frame is removed by the segment fit |
 | Noise | AWGN only | |
 | Several frames in one buffer | Yes, if they do not overlap | test |
 

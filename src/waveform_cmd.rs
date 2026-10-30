@@ -42,7 +42,8 @@ WAVEFORM (W0, simulation):
 
   Frequency offsets (--cfo, --cfo-random, --cfo-search) are in cycles per symbol: 1.0 is one symbol
   rate. --cfo-search MAX turns on the coarse frequency search (an FFT over the preamble) for offsets
-  up to +-MAX; it costs about 8 times the plain search. --cfo-bins is the older narrow search.
+  up to +-MAX (see docs/waveform-w0.md for its cost). --cfo-bins is the older narrow search; give
+  one or the other.
 ";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -210,6 +211,22 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
             hex: flags.iter().any(|f| f == "hex"),
         }),
     };
+    match &cmd {
+        WaveformCommand::Ber(a) => {
+            if a.cfo.abs() + a.cfo_random > half {
+                return Err(format!(
+                    "--cfo plus --cfo-random must stay within +-{half} (half the sample rate)"
+                ));
+            }
+            if a.cfo_bins > 0 && a.cfo_search > 0.0 {
+                return Err("give --cfo-bins or --cfo-search, not both".into());
+            }
+        }
+        WaveformCommand::Decode(a) if a.cfo_bins > 0 && a.cfo_search > 0.0 => {
+            return Err("give --cfo-bins or --cfo-search, not both".into());
+        }
+        _ => {}
+    }
     if let Some(k) = named.keys().next() {
         return Err(format!("unknown option --{k} for waveform {sub}"));
     }
@@ -515,6 +532,9 @@ mod tests {
             "ber --mod bpsk --ebn0-db 3 --cfo 4.5",
             "ber --mod bpsk --ebn0-db 3 --sps 4 --cfo-search 2.5",
             "ber --mod bpsk --ebn0-db 3 --cfo-random -1",
+            "ber --mod bpsk --ebn0-db 3 --cfo 3 --cfo-random 2",
+            "ber --mod bpsk --ebn0-db 3 --cfo-bins 2 --cfo-search 1",
+            "decode --mod bpsk --in x --cfo-bins 2 --cfo-search 1",
             "iq --mod bpsk",
             "iq --mod bpsk --out x --payload-hex abc",
             "iq --mod bpsk --out x --payload-hex 00 --payload-len 4",
