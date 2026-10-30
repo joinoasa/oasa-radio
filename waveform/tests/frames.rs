@@ -413,3 +413,211 @@ fn sub_sample_delay_is_handled() {
         }
     }
 }
+
+/// Receiver settings with the coarse frequency search on, to two symbol rates and a little more.
+fn wide() -> RxConfig {
+    RxConfig {
+        cfo_search: 2.05,
+        ..RxConfig::default()
+    }
+}
+
+#[test]
+fn coarse_search_decodes_across_two_symbol_rates() {
+    // Two Plutos with plain crystals can be about 46 kHz apart at 915 MHz: 1.8 symbol rates at
+    // 25 kbaud. Every frame here must decode, start at the right sample, and give its offset to
+    // within 0.2 % of the symbol rate. 0.0253 is the null of the plain correlation (two turns over
+    // the 79 reference symbols).
+    let offsets = [
+        -2.0, -1.62, -1.0, -0.37, -0.0253, 0.0, 0.0253, 0.5, 0.999, 1.31, 1.77, 2.0,
+    ];
+    for m in ALL {
+        let md = modem(m);
+        let mut ch = Channel::new(12);
+        let ebn0 = if m == Modulation::Fsk2 { 16.0 } else { 12.0 };
+        let n0 = n0_for_ebn0(ebn0, md.energy_per_bit());
+        for cfo in offsets {
+            for _ in 0..3 {
+                let payload = ch.rng().bytes(32);
+                let tx = md.modulate(&payload).unwrap();
+                let lead = 10 + ch.rng().below(190) as usize;
+                let imp = Impairments {
+                    n0,
+                    phase_rad: ch.rng().uniform() * 2.0 * PI,
+                    cfo_cycles_per_sample: cfo / 8.0,
+                    frac_delay: ch.rng().uniform(),
+                    lead,
+                    tail: 40,
+                };
+                let y = ch.apply(&tx, &imp);
+                let got = md.demodulate_with(&y, &wide());
+                assert_eq!(got.len(), 1, "{m:?} cfo {cfo}: {} frames", got.len());
+                let f = &got[0];
+                assert!(
+                    f.crc_ok && f.payload == payload,
+                    "{m:?} cfo {cfo}: bad frame"
+                );
+                assert!(
+                    f.start.abs_diff(lead) <= 1,
+                    "{m:?} cfo {cfo}: start {} not {lead}",
+                    f.start
+                );
+                let err = (f.cfo_cycles_per_symbol as f64 - cfo).abs();
+                assert!(
+                    err < 0.002,
+                    "{m:?} cfo {cfo}: estimated {}",
+                    f.cfo_cycles_per_symbol
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn coarse_search_reports_the_true_carrier_phase() {
+    // The phase is given at the frame start in the buffer as received, not after the receiver's
+    // own frequency correction.
+    let md = modem(Modulation::Bpsk);
+    let payload = vec![0x3Cu8; 24];
+    let tx = md.modulate(&payload).unwrap();
+    for (cfo, phase) in [(1.37f64, 0.4f64), (-0.81, -2.5), (0.0, 1.0)] {
+        let imp = Impairments {
+            phase_rad: phase,
+            cfo_cycles_per_sample: cfo / 8.0,
+            lead: 133,
+            tail: 20,
+            ..Default::default()
+        };
+        let y = Channel::new(1).apply(&tx, &imp);
+        let f = &md.demodulate_with(&y, &wide())[0];
+        let d = (f.phase_rad as f64 - phase)
+            .sin()
+            .atan2((f.phase_rad as f64 - phase).cos());
+        assert!(
+            d.abs() < 0.05,
+            "cfo {cfo}: phase {} not {phase}",
+            f.phase_rad
+        );
+    }
+}
+
+#[test]
+fn the_plain_receiver_misses_what_the_coarse_search_finds() {
+    let md = modem(Modulation::Qpsk);
+    let payload = vec![0x5Au8; 16];
+    let tx = md.modulate(&payload).unwrap();
+    let imp = Impairments {
+        cfo_cycles_per_sample: 1.0 / 8.0,
+        lead: 50,
+        tail: 50,
+        ..Default::default()
+    };
+    let y = Channel::new(3).apply(&tx, &imp);
+    assert!(md.demodulate(&y).iter().all(|f| !f.crc_ok));
+    let got = md.demodulate_with(&y, &wide());
+    assert!(got.len() == 1 && got[0].crc_ok && got[0].payload == payload);
+}
+
+#[test]
+fn coarse_search_separates_frames_with_their_own_offsets() {
+    for m in ALL {
+        let md = modem(m);
+        let mut ch = Channel::new(8);
+        let n0 = n0_for_ebn0(16.0, md.energy_per_bit());
+        let offsets = [-1.7f64, 0.02, 0.9, 1.95];
+        let payloads: Vec<Vec<u8>> = (0..4).map(|i| ch.rng().bytes(12 + 9 * i)).collect();
+        let mut stream = Vec::new();
+        for (p, cfo) in payloads.iter().zip(offsets) {
+            stream.extend(vec![Complex32::ZERO; 150]);
+            let tx = md.modulate(p).unwrap();
+            let imp = Impairments {
+                cfo_cycles_per_sample: cfo / 8.0,
+                phase_rad: ch.rng().uniform() * 2.0 * PI,
+                ..Default::default()
+            };
+            stream.extend(ch.apply(&tx, &imp));
+        }
+        stream.extend(vec![Complex32::ZERO; 150]);
+        ch.add_awgn(&mut stream, n0);
+        let got: Vec<Vec<u8>> = md
+            .demodulate_with(&stream, &wide())
+            .into_iter()
+            .filter(|f| f.crc_ok)
+            .map(|f| f.payload)
+            .collect();
+        assert_eq!(got, payloads, "{m:?}");
+    }
+}
+
+#[test]
+fn coarse_search_on_noise_only_gives_no_frames() {
+    // The threshold is raised so that a position passes no more often than without the search:
+    // about 6e-12. 600 000 noise samples (3 modulations): the chance of even one frame is about 4e-6.
+    for m in ALL {
+        let md = modem(m);
+        let y = Channel::new(77).noise(200_000, 1.0);
+        let got = md.demodulate_with(&y, &wide());
+        assert!(got.is_empty(), "{m:?}: {} false frames", got.len());
+    }
+}
+
+#[test]
+fn coarse_metric_follows_its_noise_bound() {
+    // Each bin is Beta(1, M-1) in noise, so a position passes t with probability at most about
+    // cells * (1-t)^(M-1). That bound is what the threshold is built on. Check it at a low t, where
+    // hits are countable, for a wide search (1-sample chunks) and a narrow one (chunked): it must
+    // hold, and not be loose by more than a factor of 2 (or the threshold costs sensitivity).
+    let md = modem(Modulation::Bpsk);
+    let y = Channel::new(31).noise(400_000, 1.0);
+    let t = 0.018f64;
+    for search in [2.05f32, 0.5] {
+        let rx = RxConfig {
+            cfo_search: search,
+            ..RxConfig::default()
+        };
+        let cs = md.coarse_search(&rx).unwrap();
+        let cm = md.coarse_metric(&y, &rx);
+        let bound = cs.cells * (1.0 - t).powi(79 * 8 - 1);
+        let measured = cm.iter().filter(|v| v.0 as f64 > t).count() as f64 / cm.len() as f64;
+        println!(
+            "search {search}: chunk {} fft {} cells {} measured {measured:e} bound {bound:e}",
+            cs.chunk, cs.fft_len, cs.cells
+        );
+        assert!(
+            measured < bound * 1.15 && measured > bound * 0.5,
+            "search {search}: measured {measured:e}, bound {bound:e}"
+        );
+        // and the threshold it sets keeps the per-position rate at the plain receiver's
+        let plain = (1.0 - 0.04f64).powi(79 * 8 - 1);
+        let ours = cs.cells * (1.0 - cs.threshold as f64).powi(79 * 8 - 1);
+        assert!((ours / plain - 1.0).abs() < 0.01, "{ours:e} vs {plain:e}");
+    }
+}
+
+#[test]
+fn coarse_search_settings() {
+    let md = modem(Modulation::Bpsk);
+    assert!(md.coarse_search(&RxConfig::default()).is_none());
+    assert!(md
+        .coarse_metric(&[Complex32::ZERO; 2000], &RxConfig::default())
+        .is_empty());
+    // wide: no chunking, FFT about 1.5 times the 632-sample window
+    let w = md.coarse_search(&wide()).unwrap();
+    assert_eq!((w.chunk, w.fft_len, w.step), (1, 1024, 2));
+    // narrow: chunks shrink the FFT
+    let n = md
+        .coarse_search(&RxConfig {
+            cfo_search: 0.1,
+            ..RxConfig::default()
+        })
+        .unwrap();
+    assert!(n.chunk > 1 && n.fft_len < w.fft_len);
+    // a search past half the sample rate is capped there
+    let c = md
+        .coarse_search(&RxConfig {
+            cfo_search: 100.0,
+            ..RxConfig::default()
+        })
+        .unwrap();
+    assert!(c.bins < c.fft_len / 2);
+}

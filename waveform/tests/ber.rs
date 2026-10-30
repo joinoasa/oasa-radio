@@ -197,3 +197,49 @@ fn random_sub_sample_delay_costs_little() {
         assert!(consistent(&p, 3.0, 0.08), "{}", show(&p));
     }
 }
+
+/// The coarse frequency search's receiver setting: two symbol rates either way, and a little more.
+fn wide_search() -> BerOptions {
+    BerOptions {
+        cfo_random: 2.0,
+        rx: oasa_waveform::RxConfig {
+            cfo_search: 2.05,
+            ..oasa_waveform::RxConfig::default()
+        },
+        ..BerOptions::default()
+    }
+}
+
+#[test]
+fn coarse_search_keeps_the_ber_across_two_symbol_rates() {
+    // Every frame gets its own offset, uniform in +-2 symbol rates. Every frame must be found,
+    // and the BER must stay on the curve (the same 5 % allowance as the 0.4 % offset test).
+    for (m, db) in [
+        (Modulation::Bpsk, 4.0),
+        (Modulation::Qpsk, 4.0),
+        (Modulation::Fsk2, 8.0),
+    ] {
+        let p = run_ber(m, db, 40_000, 51, &wide_search()).unwrap();
+        println!("cfo +-2: {}", show(&p));
+        assert_eq!(p.detected, p.frames, "missed frames: {}", show(&p));
+        assert!(consistent(&p, 3.0, 0.05), "{}", show(&p));
+    }
+}
+
+/// The issue's acceptance run: 2 million bits at Eb/N0 = 8 dB, offsets uniform in +-2 symbol
+/// rates, random sub-sample delay. Every frame found, BER within 10 % of theory. Slow: run in
+/// release with `--ignored`.
+#[test]
+#[ignore]
+fn coarse_search_long() {
+    for m in [Modulation::Bpsk, Modulation::Qpsk, Modulation::Fsk2] {
+        let opts = BerOptions {
+            random_frac_delay: true,
+            ..wide_search()
+        };
+        let p = run_ber(m, 8.0, 2_000_000, 1, &opts).unwrap();
+        println!("cfo +-2: {} ratio {:.3}", show(&p), p.ber / p.theory);
+        assert_eq!(p.detected, p.frames, "missed frames: {}", show(&p));
+        assert!((p.ber / p.theory - 1.0).abs() <= 0.10, "{}", show(&p));
+    }
+}

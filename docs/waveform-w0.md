@@ -31,7 +31,7 @@ Overhead: 79 symbols of preamble and sync, plus 32 bits of header and CRC.
 | Sub-sample timing | PSK yes; 2-FSK to the nearest sample only | BER with random fractional delay: BPSK +0.9 %, QPSK +7 %, FSK +0.3 % over theory at 6 dB (400 000 bits, seed 3; QPSK z = +2.2) |
 | Carrier phase | Yes, any | all BER runs use a random phase per frame |
 | Gain | Yes (amplitude is estimated per frame) | test with gain 0.001 to 300 |
-| Carrier frequency offset | Default: up to about +-0.8 % of the symbol rate (detection limit). With `cfo_bins` (frequency search in 0.5 % steps): +-4 % tested | table below. Residual drift over a frame is removed by the segment fit |
+| Carrier frequency offset | Default: up to about +-0.8 % of the symbol rate (detection limit). With `cfo_bins` (frequency search in 0.5 % steps): +-4 % tested. With `cfo_search` (coarse FFT search): +-2 symbol rates tested; the limit is just below half the sample rate | tables below. Residual drift over a frame is removed by the segment fit |
 | Noise | AWGN only | |
 | Several frames in one buffer | Yes, if they do not overlap | test |
 
@@ -45,6 +45,60 @@ CFO table (10 dB Eb/N0, 79 frames of 64 bytes per cell, seed 2; frames found / f
 | 0.04 | 0/79 | 79/79 |
 
 The single coherent correlation over 79 symbols loses the signal as the offset approaches one turn over the preamble (a null at 1/79 = 1.27 %, then weaker lobes). The bins search around that. The frequency estimate itself works to +-6 % (phase step between 8-symbol chunks), more than the bins cover.
+
+### Coarse frequency search (`cfo_search`)
+
+For radios with plain crystals: two Plutos can be about 50 ppm apart, 46 kHz at 915 MHz, which is 1.8 symbol rates at 25 kbaud. `RxConfig::cfo_search = MAX` (cycles per symbol; `--cfo-search MAX` on the command line) finds frames anywhere in +-MAX. Off by default.
+
+**Method.** Every 2 samples (`sps / 4`), the receiver multiplies the 632-sample window by the conjugate of the known preamble and sync waveform. That removes the chips: if a frame starts there, what is left is a tone at the carrier offset. An FFT of the product (zero padded to 1024 points, about 1.5 times the window) gives the correlation at every trial frequency at once; the strongest bin within +-MAX, refined by a parabola through its neighbours, is the coarse estimate. For a narrow search the product is first summed in chunks (so `0.5` at 8 samples per symbol uses chunks of 3 and a 512-point FFT); the chunk is kept short enough that it loses at most 0.6 dB at the edge of the range. Candidates must be the strongest within one window length (632 samples). Then the receiver turns the buffer back by the coarse frequency and runs the normal single-frequency detector and decoder in a small window around the candidate, which removes the rest (the coarse estimate is within about 0.001 cycles per symbol). The reported `cfo_cycles_per_symbol` and `phase_rad` are for the buffer as received.
+
+**False alarms.** Each FFT bin is the normal metric for a reference shifted to that frequency, so in noise it is `Beta(1, M-1)` like before. Taking the largest of `cells` bins (529 for +-2.05 at 8 samples per symbol) multiplies the chance that a noise position passes by about `cells`. The threshold is raised to cancel that: 0.04 becomes 0.0495, so the false alarm probability per position stays 6.5e-12. Counting every bin examined is slightly conservative: in 400 000 noise samples the measured rate was 1.00 to 1.03 times the bound for the wide search and 0.80 to 0.88 for the chunked one (`coarse_metric_follows_its_noise_bound`). The price is sensitivity, in two parts:
+
+* The threshold is 24 % (0.9 dB) higher.
+* The search sees less than the full peak. The FFT's bins (1/1024 cycle per sample) are wider than the zero padding needs for a flat response, and the time grid is 2 samples. Measured on clean frames at 66 offsets across one bin, against the plain metric at zero offset and exact timing: BPSK -0.48 dB on average, -1.40 dB at worst (halfway between bins); 2-FSK -0.68 dB average, -1.69 dB worst. The chunked narrow search: -0.48 and -1.16 dB (BPSK), -0.67 and -1.44 dB (FSK).
+
+So at worst the search needs about 2.5 dB more preamble energy than the plain receiver to cross its threshold. The normal metric still sets the frame's timing and frequency afterwards, so decoding loses nothing (BER table below). At Es/N0 = 0 dB the expected metric is about 0.12; less 1.7 dB that is 0.08, still above the 0.0495 threshold. Padding the FFT to 2048 would cut the worst case to about -0.5 dB at about twice the cost; not done, since nothing needed it.
+
+**Cost.** A 1024-point FFT per 2 samples instead of one 632-point correlation per sample. Detection time for a 5000-sample buffer (noise only, so the whole search runs; release build, 2 CPUs, mean of 40, BPSK and FSK the same within 1 %):
+
+| Receiver | ms per buffer |
+|---|---|
+| plain (before) | 2.9 |
+| `cfo_bins 8` (before; covers +-4 %) | 49.2 |
+| `cfo_search 0.5` (chunks of 3, 512-point FFT) | 11.1 |
+| `cfo_search 2.05` (1024-point FFT) | 24.5 |
+
+At 25 kbaud and 8 samples per symbol a 5000-sample buffer is 25 ms of air, so the wide search keeps up on one core with almost nothing to spare. A streaming receiver should run it once per new block, not over old samples again.
+
+Detection and estimate across offsets (from `coarse_search_decodes_across_two_symbol_rates`: 3 frames each at 12 offsets from -2.0 to +2.0, including the plain correlation's null at 0.0253; PSK at 12 dB, FSK at 16 dB, random phase, delay and sub-sample delay): every frame decoded, started at the right sample, and gave its offset to within 0.002 cycles per symbol.
+
+BER with the search on (`--cfo-search 2.05`), Eb/N0 = 8 dB, 64-byte frames, random phase, start delay and sub-sample delay; each row 400 384 bits, seed 7. Every frame was found in every row:
+
+```
+oasa-radio waveform ber --mod bpsk --ebn0-db 8 --bits 400000 --seed 7 --cfo C --cfo-search 2.05 --random-frac-delay
+```
+
+| cfo (cycles/symbol) | BPSK errors | ratio | z | QPSK errors | ratio | z | 2-FSK errors | ratio | z |
+|---|---|---|---|---|---|---|---|---|---|
+| -2.0 | 79 | 1.034 | +0.3 | 86 | 1.125 | +1.1 | 8 666 | 1.015 | +1.4 |
+| -1.3 | 68 | 0.890 | -1.0 | 73 | 0.955 | -0.4 | 8 730 | 1.023 | +2.1 |
+| 0 | 82 | 1.073 | +0.6 | 95 | 1.243 | +2.1 | 8 748 | 1.025 | +2.3 |
+| 0.5 | 86 | 1.125 | +1.1 | 77 | 1.007 | +0.1 | 8 543 | 1.001 | +0.1 |
+| 1.0 | 81 | 1.060 | +0.5 | 76 | 0.994 | 0.0 | 8 534 | 1.000 | 0.0 |
+| 1.5 | 77 | 1.007 | +0.1 | 82 | 1.073 | +0.6 | 8 650 | 1.013 | +1.2 |
+| 2.0 | 65 | 0.850 | -1.3 | 77 | 1.007 | +0.1 | 8 737 | 1.023 | +2.2 |
+
+Theory: 1.909e-4 (PSK), 2.132e-2 (2-FSK). With only 70 to 95 errors a PSK row's ratio has a sampling spread of about +-11 %; every z is within +-2.3.
+
+Acceptance run (`cargo test --release -p oasa-waveform --test ber coarse_search_long -- --ignored`): 2 000 384 bits per modulation at 8 dB, every frame with its own offset uniform in +-2 symbol rates, random sub-sample delay, seed 1. Measured on 2026-10-30:
+
+| Mod | frames found | errors | BER | theory | ratio | z |
+|---|---|---|---|---|---|---|
+| BPSK | 3907/3907 | 365 | 1.825e-4 | 1.909e-4 | 0.956 | -0.9 |
+| QPSK | 3907/3907 | 417 | 2.085e-4 | 1.909e-4 | 1.092 | +1.8 |
+| 2-FSK | 3907/3907 | 42 822 | 2.141e-2 | 2.132e-2 | 1.004 | +0.8 |
+
+QPSK's 9 % is within its sampling error (z = +1.8; one sigma is 5 % at 380 expected errors), and the plain receiver's QPSK rows above sit at +0.4 to +2.1 % on much larger counts.
 
 ### Not handled
 
@@ -106,10 +160,10 @@ Reading it: 2-FSK sits on the curve. BPSK and QPSK are on it at 4 dB and up (wit
 
 | Where | Tests | Time (2 CPUs, another build running) |
 |---|---|---|
-| `waveform` unit tests | 23: erfc and the BER curves against Python values, Wilson and z-score, RRC (unit energy, near-Nyquist), m-sequence autocorrelation, CRC-16 check value `0x29B1`, whitening, generator and Gaussian statistics, channel noise power and conventions, fractional delay | 0.01 s |
-| `waveform/tests/ber.rs` | 9 (+1 ignored `long_sweep`): BER at five Eb/N0 points per modulation with fixed seeds, independence of oversampling (4 and 16 samples per symbol), a 1 dB wrong claim must fail, BPSK = QPSK per Eb/N0, seeds repeat, 0.4 % frequency offset, random sub-sample delay | about 10 s |
-| `waveform/tests/frames.rs` | 18: energy convention, round trips with random delay and phase, high-SNR round trip with random offsets, frequency offset estimated and tracked, frequency bins, gain, several frames, **noise-only gives no frames**, the detection metric follows its noise theory, **damaged frames fail the CRC** (also at every position in the body), wrong sync word, no preamble, truncated frame, sub-sample delay, payload limits | about 2 s |
-| `tests/cli.rs` | 3 new: `ber` JSON lines repeat from the seed, `iq` writes a SigMF pair that `decode` reads back (all three modulations), bad arguments | 1 s |
+| `waveform` unit tests | 25 (2 new: the FFT against a direct DFT, a tone in its bin): erfc and the BER curves against Python values, Wilson and z-score, RRC (unit energy, near-Nyquist), m-sequence autocorrelation, CRC-16 check value `0x29B1`, whitening, generator and Gaussian statistics, channel noise power and conventions, fractional delay | 0.01 s |
+| `waveform/tests/ber.rs` | 10 (+2 ignored, `long_sweep` and `coarse_search_long`): new: BER with the coarse search and offsets in +-2 symbol rates; BER at five Eb/N0 points per modulation with fixed seeds, independence of oversampling (4 and 16 samples per symbol), a 1 dB wrong claim must fail, BPSK = QPSK per Eb/N0, seeds repeat, 0.4 % frequency offset, random sub-sample delay | about 13 s |
+| `waveform/tests/frames.rs` | 25 (7 new for the coarse search: 12 offsets from -2 to +2 per modulation, the true carrier phase, the plain receiver misses what it finds, four frames with their own offsets, noise only gives nothing, its noise bound, its settings): energy convention, round trips with random delay and phase, high-SNR round trip with random offsets, frequency offset estimated and tracked, frequency bins, gain, several frames, **noise-only gives no frames**, the detection metric follows its noise theory, **damaged frames fail the CRC** (also at every position in the body), wrong sync word, no preamble, truncated frame, sub-sample delay, payload limits | about 6 s |
+| `tests/cli.rs` | 3: `ber` JSON lines repeat from the seed, `iq` writes a SigMF pair that `decode` reads back (all three modulations), bad arguments | 1 s |
 
 The long sweep (`cargo test --release -p oasa-waveform -- --ignored`) is 2 million bits a point from 0 to 10 dB.
 
@@ -120,7 +174,7 @@ Lab suite `l1-waveform-w0` (needs `OASA_RADIO_BIN_DIR`): BER by modulation and E
 Not done; listed so W1 starts from facts.
 
 1. **IQ in and out.** `modulate` and `demodulate` already speak `Complex32`. A thin `sdr` adapter must scale to the DAC (12-bit; amplitude well below full scale to stay linear), pick a sample rate that is `symbol_rate x sps`, and hand the receiver blocks of at least one frame plus margin. A streaming receiver (sliding buffer, no re-search of old samples) is needed for continuous operation.
-2. **Frequency offset.** Two independent crystals. The lab's own limits ([hardware-suites](https://github.com/joinoasa/oasa-lab/blob/main/docs/hardware-suites.md)) assume a Pluto+ TCXO of 0.5 ppm, so two of them differ by up to 1 ppm: 915 Hz at 915 MHz, 2.4 kHz at 2.4 GHz. A plain Pluto crystal is 20 to 25 ppm (the same page's wording for a plain crystal); two such differ by up to about 50 ppm, 46 kHz at 915 MHz. Against the 25 kHz symbol rate used in the examples that is 4 % for the TCXO at 915 MHz and over 100 % for the plain crystal. Choose the symbol rate so the offset is a few percent of it at most (a rate of 250 kHz or more for the TCXO case) and use `cfo_bins`, or add a coarse frequency search (FFT of the received preamble) first. **Unverified:** the Pluto sample rate limits (I recall about 65 kS/s to 61.44 MS/s with the AD9363) and its 12-bit converters; check the ADI documentation before choosing rates. No network was available for this task.
+2. **Frequency offset.** Two independent crystals. The lab's own limits ([hardware-suites](https://github.com/joinoasa/oasa-lab/blob/main/docs/hardware-suites.md)) assume a Pluto+ TCXO of 0.5 ppm, so two of them differ by up to 1 ppm: 915 Hz at 915 MHz, 2.4 kHz at 2.4 GHz. A plain Pluto crystal is 20 to 25 ppm (the same page's wording for a plain crystal); two such differ by up to about 50 ppm, 46 kHz at 915 MHz. Against the 25 kHz symbol rate used in the examples that is 4 % for the TCXO at 915 MHz and over 100 % for the plain crystal. The coarse frequency search (`--cfo-search`, above) covers both: set MAX a little above the worst offset in symbol rates (2.05 for plain crystals at 25 kbaud). For a TCXO a small MAX keeps the cost down. **Unverified:** the Pluto sample rate limits (I recall about 65 kS/s to 61.44 MS/s with the AD9363) and its 12-bit converters; check the ADI documentation before choosing rates. No network was available for this task.
 3. **DC offset and LO leakage** at zero IF: shift the signal off DC (a small digital frequency shift, the receiver already removes a frequency offset) or remove DC before detection.
 4. **Transmit on cable only**, with the 60 dB rule of the lab, and gain set so the receiver does not clip. The amplitude is estimated per frame, but a clipped signal is not recoverable.
 5. **Sample rate and gain settings recorded** in the SigMF file. `oasa-radio waveform iq` already writes `core:datatype`, `core:sample_rate`, `core:frequency` and `core:datetime`; it does not write `core:sha512` (the lab's own writer adds it when a recording is registered with a device).

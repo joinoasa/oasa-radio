@@ -23,20 +23,27 @@ pub const USAGE: &str = "\
 WAVEFORM (W0, simulation):
   oasa-radio waveform ber --mod bpsk|qpsk|fsk2 --ebn0-db 0,2,4,6 [--bits N] [--seed S]
                           [--sps 8] [--payload-len 64] [--cfo CYCLES_PER_SYMBOL]
-                          [--random-frac-delay] [--cfo-bins 0] [--json]
+                          [--cfo-random MAX] [--random-frac-delay] [--cfo-bins 0]
+                          [--cfo-search MAX] [--json]
   oasa-radio waveform iq --mod bpsk|qpsk|fsk2 --out BASE [--ebn0-db X] [--payload-len 32 | --payload-hex HEX]
                          [--seed S] [--sps 8] [--symbol-rate 25000] [--center-hz 0]
                          [--phase-deg 0] [--delay 64] [--tail 64] [--cfo 0] [--frac-delay 0]
-  oasa-radio waveform decode --in BASE --mod bpsk|qpsk|fsk2 [--sps 8] [--cfo-bins 0] [--hex]
+  oasa-radio waveform decode --in BASE --mod bpsk|qpsk|fsk2 [--sps 8] [--cfo-bins 0]
+                             [--cfo-search MAX] [--hex]
 
   ber     Sends random frames through the modem and the simulated channel at each Eb/N0 and prints one
           JSON line per point: errors, bits, BER, the theory value (BPSK and QPSK: Q(sqrt(2Eb/N0));
           2-FSK, noncoherent: 0.5 exp(-Eb/2N0)), a 3-sigma Wilson interval and the binomial z-score.
           Default 100000 bits, seed 1. The same seed gives the same lines. (--json is accepted; output
-          is always JSON lines.)
+          is always JSON lines.) --cfo-random gives each frame its own offset, uniform in +-MAX.
   iq      Writes BASE.sigmf-data (cf32_le, little endian float32 I and Q) and BASE.sigmf-meta: one frame
           with BASE delay samples of noise in front and TAIL after. No --ebn0-db means no noise.
   decode  Finds frames in BASE.sigmf-data. Prints sizes and CRC status; the payload only with --hex.
+
+  Frequency offsets (--cfo, --cfo-random, --cfo-search) are in cycles per symbol: 1.0 is one symbol
+  rate. --cfo-search MAX turns on the coarse frequency search (an FFT over the preamble) for offsets
+  up to +-MAX (see docs/waveform-w0.md for its cost). --cfo-bins is the older narrow search; give
+  one or the other.
 ";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,8 +55,10 @@ pub struct BerArgs {
     pub sps: usize,
     pub payload_len: usize,
     pub cfo: f64,
+    pub cfo_random: f64,
     pub random_frac_delay: bool,
     pub cfo_bins: usize,
+    pub cfo_search: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +90,7 @@ pub struct DecodeArgs {
     pub input: String,
     pub sps: usize,
     pub cfo_bins: usize,
+    pub cfo_search: f64,
     pub hex: bool,
 }
 
@@ -128,6 +138,8 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
         Modulation::parse(&v).ok_or(format!("--mod {v:?}: use bpsk, qpsk or fsk2"))?
     };
     let sps = int("sps", named.remove("sps"), 8, 4, 64)? as usize;
+    // Frequencies in cycles per symbol stay inside the sampled band, +-sps/2.
+    let half = sps as f64 / 2.0;
     let cmd = match sub {
         "ber" => {
             let list = named.remove("ebn0-db").ok_or("missing --ebn0-db")?;
@@ -145,9 +157,11 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
                 seed: int("seed", named.remove("seed"), 1, 0, u64::MAX)?,
                 sps,
                 payload_len: int("payload-len", named.remove("payload-len"), 64, 1, 255)? as usize,
-                cfo: opt_float("cfo", named.remove("cfo"), 0.0, -0.5, 0.5)?,
+                cfo: opt_float("cfo", named.remove("cfo"), 0.0, -half, half)?,
+                cfo_random: opt_float("cfo-random", named.remove("cfo-random"), 0.0, 0.0, half)?,
                 random_frac_delay: flags.iter().any(|f| f == "random-frac-delay"),
                 cfo_bins: int("cfo-bins", named.remove("cfo-bins"), 0, 0, 20)? as usize,
+                cfo_search: opt_float("cfo-search", named.remove("cfo-search"), 0.0, 0.0, half)?,
             })
         }
         "iq" => {
@@ -184,7 +198,7 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
                 phase_deg: opt_float("phase-deg", named.remove("phase-deg"), 0.0, -360.0, 360.0)?,
                 delay: int("delay", named.remove("delay"), 64, 0, 10_000_000)? as usize,
                 tail: int("tail", named.remove("tail"), 64, 0, 10_000_000)? as usize,
-                cfo: opt_float("cfo", named.remove("cfo"), 0.0, -0.5, 0.5)?,
+                cfo: opt_float("cfo", named.remove("cfo"), 0.0, -half, half)?,
                 frac_delay: opt_float("frac-delay", named.remove("frac-delay"), 0.0, 0.0, 0.999)?,
             })
         }
@@ -193,9 +207,26 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
             input: named.remove("in").ok_or("missing --in")?,
             sps,
             cfo_bins: int("cfo-bins", named.remove("cfo-bins"), 0, 0, 20)? as usize,
+            cfo_search: opt_float("cfo-search", named.remove("cfo-search"), 0.0, 0.0, half)?,
             hex: flags.iter().any(|f| f == "hex"),
         }),
     };
+    match &cmd {
+        WaveformCommand::Ber(a) => {
+            if a.cfo.abs() + a.cfo_random > half {
+                return Err(format!(
+                    "--cfo plus --cfo-random must stay within +-{half} (half the sample rate)"
+                ));
+            }
+            if a.cfo_bins > 0 && a.cfo_search > 0.0 {
+                return Err("give --cfo-bins or --cfo-search, not both".into());
+            }
+        }
+        WaveformCommand::Decode(a) if a.cfo_bins > 0 && a.cfo_search > 0.0 => {
+            return Err("give --cfo-bins or --cfo-search, not both".into());
+        }
+        _ => {}
+    }
     if let Some(k) = named.keys().next() {
         return Err(format!("unknown option --{k} for waveform {sub}"));
     }
@@ -275,9 +306,11 @@ fn run_ber_cmd(a: &BerArgs, out: &mut dyn Write) -> R<()> {
         sps: a.sps,
         payload_len: a.payload_len,
         cfo_cycles_per_symbol: a.cfo,
+        cfo_random: a.cfo_random,
         random_frac_delay: a.random_frac_delay,
         rx: RxConfig {
             cfo_bins: a.cfo_bins,
+            cfo_search: a.cfo_search as f32,
             ..RxConfig::default()
         },
         ..BerOptions::default()
@@ -290,7 +323,7 @@ fn run_ber_cmd(a: &BerArgs, out: &mut dyn Write) -> R<()> {
         let p = run_ber(a.modulation, db, a.bits, a.seed, &opts).map_err(|e| e.to_string())?;
         writeln!(
             out,
-            "{{\"ts\":\"{}\",\"event\":\"ber\",\"mod\":\"{}\",\"ebn0_db\":{},\"bits\":{},\"errors\":{},\"ber\":{},\"theory\":{},\"ci_lo\":{},\"ci_hi\":{},\"z\":{},\"frames\":{},\"detected\":{},\"crc_ok\":{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"cfo_cycles_per_symbol\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"theory_kind\":{}}}",
+            "{{\"ts\":\"{}\",\"event\":\"ber\",\"mod\":\"{}\",\"ebn0_db\":{},\"bits\":{},\"errors\":{},\"ber\":{},\"theory\":{},\"ci_lo\":{},\"ci_hi\":{},\"z\":{},\"frames\":{},\"detected\":{},\"crc_ok\":{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"theory_kind\":{}}}",
             now(),
             a.modulation.name(),
             num(db),
@@ -308,8 +341,10 @@ fn run_ber_cmd(a: &BerArgs, out: &mut dyn Write) -> R<()> {
             a.sps,
             a.payload_len,
             num(a.cfo),
+            num(a.cfo_random),
             a.random_frac_delay,
             a.cfo_bins,
+            num(a.cfo_search),
             json_str(theory),
         )
         .map_err(io)?;
@@ -417,6 +452,7 @@ fn run_decode(a: &DecodeArgs, out: &mut dyn Write) -> R<()> {
     .map_err(|e| e.to_string())?;
     let rx = RxConfig {
         cfo_bins: a.cfo_bins,
+        cfo_search: a.cfo_search as f32,
         ..RxConfig::default()
     };
     let frames = modem.demodulate_with(&samples, &rx);
@@ -493,6 +529,12 @@ mod tests {
             "ber --mod bpsk --ebn0-db 3 --bits 0",
             "ber --mod bpsk --ebn0-db 3 --bogus 1",
             "ber --mod bpsk --mod qpsk --ebn0-db 3",
+            "ber --mod bpsk --ebn0-db 3 --cfo 4.5",
+            "ber --mod bpsk --ebn0-db 3 --sps 4 --cfo-search 2.5",
+            "ber --mod bpsk --ebn0-db 3 --cfo-random -1",
+            "ber --mod bpsk --ebn0-db 3 --cfo 3 --cfo-random 2",
+            "ber --mod bpsk --ebn0-db 3 --cfo-bins 2 --cfo-search 1",
+            "decode --mod bpsk --in x --cfo-bins 2 --cfo-search 1",
             "iq --mod bpsk",
             "iq --mod bpsk --out x --payload-hex abc",
             "iq --mod bpsk --out x --payload-hex 00 --payload-len 4",
@@ -526,6 +568,14 @@ mod tests {
                 ..
             })
         ));
+        match parse(&v(
+            "ber --mod bpsk --ebn0-db 8 --cfo-random 2 --cfo-search 2.05",
+        ))
+        .unwrap()
+        {
+            WaveformCommand::Ber(a) => assert_eq!((a.cfo_random, a.cfo_search), (2.0, 2.05)),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
