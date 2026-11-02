@@ -20,6 +20,8 @@ pub struct BerOptions {
     pub random_phase: bool,
     /// Carrier frequency offset in cycles per symbol, same for every frame.
     pub cfo_cycles_per_symbol: f64,
+    /// Add a random offset per frame, uniform in `+-cfo_random` cycles per symbol (0: none).
+    pub cfo_random: f64,
     /// Receiver settings other than the BER-measurement ones (`expected_len`, no sync rejection).
     pub rx: RxConfig,
 }
@@ -33,6 +35,7 @@ impl Default for BerOptions {
             random_frac_delay: false,
             random_phase: true,
             cfo_cycles_per_symbol: 0.0,
+            cfo_random: 0.0,
             rx: RxConfig::default(),
         }
     }
@@ -103,6 +106,11 @@ pub fn run_ber(
         let payload = ch.rng().bytes(opts.payload_len);
         let tx = modem.modulate(&payload)?;
         let lead = 2 + ch.rng().below(opts.max_delay as u64 + 1) as usize;
+        let cfo = if opts.cfo_random > 0.0 {
+            opts.cfo_cycles_per_symbol + (2.0 * ch.rng().uniform() - 1.0) * opts.cfo_random
+        } else {
+            opts.cfo_cycles_per_symbol
+        };
         let imp = Impairments {
             n0,
             phase_rad: if opts.random_phase {
@@ -115,7 +123,7 @@ pub fn run_ber(
             } else {
                 0.0
             },
-            cfo_cycles_per_sample: opts.cfo_cycles_per_symbol / opts.sps as f64,
+            cfo_cycles_per_sample: cfo / opts.sps as f64,
             lead,
             tail: 8,
         };

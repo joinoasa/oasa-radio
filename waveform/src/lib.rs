@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod channel;
+pub mod fft;
 pub mod frame;
 pub mod iq;
 pub mod modem;
@@ -28,4 +29,4 @@ pub mod sim;
 pub mod theory;
 
 pub use iq::Complex32;
-pub use modem::{ConfigError, Modem, ModemConfig, Modulation, RxConfig, RxFrame};
+pub use modem::{CoarseSearch, ConfigError, Modem, ModemConfig, Modulation, RxConfig, RxFrame};

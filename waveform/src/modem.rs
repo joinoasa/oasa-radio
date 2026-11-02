@@ -123,9 +123,13 @@ pub struct RxConfig {
     /// Off means the preamble's estimate alone is used.
     pub refine_phase: bool,
     /// Extra trial frequencies for detection: `cfo_bins` on each side of zero, `cfo_step` cycles per
-    /// symbol apart. 0 searches only zero offset.
+    /// symbol apart. 0 searches only zero offset. Not used when `cfo_search` is on.
     pub cfo_bins: usize,
     pub cfo_step: f32,
+    /// Coarse frequency search: the largest carrier offset to look for, in cycles per symbol (2.0 is
+    /// two symbol rates either way). 0 turns it off. It is capped at half the sample rate
+    /// (`sps / 2` cycles per symbol). See [`Modem::coarse_metric`] for the method and its cost.
+    pub cfo_search: f32,
 }
 
 impl Default for RxConfig {
@@ -137,9 +141,36 @@ impl Default for RxConfig {
             refine_phase: true,
             cfo_bins: 0,
             cfo_step: 0.005,
+            cfo_search: 0.0,
         }
     }
 }
+
+/// The coarse frequency search for one receiver setting: see [`Modem::coarse_metric`].
+#[derive(Debug, Clone)]
+pub struct CoarseSearch {
+    /// Samples summed into one point before the FFT (1 for wide searches).
+    pub chunk: usize,
+    /// FFT size.
+    pub fft_len: usize,
+    /// Bins examined on each side of zero.
+    pub bins: usize,
+    /// Distance between the time offsets searched, in samples.
+    pub step: usize,
+    /// Trial frequencies (bins examined). In white noise the chance that a position passes a
+    /// threshold `t` is at most about `cells * (1 - t)^(M - 1)`: this sets the threshold.
+    pub cells: f64,
+    /// Detection threshold on the coarse metric: `detect_threshold` raised so that the false alarm
+    /// probability per position stays what it is without the search.
+    pub threshold: f32,
+    fft: crate::fft::Fft,
+}
+
+/// The largest offset searched, as a fraction of the sample rate.
+const COARSE_MAX_CYCLES_PER_SAMPLE: f64 = 0.5;
+/// Chunk length rule: the searched offset times the chunk length stays under this, so a chunk loses
+/// at most `sinc^2(0.2)` = 0.6 dB of the signal at the edge of the range.
+const COARSE_CHUNK_TURNS: f64 = 0.2;
 
 /// One frame found by [`Modem::demodulate`].
 #[derive(Debug, Clone, PartialEq)]
@@ -324,6 +355,9 @@ impl Modem {
     /// Find frames in `samples`. Frames come in order of position; a frame with a bad CRC is
     /// returned with `crc_ok == false`. Overlapping frames are not separated.
     pub fn demodulate_with(&self, samples: &[Complex32], rx: &RxConfig) -> Vec<RxFrame> {
+        if rx.cfo_search > 0.0 {
+            return self.demodulate_coarse(samples, rx);
+        }
         let metric = self.metric(samples, rx);
         let sps = self.cfg.sps;
         let mut out: Vec<RxFrame> = Vec::new();
@@ -396,6 +430,187 @@ impl Modem {
             }
         }
         best
+    }
+
+    /// The coarse frequency search for `rx`, or `None` if `rx.cfo_search` is 0.
+    pub fn coarse_search(&self, rx: &RxConfig) -> Option<CoarseSearch> {
+        if rx.cfo_search.is_nan() || rx.cfo_search <= 0.0 {
+            return None;
+        }
+        let m = self.refw.len();
+        let range = (rx.cfo_search as f64 / self.cfg.sps as f64).min(COARSE_MAX_CYCLES_PER_SAMPLE);
+        let chunk = ((COARSE_CHUNK_TURNS / range).floor() as usize).clamp(1, m / 16);
+        let points = m.div_ceil(chunk);
+        let fft_len = (points + points / 2).next_power_of_two().max(8);
+        let bins = (((range * (fft_len * chunk) as f64).ceil() as usize) + 1).min(fft_len / 2 - 1);
+        // Each bin examined is one trial frequency. The bins are closer than independent (the FFT is
+        // zero padded), but the largest of a continuous spectrum beats the largest of independent
+        // cells, and counting every bin matches what is measured (a test checks it) or is above it.
+        let cells = (2 * bins + 1) as f64;
+        let t = rx.detect_threshold as f64;
+        let threshold = (1.0 - (1.0 - t) * cells.powf(-1.0 / (m as f64 - 1.0))) as f32;
+        Some(CoarseSearch {
+            chunk,
+            fft_len,
+            bins,
+            step: (self.cfg.sps / 4).max(1),
+            cells,
+            threshold,
+            fft: crate::fft::Fft::new(fft_len),
+        })
+    }
+
+    /// The coarse search's metric: one value every `step` samples (position `i` is sample
+    /// `i * step`), each `(metric, frequency in cycles per symbol)`. Empty if the search is off.
+    ///
+    /// Method: at a trial position, multiply the received window by the conjugate of the known
+    /// preamble and sync waveform. This removes the chips: what is left is a tone at the carrier
+    /// offset. Sum it in chunks of `chunk` samples (1 for wide searches), take an FFT of
+    /// `fft_len` points (zero padded to about 1.5 times the window), and keep the strongest bin
+    /// within the range. Each bin is the normal correlation metric for a reference shifted to that
+    /// bin's frequency, so in white noise it is `Beta(1, M-1)` like [`Modem::metric`]. Taking the
+    /// largest of about `cells` independent ones raises the false alarm rate by that factor; the
+    /// threshold is raised to cancel it.
+    pub fn coarse_metric(&self, r: &[Complex32], rx: &RxConfig) -> Vec<(f32, f32)> {
+        match self.coarse_search(rx) {
+            Some(cs) => self.coarse_metric_with(r, &cs),
+            None => Vec::new(),
+        }
+    }
+
+    fn coarse_metric_with(&self, r: &[Complex32], cs: &CoarseSearch) -> Vec<(f32, f32)> {
+        let m = self.refw.len();
+        if r.len() < m {
+            return Vec::new();
+        }
+        let positions = r.len() - m + 1;
+        let mut prefix = Vec::with_capacity(r.len() + 1);
+        let mut acc = 0.0f64;
+        prefix.push(0.0);
+        for s in r {
+            acc += s.norm_sqr() as f64;
+            prefix.push(acc);
+        }
+        let n = cs.fft_len;
+        let span = (n * cs.chunk) as f64;
+        let mut buf = vec![Complex32::ZERO; n];
+        let mut out = Vec::with_capacity(positions.div_ceil(cs.step));
+        for tau in (0..positions).step_by(cs.step) {
+            buf.fill(Complex32::ZERO);
+            let win = &r[tau..tau + m];
+            for (slot, (w, p)) in buf
+                .iter_mut()
+                .zip(win.chunks(cs.chunk).zip(self.refw.chunks(cs.chunk)))
+            {
+                let (mut cr, mut ci) = (0.0f32, 0.0f32);
+                for (a, b) in w.iter().zip(p) {
+                    // a * conj(b)
+                    cr += a.re * b.re + a.im * b.im;
+                    ci += a.im * b.re - a.re * b.im;
+                }
+                *slot = Complex32::new(cr, ci);
+            }
+            cs.fft.forward(&mut buf);
+            let (mut best, mut best_k) = (-1.0f32, 0isize);
+            for k in -(cs.bins as isize)..=cs.bins as isize {
+                let v = buf[k.rem_euclid(n as isize) as usize].norm_sqr();
+                if v > best {
+                    best = v;
+                    best_k = k;
+                }
+            }
+            let mag = |k: isize| buf[k.rem_euclid(n as isize) as usize].norm_sqr().sqrt() as f64;
+            let (a, b, c) = (mag(best_k - 1), mag(best_k), mag(best_k + 1));
+            let den = a - 2.0 * b + c;
+            let delta = if den < 0.0 {
+                (0.5 * (a - c) / den).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
+            let e = prefix[tau + m] - prefix[tau];
+            let metric = if e > 1e-30 {
+                (best as f64 / (self.ref_energy * e)) as f32
+            } else {
+                0.0
+            };
+            let f = (best_k as f64 + delta) / span * self.cfg.sps as f64;
+            out.push((metric, f as f32));
+        }
+        out
+    }
+
+    /// [`Modem::demodulate_with`] with the coarse frequency search: find candidates on the coarse
+    /// grid, then for each one turn the buffer back by its frequency and run the normal detector
+    /// (one frequency) and decoder in a small window around it.
+    fn demodulate_coarse(&self, r: &[Complex32], rx: &RxConfig) -> Vec<RxFrame> {
+        let Some(cs) = self.coarse_search(rx) else {
+            return Vec::new();
+        };
+        let cm = self.coarse_metric_with(r, &cs);
+        if cm.is_empty() {
+            return Vec::new();
+        }
+        let sps = self.cfg.sps;
+        let m = self.refw.len();
+        let last = r.len() - m;
+        // A candidate must be the strongest within one reference length. Taking the best of many
+        // frequencies lifts the time side peaks too (for 2-FSK the preamble one symbol off still
+        // matches well), and a one-symbol window lets them through as false starts. Real frames
+        // are always further apart than this; overlapping frames are not separated anyway.
+        let reach = m.div_ceil(cs.step);
+        let frame_len = self.frame_samples(rx.expected_len.unwrap_or(MAX_PAYLOAD).min(MAX_PAYLOAD));
+        let fine = RxConfig {
+            cfo_bins: 0,
+            cfo_search: 0.0,
+            ..rx.clone()
+        };
+        let mut out: Vec<RxFrame> = Vec::new();
+        let mut busy_until = 0usize;
+        for i in 0..cm.len() {
+            let (v, f) = cm[i];
+            let tau_c = i * cs.step;
+            if v < cs.threshold || tau_c < busy_until {
+                continue;
+            }
+            let lo_i = i.saturating_sub(reach);
+            let hi_i = (i + reach + 1).min(cm.len());
+            let is_peak = (lo_i..hi_i).all(|j| cm[j].0 < v || (cm[j].0 == v && j >= i));
+            if !is_peak {
+                continue;
+            }
+            let lo = tau_c.saturating_sub(sps + cs.step).max(busy_until);
+            let hi = (tau_c + sps + cs.step).min(last);
+            let end = (hi + frame_len + 1).min(r.len());
+            let w = f as f64 / sps as f64;
+            let d: Vec<Complex32> = r[lo..end]
+                .iter()
+                .enumerate()
+                .map(|(j, s)| {
+                    let turns = (w * (lo + j) as f64).rem_euclid(1.0);
+                    let (sn, co) = (-2.0 * PI * turns).sin_cos();
+                    *s * Complex32::new(co as f32, sn as f32)
+                })
+                .collect();
+            let fm = self.metric(&d[..hi - lo + m], &fine);
+            let Some(j) = (0..fm.len()).max_by(|&a, &b| fm[a].total_cmp(&fm[b]).then(b.cmp(&a)))
+            else {
+                continue;
+            };
+            let mu = parabola_peak(&fm, j);
+            if let Some(mut fr) = self.decode_at(&d, j, mu, fm[j], &fine) {
+                fr.start += lo;
+                fr.end += lo;
+                fr.cfo_cycles_per_symbol += f;
+                let turns = (w * fr.start as f64).rem_euclid(1.0);
+                let ph = fr.phase_rad as f64 + 2.0 * PI * turns;
+                fr.phase_rad = ph.sin().atan2(ph.cos()) as f32;
+                if fr.crc_ok {
+                    busy_until = fr.end;
+                }
+                out.push(fr);
+            }
+        }
+        out
     }
 
     fn decode_at(
