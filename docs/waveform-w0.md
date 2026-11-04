@@ -106,7 +106,7 @@ QPSK's 9 % is within its sampling error (z = +1.8; one sigma is 5 % at 380 expec
 
 - Sample clock offset between transmitter and receiver (no symbol clock tracking; frames are short).
 - Fading, multipath, interference, IQ imbalance, a DC offset. (The Pluto has a DC spike; see W1 below.)
-- A continuous stream: `demodulate` takes one buffer and searches all of it. Cost grows as buffer length x 632 multiplications (about 3 ms for a 5000-sample frame buffer at 8 samples per symbol in a release build). A streaming receiver needs a sliding buffer.
+- A continuous stream: done, see "Streaming receiver" below. `demodulate` itself still takes one buffer and searches all of it.
 - Coherent 2-FSK. The theory function exists (`ber_bfsk_coherent`) but the receiver is noncoherent.
 - No FEC on the payload. W2. The W0 header (length and complement, unprotected) loses a frame to one flipped bit: found-frame rate 27 % at 0 dB and 82 % at 4 dB. [Frame format v1](frame-v1.md) fixes that; W0 stays the default.
 
@@ -232,7 +232,7 @@ needed for continuous operation.
 
 Not done; listed so W1 starts from facts.
 
-1. **IQ in and out.** `modulate` and `demodulate` already speak `Complex32`. A thin `sdr` adapter must scale to the DAC (12-bit; amplitude well below full scale to stay linear), pick a sample rate that is `symbol_rate x sps`, and hand the receiver blocks of at least one frame plus margin. A streaming receiver (sliding buffer, no re-search of old samples) is needed for continuous operation.
+1. **IQ in and out.** `modulate` and `demodulate` already speak `Complex32`. A thin `sdr` adapter must scale to the DAC (12-bit; amplitude well below full scale to stay linear), pick a sample rate that is `symbol_rate x sps`, and hand the receiver blocks; `StreamReceiver` (below) does the sliding buffer.
 2. **Frequency offset.** Two independent crystals. The lab's own limits ([hardware-suites](https://github.com/joinoasa/oasa-lab/blob/main/docs/hardware-suites.md)) assume a Pluto+ TCXO of 0.5 ppm, so two of them differ by up to 1 ppm: 915 Hz at 915 MHz, 2.4 kHz at 2.4 GHz. A plain Pluto crystal is 20 to 25 ppm (the same page's wording for a plain crystal); two such differ by up to about 50 ppm, 46 kHz at 915 MHz. Against the 25 kHz symbol rate used in the examples that is 4 % for the TCXO at 915 MHz and over 100 % for the plain crystal. The coarse frequency search (`--cfo-search`, above) covers both: set MAX a little above the worst offset in symbol rates (2.05 for plain crystals at 25 kbaud). For a TCXO a small MAX keeps the cost down. **Unverified:** the Pluto sample rate limits (I recall about 65 kS/s to 61.44 MS/s with the AD9363) and its 12-bit converters; check the ADI documentation before choosing rates. No network was available for this task.
 3. **DC offset and LO leakage** at zero IF: shift the signal off DC (a small digital frequency shift, the receiver already removes a frequency offset) or remove DC before detection.
 4. **Transmit on cable only**, with the 60 dB rule of the lab, and gain set so the receiver does not clip. The amplitude is estimated per frame, but a clipped signal is not recoverable.
@@ -246,3 +246,26 @@ Not done; listed so W1 starts from facts.
 * The 5 % allowance in the tests, the likelihood-ratio threshold (15), the statements about implementation loss and the frequency ranges are measured or chosen here, from the runs above; they are not from a reference.
 * The Pluto figures in the W1 section are from the lab's docs (ppm) or from memory (rates, converters; unverified).
 * One estimate was dropped on purpose: a decision-directed phase-locked loop was tried first and removed, because with a noisy frequency estimate it left 10 % excess errors at low Eb/N0.
+
+## Streaming receiver
+
+`stream::StreamReceiver` (and `oasa-radio waveform rx-stream`, which reads raw cf32_le from stdin or a file) takes
+samples in blocks of any size and returns each frame once, with `start` and `end` counted from the stream's first
+sample. It keeps a window over the stream and decides a frame only when its start is at least one longest frame
+(255 bytes, or `expected_len`) plus a margin before the window's end, so the frame is surely all there. A start once
+decided is never decided again. The window drops samples from the front but keeps one detection reference before
+the next decision point (so the detector's peak test sees the same neighbours as on the whole buffer), any decided
+frame still running (so its body is skipped as on the whole buffer), and moves only in steps of the coarse search's
+time grid (2 samples at 8 samples per symbol; otherwise the grid shifts and, at low SNR, a few decisions change).
+
+**Same result as the whole buffer.** `waveform/tests/stream.rs`: blocks of the whole stream, 65 536, 4096, 511,
+and a mix of 1000/7/333/20 000/1 samples give exactly the frames (start, payload, CRC) that `demodulate_with` gives
+on the whole stream, for the plain receiver, the coarse search (narrow and +-2.05), v1, a known length, 4 to 12 dB
+(an ignored test runs 12 seeds of each, about 6 minutes in release). The window stays near two frames; a frame cut
+off by the end of the stream is not returned. On W1 bench recordings (oasa-lab job 76a64a620a49), clean and with
+noise added to 0 and 1 dB, `rx-stream` in blocks of 4096 printed the same frames as `decode`.
+
+**Speed.** 3.28 million samples of W1 bench recording (QPSK, 64-byte frames back to back, 1 MS/s, so 3.3 s of air)
+on one core of the development PC, release build: 2.46 s with `--cfo-search 0.1`, 2.05 s with the length known as
+well, 1.48 s with neither; about 6 MB of memory throughout. Each block is searched together with the overlap kept
+from before (about one longest frame), so blocks of a few frame lengths or more keep that overhead small.
