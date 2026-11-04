@@ -10,7 +10,7 @@
 //! `long_sweep` is `#[ignore]`d: run it with `cargo test --release -p oasa-waveform -- --ignored`.
 
 use oasa_waveform::sim::{run_ber, BerOptions, BerPoint};
-use oasa_waveform::Modulation;
+use oasa_waveform::{Modulation, RxConfig};
 
 /// Is the measured error count consistent with the theory, to `z` sigma, allowing the theory value to
 /// be up to `slack` (a fraction) higher? (A receiver only loses to the ideal, never beats it.)
@@ -158,6 +158,25 @@ fn small_frequency_offset_does_not_change_the_ber() {
         assert_eq!(p.detected, p.frames);
         assert!(consistent(&p, 3.0, 0.05), "{}", show(&p));
     }
+}
+
+#[test]
+fn qpsk_with_the_coarse_search_tracks_at_low_snr() {
+    // oasa-radio#14: with the coarse search on, the preamble leaves a frequency error that QPSK's
+    // power-law fit could not take out at low SNR (1.40 x theory at 2 dB, this offset and seed). The
+    // slope search over the whole body brings it to 1.11 x.
+    let opts = BerOptions {
+        cfo_cycles_per_symbol: 0.018,
+        rx: RxConfig {
+            cfo_search: 0.1,
+            ..RxConfig::default()
+        },
+        ..BerOptions::default()
+    };
+    let p = run_ber(Modulation::Qpsk, 2.0, 300_000, 1, &opts).unwrap();
+    println!("cfo 0.018, search 0.1: {}", show(&p));
+    assert_eq!(p.detected, p.frames);
+    assert!(p.ber < 1.25 * p.theory, "{}", show(&p));
 }
 
 /// 0 to 10 dB, a million bits a point. Slow: run in release with `--ignored`.

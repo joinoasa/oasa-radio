@@ -1334,7 +1334,7 @@ fn refine_phase(m: Modulation, z: &[Complex32], rho: f64) -> (f64, f64) {
     }
     let mean_t: f64 = theta.iter().zip(&weight).map(|(t, w)| t * w).sum::<f64>() / wsum;
     if nseg < 4 {
-        return (mean_t, 0.0);
+        return power_law_slope(m, z, mean_t);
     }
     let mean_c: f64 = centre.iter().zip(&weight).map(|(c, w)| c * w).sum::<f64>() / wsum;
     let sxx: f64 = centre
@@ -1359,6 +1359,95 @@ fn refine_phase(m: Modulation, z: &[Complex32], rho: f64) -> (f64, f64) {
     } else {
         (mean_t, 0.0)
     }
+}
+
+/// Largest residual frequency [`power_law_slope`] searches, in cycles per symbol. After the
+/// preamble's estimate, what is left at 0 dB Eb/N0 is within about +-0.0015 (3 sigma; the
+/// preamble is near its Cramer-Rao bound there).
+const SLOPE_SEARCH_CYCLES: f64 = 0.0025;
+
+/// Gain over slope 0, in units of the noise power of the sum, that [`power_law_slope`] needs before
+/// it uses a slope. With no slope the gain of the best of the search is about the largest of a few
+/// independent exponentials of mean 1, so this keeps false slopes to a few percent of frames, and a
+/// false slope is never larger than the search range.
+const SLOPE_GAIN_MIN: f64 = 5.0;
+
+/// Phase and slope of the frame body at low SNR, where [`refine_phase`] has too few segments to
+/// fit a line: the slope `b` (radians per symbol) that makes `|sum_k z_k^M exp(-j M b k)|` largest,
+/// searched over the whole body (so no unwrapping), then the phase at that slope. `M` is the
+/// power-law order. The slope is used only if it raises the sum by [`SLOPE_GAIN_MIN`] over slope 0;
+/// otherwise the result is `(mean_t, 0)`.
+///
+/// Why: with the coarse frequency search on, the preamble leaves up to about 0.0015 cycles per
+/// symbol at 0 dB, which is over 100 degrees across a 64-byte QPSK frame. Without this, QPSK lost
+/// 0.6 to 1.4 dB at 1 to 2 dB Eb/N0 (oasa-radio#14). Returns `(a, b)` like [`refine_phase`].
+fn power_law_slope(m: Modulation, z: &[Complex32], mean_t: f64) -> (f64, f64) {
+    let order = if m == Modulation::Bpsk { 2 } else { 4 };
+    let n = z.len();
+    if n < 32 {
+        return (mean_t, 0.0);
+    }
+    let p: Vec<(f64, f64)> = z
+        .iter()
+        .map(|v| {
+            let (x, y) = (v.re as f64, v.im as f64);
+            let (mut pr, mut pi) = (x, y);
+            for _ in 1..order {
+                (pr, pi) = (pr * x - pi * y, pr * y + pi * x);
+            }
+            (pr, pi)
+        })
+        .collect();
+    let centre = (n - 1) as f64 / 2.0;
+    // the power-law sum at slope b, about the body's centre
+    let sum_at = |b: f64| -> (f64, f64) {
+        let (mut sr, mut si) = (0.0f64, 0.0f64);
+        for (k, &(pr, pi)) in p.iter().enumerate() {
+            let (s, c) = (-(order as f64) * b * (k as f64 - centre)).sin_cos();
+            sr += pr * c - pi * s;
+            si += pr * s + pi * c;
+        }
+        (sr, si)
+    };
+    let pw = |b: f64| {
+        let (r, i) = sum_at(b);
+        r * r + i * i
+    };
+    // grid: a quarter of the resolution, 1 / (order * n) cycles per symbol
+    let step = 2.0 * PI / (4.0 * order as f64 * n as f64);
+    let reach = (2.0 * PI * SLOPE_SEARCH_CYCLES / step).ceil() as i64;
+    let (mut best, mut best_j) = (-1.0f64, 0i64);
+    for j in -reach..=reach {
+        let v = pw(j as f64 * step);
+        if v > best {
+            best = v;
+            best_j = j;
+        }
+    }
+    let mut b = best_j as f64 * step;
+    if best_j.abs() < reach {
+        let (y0, y1, y2) = (pw(b - step).sqrt(), best.sqrt(), pw(b + step).sqrt());
+        let den = y0 - 2.0 * y1 + y2;
+        if den < 0.0 {
+            b += 0.5 * (y0 - y2) / den * step;
+        }
+    }
+    // Noise power of the sum: the total power of the terms less the signal's share of it.
+    let e: f64 = p.iter().map(|&(r, i)| r * r + i * i).sum();
+    let noise = (e - best / n as f64).max(1e-30);
+    if (pw(b) - pw(0.0)) / noise < SLOPE_GAIN_MIN {
+        return (mean_t, 0.0);
+    }
+    let (mut sr, mut si) = sum_at(b);
+    if order == 4 {
+        sr = -sr;
+        si = -si;
+    }
+    // the phase at the centre, on the ambiguity the segments chose (nearest their mean)
+    let st = PI / order as f64;
+    let a_c = si.atan2(sr) / order as f64;
+    let a_c = mean_t + (a_c - mean_t + st).rem_euclid(2.0 * st) - st;
+    (a_c - b * centre, b)
 }
 
 /// Where the peak of three neighbouring metric values lies, as an offset from `i` in samples
