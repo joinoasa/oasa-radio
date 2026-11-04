@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 pub mod channel;
+pub mod fec;
 pub mod fft;
 pub mod frame;
 pub mod iq;
