@@ -346,8 +346,116 @@ fn waveform_decode_can_take_the_length_as_known() {
 }
 
 #[test]
+fn waveform_v1_frames_round_trip_and_report_the_header() {
+    let dir = std::env::temp_dir().join(format!("oasa-wf1-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (m, name) in [("bpsk", "BPSK"), ("qpsk", "QPSK"), ("fsk2", "FSK2")] {
+        let base_s = dir.join(format!("v1-{m}")).display().to_string();
+        let o = run(&[
+            "waveform",
+            "iq",
+            "--mod",
+            m,
+            "--out",
+            &base_s,
+            "--ebn0-db",
+            "20",
+            "--payload-hex",
+            "00ff10a5c3",
+            "--delay",
+            "50",
+            "--seed",
+            "4",
+            "--frame",
+            "v1",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(field(&String::from_utf8_lossy(&o.stdout), "frame"), "v1");
+        let meta = std::fs::read_to_string(format!("{base_s}.sigmf-meta")).unwrap();
+        assert!(meta.contains("\"oasa:frame\": \"v1\""), "{name}: {meta}");
+        let d = run(&[
+            "waveform", "decode", "--mod", m, "--in", &base_s, "--hex", "--frame", "v1",
+        ]);
+        assert!(d.status.success());
+        let out = String::from_utf8_lossy(&d.stdout).to_string();
+        let frame = out
+            .lines()
+            .find(|l| l.contains("\"event\":\"frame\""))
+            .unwrap_or_else(|| panic!("{m}: {out}"));
+        assert_eq!(field(frame, "crc_ok"), "true", "{m}");
+        assert_eq!(field(frame, "payload_hex"), "00ff10a5c3", "{m}");
+        assert!(frame.contains(&format!("\"header\":{{\"version\":0,\"extension\":0,\"modulation\":\"{m}\",\"payload_code\":0,\"pilots\":0,\"length\":5,\"channel_plan\":0,\"coexistence\":0}}")), "{frame}");
+        let done = out.lines().find(|l| l.contains("decode_done")).unwrap();
+        assert_eq!(field(done, "frame"), "v1");
+        assert_eq!(field(done, "frames"), "1");
+        assert_eq!(field(done, "header_rejected"), "0");
+        for k in ["preambles", "sync_rejected", "too_short", "inside_frame"] {
+            field(done, k).parse::<u64>().unwrap();
+        }
+        // read as W0 the same file is not a good frame
+        let w = run(&["waveform", "decode", "--mod", m, "--in", &base_s]);
+        let w = String::from_utf8_lossy(&w.stdout).to_string();
+        assert!(!w.contains("\"crc_ok\":true"), "{m}: {w}");
+        assert!(w.contains("\"frame\":\"w0\""));
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn waveform_ber_v1_counts_headers_through_the_real_path() {
+    let o = run(&[
+        "waveform",
+        "ber",
+        "--mod",
+        "bpsk",
+        "--ebn0-db",
+        "6",
+        "--bits",
+        "20000",
+        "--seed",
+        "2",
+        "--frame",
+        "v1",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    let l = out.lines().next().unwrap();
+    assert_eq!(field(l, "frame"), "v1");
+    let (frames, detected, header_ok): (u64, u64, u64) = (
+        field(l, "frames").parse().unwrap(),
+        field(l, "detected").parse().unwrap(),
+        field(l, "header_ok").parse().unwrap(),
+    );
+    assert_eq!(detected, frames);
+    assert!(header_ok >= frames - 1, "{l}");
+    // W0 lines have no header_ok
+    let w = run(&[
+        "waveform",
+        "ber",
+        "--mod",
+        "bpsk",
+        "--ebn0-db",
+        "6",
+        "--bits",
+        "2000",
+    ]);
+    let w = String::from_utf8_lossy(&w.stdout).to_string();
+    assert!(!w.contains("header_ok") && w.contains("\"frame\":\"w0\""));
+}
+
+#[test]
 fn waveform_bad_arguments_fail_cleanly() {
     for args in [
+        vec![
+            "waveform",
+            "ber",
+            "--mod",
+            "bpsk",
+            "--ebn0-db",
+            "3",
+            "--frame",
+            "v9",
+        ],
         vec!["waveform", "ber", "--mod", "bpsk"],
         vec!["waveform", "ber", "--mod", "16qam", "--ebn0-db", "3"],
         vec![

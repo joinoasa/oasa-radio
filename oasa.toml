@@ -13,6 +13,7 @@ docs = [
   "SECURITY.md",
   "docs/serial-framing.md",
   "docs/waveform-w0.md",
+  "docs/frame-v1.md",
   "firmware/heltec-v3/README.md",
   "research/t-rf3-array/README.md",
 ]

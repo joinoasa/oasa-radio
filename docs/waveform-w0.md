@@ -106,7 +106,7 @@ QPSK's 9 % is within its sampling error (z = +1.8; one sigma is 5 % at 380 expec
 - Fading, multipath, interference, IQ imbalance, a DC offset. (The Pluto has a DC spike; see W1 below.)
 - A continuous stream: `demodulate` takes one buffer and searches all of it. Cost grows as buffer length x 632 multiplications (about 3 ms for a 5000-sample frame buffer at 8 samples per symbol in a release build). A streaming receiver needs a sliding buffer.
 - Coherent 2-FSK. The theory function exists (`ber_bfsk_coherent`) but the receiver is noncoherent.
-- No FEC. W2.
+- No FEC on the payload. W2. The W0 header (length and complement, unprotected) loses a frame to one flipped bit: found-frame rate 27 % at 0 dB and 82 % at 4 dB. [Frame format v1](frame-v1.md) fixes that; W0 stays the default.
 
 ## Energy and SNR conventions
 
@@ -169,6 +169,63 @@ The long sweep (`cargo test --release -p oasa-waveform -- --ignored`) is 2 milli
 
 Lab suite `l1-waveform-w0` (needs `OASA_RADIO_BIN_DIR`): BER by modulation and Eb/N0 with theory computed in Python (`math.erfc`) and the limit `ber_z` within +-3, the written IQ's symbol energy and noise power measured from the cf32 file, round trips with phase, delay, sub-sample delay and frequency offset, and four known-bad cases that must be rejected: a claim 1 dB off, no preamble, noise only, a damaged payload.
 
+## W1 on hardware: B200mini and E310 over cable (2026-11-04)
+
+The modem above, unchanged, between two real radios: an Ettus B200mini and an Ettus USRP E310 joined by coax and
+fixed attenuators, 60 dB each way, at 915 MHz. Lab suite `l2-waveform-w1` in
+[oasa-lab](https://github.com/joinoasa/oasa-lab) (code `oasa_lab/w1test.py`, method in its docs/hardware-suites.md).
+
+![W1 bench wiring](images/w1-bench-wiring.svg)
+
+How it is run: `oasa-radio waveform iq` writes 24 frames with known random 64-byte payloads; they are joined with 400
+samples of silence each, shifted up by a **digital IF of 250 kHz**, scaled to a peak of 0.5 and sent on repeat at **1
+MS/s** (125 kbaud, 8 samples per symbol). The other radio records four repeats; the recording is shifted back down
+and `oasa-radio waveform decode --cfo-search 0.1` finds the frames. **Eb/N0 is measured from the recording** in this
+page's convention: Es from the power on the frames minus the power in the gaps, N0 from the noise spectrum of the
+gaps inside the signal band.
+
+Bit error rate against theory, real radios, outside the job service (bundle checked with `--require-hardware`).
+Loss = measured Eb/N0 minus the Eb/N0 at which theory gives the measured BER:
+
+| Direction | Mod | Eb/N0 dB | errors / bits | BER | theory | loss dB |
+|---|---|---|---|---|---|---|
+| E310 to B200 | BPSK | 3.44 | 668 / 30 208 | 2.21e-2 | 1.79e-2 | +0.37 |
+| | | 5.25 | 273 / 45 568 | 5.99e-3 | 4.82e-3 | +0.26 |
+| | | 7.01 | 35 / 48 640 | 7.20e-4 | 7.60e-4 | -0.04 |
+| B200 to E310 | BPSK | 3.45 | 676 / 32 256 | 2.10e-2 | 1.77e-2 | +0.29 |
+| | | 5.23 | 255 / 44 544 | 5.72e-3 | 4.91e-3 | +0.18 |
+| | | 6.77 | 29 / 48 640 | 5.96e-4 | 1.02e-3 | -0.43 |
+| E310 to B200 | QPSK | 3.38 | 982 / 33 280 | 2.95e-2 | 1.84e-2 | +0.87 |
+| | | 4.93 | 255 / 44 544 | 5.72e-3 | 6.32e-3 | -0.12 |
+| | | 7.13 | 33 / 46 592 | 7.08e-4 | 6.51e-4 | +0.07 |
+| B200 to E310 | QPSK | 3.36 | 727 / 36 352 | 2.00e-2 | 1.87e-2 | +0.12 |
+| | | 5.00 | 249 / 44 544 | 5.59e-3 | 5.95e-3 | -0.08 |
+| | | 7.04 | 34 / 47 104 | 7.22e-4 | 7.35e-4 | -0.01 |
+
+Every point is within 0.9 dB of theory, so within W1's 1 dB of the simulation (which sits on theory, above).
+Known-bad checks on the same bench: a recording with no transmitter gives no frames; a BPSK recording decoded as
+QPSK passes no CRC (as BPSK, 64 frames pass).
+
+What the bench taught, in the order it was found:
+
+1. **200 kS/s does not work on this pair.** The frames were in the recording (in-band 14 dB over the noise; a
+   cross-correlation with the sent file found them at the expected clock offset), yet nothing decoded, while the same
+   file decoded 24 of 24 with no radio in between. The E310 has no DSP (UHD: "No DSP capabilities detected"), so low
+   rates go straight to the AD9361; the likely cause, not proven. 1 MS/s works.
+2. **Zero IF costs about 5 dB.** At 1 MS/s with the signal at DC, BPSK was about 5 dB off theory and frames were
+   missed: the receivers' DC offset and LO leak sit on the signal (item 3 of the list below). A digital IF of 250 kHz
+   puts the DC spike outside the 170 kHz signal band and removes the loss.
+3. **The two crystals differ by about 2.5 ppm** (2.25 kHz at 915 MHz, 0.018 cycles per symbol at 125 kbaud),
+   mirrored between directions. `--cfo-search 0.1` covers it with room.
+4. **Measuring Eb/N0 needs care.** N0 must be taken inside the signal band: out of band, the radios' filters shape
+   the noise and the BER looked 2 to 3 dB better than theory, which a real receiver cannot be. An averaged
+   spectrum must not get the single-periodogram median correction (it adds 1.6 dB).
+5. **A loose SMA join once added about 21 dB** on one path. Tighten every join and re-measure.
+
+Not covered yet: 2-FSK; points below about 3 dB (frames are missed there, so the BER is for the frames found); more
+bits at 7 dB (about 30 errors a point); other radio pairs (Plutos). A streaming receiver (item 1 below) is still
+needed for continuous operation.
+
 ## What W1 needs (two Plutos over cable)
 
 Not done; listed so W1 starts from facts.
@@ -179,7 +236,7 @@ Not done; listed so W1 starts from facts.
 4. **Transmit on cable only**, with the 60 dB rule of the lab, and gain set so the receiver does not clip. The amplitude is estimated per frame, but a clipped signal is not recoverable.
 5. **Sample rate and gain settings recorded** in the SigMF file. `oasa-radio waveform iq` already writes `core:datatype`, `core:sample_rate`, `core:frequency` and `core:datetime`; it does not write `core:sha512` (the lab's own writer adds it when a recording is registered with a device).
 6. **Measure on the bench** what the simulation cannot say: real noise figure and bandwidth, so Eb/N0 at the receiver is known from a power measurement, then repeat this BER table over cable with an attenuator.
-7. Then **W2**: FEC and OFDM. The frame format has no FEC hook yet; whitening and CRC are in place.
+7. Then **W2**: FEC and OFDM. The payload has no FEC yet; whitening and CRC are in place. The header is the exception: [frame format v1](frame-v1.md) protects it with a convolutional code (`fec.rs`, reusable for the payload), because the W0 header loses frames below about 4 dB.
 
 ## Notes on sources and what is unverified
 

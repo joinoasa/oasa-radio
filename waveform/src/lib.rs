@@ -8,7 +8,8 @@
 //!   Kept apart from the modem on purpose.
 //! - [`theory`]: erfc, Q and the textbook BER curves the simulation is checked against.
 //! - [`sim`]: the Monte Carlo BER harness used by the tests and `oasa-radio waveform ber`.
-//! - [`frame`], [`pulse`], [`rng`], [`iq`]: frame format and CRC, the RRC pulse, the seeded generator,
+//! - [`fec`]: the convolutional code and its Viterbi decoder (the frame v1 header uses them).
+//! - [`frame`], [`pulse`], [`rng`], [`iq`]: frame formats (W0, v1) and CRCs, the RRC pulse, the seeded generator,
 //!   the sample type and cf32 byte conversion.
 //!
 //! Energy convention (the one place this goes wrong most often): the modulator makes the energy of
@@ -19,6 +20,7 @@
 #![forbid(unsafe_code)]
 
 pub mod channel;
+pub mod fec;
 pub mod fft;
 pub mod frame;
 pub mod iq;
@@ -28,5 +30,8 @@ pub mod rng;
 pub mod sim;
 pub mod theory;
 
+pub use frame::{FrameFormat, HeaderFields};
 pub use iq::Complex32;
-pub use modem::{CoarseSearch, ConfigError, Modem, ModemConfig, Modulation, RxConfig, RxFrame};
+pub use modem::{
+    CoarseSearch, ConfigError, Modem, ModemConfig, Modulation, RxConfig, RxFrame, RxReport,
+};

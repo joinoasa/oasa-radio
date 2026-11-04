@@ -2,8 +2,12 @@
 //! false alarms, damaged frames, wrong sync words, gain and frequency offset.
 
 use oasa_waveform::channel::{n0_for_ebn0, Channel, Impairments};
-use oasa_waveform::frame::MAX_PAYLOAD;
-use oasa_waveform::{Complex32, Modem, ModemConfig, Modulation, RxConfig};
+use oasa_waveform::frame::{
+    body_bits_v1, crc8, header_symbols, header_symbols_raw, FrameFormat, HeaderFields,
+    HEADER_SYMBOLS, MAX_PAYLOAD,
+};
+use oasa_waveform::sim::{run_found, BerOptions};
+use oasa_waveform::{Complex32, Modem, ModemConfig, Modulation, RxConfig, RxFrame, RxReport};
 use std::f64::consts::PI;
 
 const ALL: [Modulation; 3] = [Modulation::Fsk2, Modulation::Bpsk, Modulation::Qpsk];
@@ -680,5 +684,560 @@ fn many_frames_in_one_buffer_with_the_length_known() {
             ber < 1.6 * theory + 2e-4 && ber > 0.6 * theory - 2e-4,
             "{ebn0} dB: BER {ber:.3e}, theory {theory:.3e}"
         );
+    }
+}
+
+/// A fingerprint of a waveform: every sample rounded to 1e-4 (so a last-bit difference in a
+/// sine does not matter) and folded into an FNV-1a hash.
+fn fingerprint(x: &[Complex32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for s in x {
+        for v in [s.re, s.im] {
+            for b in ((v * 1e4).round() as i32).to_le_bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+    h
+}
+
+#[test]
+fn w0_waveform_does_not_drift() {
+    // The default frame format is W0 and its samples must never change: pinned here (length and a
+    // fingerprint of the whole frame, taken from `main` before v1) for payload 0x00..0x2F, 8 samples per symbol.
+    let payload: Vec<u8> = (0..48u8).collect();
+    for (m, len, fp) in GOLDEN {
+        let md = modem(m);
+        assert_eq!(md.config().frame, FrameFormat::W0);
+        let x = md.modulate(&payload).unwrap();
+        assert_eq!(x.len(), len, "{m:?} length");
+        assert_eq!(
+            fingerprint(&x),
+            fp,
+            "{m:?} fingerprint {:#x}",
+            fingerprint(&x)
+        );
+    }
+}
+
+const GOLDEN: [(Modulation, usize, u64); 3] = [
+    (Modulation::Fsk2, 3960, 0x766b_7f2c_708b_112c),
+    (Modulation::Bpsk, 4081, 0xf66f_4d10_d066_050e),
+    (Modulation::Qpsk, 2417, 0x8e88_0300_2278_daa9),
+];
+
+// ---- frame format v1: protected header ----
+
+fn modem_v1(m: Modulation) -> Modem {
+    Modem::new(ModemConfig {
+        frame: FrameFormat::V1,
+        ..ModemConfig::new(m)
+    })
+    .unwrap()
+}
+
+/// A noiseless buffer with the frame `tx` after `lead` samples.
+fn clean(tx: &[Complex32], lead: usize) -> Vec<Complex32> {
+    let mut ch = Channel::new(1);
+    ch.apply(
+        tx,
+        &Impairments {
+            lead,
+            tail: 40,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn v1_frame_length_and_energy() {
+    for m in ALL {
+        let md = modem_v1(m);
+        for n in [0usize, 1, 64, 255] {
+            let x = md.modulate(&vec![7; n]).unwrap();
+            assert_eq!(x.len(), md.frame_samples(n), "{m:?} {n}");
+            let nsym = (63 + 16 + HEADER_SYMBOLS) as f64
+                + (n + 2) as f64 * 8.0 / m.bits_per_symbol() as f64;
+            let e: f64 = x.iter().map(|s| s.norm_sqr() as f64).sum();
+            assert!((e / nsym - 1.0).abs() < 0.02, "{m:?} {n}: {e} for {nsym}");
+        }
+    }
+    // v1 replaces the 4 bytes of W0 length, complement and (shared) overhead by 152 header symbols:
+    // for 64 bytes of BPSK, 152 + 66 * 8 symbols against 68 * 8
+    let (w0, v1) = (modem(Modulation::Bpsk), modem_v1(Modulation::Bpsk));
+    assert_eq!(
+        v1.frame_samples(64) - w0.frame_samples(64),
+        (152 + 66 * 8 - 68 * 8) * 8
+    );
+}
+
+#[test]
+fn v1_round_trip_random_payloads_and_offsets() {
+    // Payloads of 0 to 255 bytes, random delay, sub-sample delay, phase and a small frequency
+    // offset, at an Eb/N0 where W0 also gets through.
+    for m in ALL {
+        let md = modem_v1(m);
+        let mut ch = Channel::new(21);
+        let ebn0 = if m == Modulation::Fsk2 { 18.0 } else { 12.0 };
+        let n0 = n0_for_ebn0(ebn0, md.energy_per_bit());
+        let mut ok = 0;
+        let total = 40;
+        for i in 0..total {
+            let len = if i < 3 {
+                [0, 1, 255][i]
+            } else {
+                ch.rng().below(256) as usize
+            };
+            let payload = ch.rng().bytes(len);
+            let tx = md.modulate(&payload).unwrap();
+            let lead = ch.rng().below(300) as usize;
+            let imp = Impairments {
+                n0,
+                phase_rad: ch.rng().uniform() * 2.0 * PI,
+                frac_delay: ch.rng().uniform(),
+                cfo_cycles_per_sample: (ch.rng().uniform() - 0.5) * 0.004 / 8.0,
+                lead,
+                tail: 30,
+            };
+            let y = ch.apply(&tx, &imp);
+            let got = md.demodulate(&y);
+            let hit = got.iter().find(|f| f.crc_ok && f.payload == payload);
+            if let Some(f) = hit {
+                ok += 1;
+                assert!(f.start.abs_diff(lead) <= 1, "{m:?} frame {i}");
+                assert_eq!(f.header, Some(HeaderFields::new(m.code(), len as u8)));
+            }
+        }
+        assert!(ok >= total - 2, "{m:?}: {ok} of {total}");
+    }
+}
+
+#[test]
+fn v1_noiseless_round_trip_is_exact() {
+    for m in ALL {
+        let md = modem_v1(m);
+        let mut ch = Channel::new(22);
+        for i in 0..30 {
+            let len = ch.rng().below(256) as usize;
+            let payload = ch.rng().bytes(len);
+            let tx = md.modulate(&payload).unwrap();
+            let imp = Impairments {
+                phase_rad: ch.rng().uniform() * 2.0 * PI,
+                frac_delay: ch.rng().uniform(),
+                lead: 50 + i,
+                tail: 20,
+                ..Default::default()
+            };
+            let (got, rep) = md.demodulate_report(&ch.apply(&tx, &imp), &RxConfig::default());
+            assert_eq!(got.len(), 1, "{m:?} {i}");
+            assert!(got[0].crc_ok && got[0].payload == payload, "{m:?} {i}");
+            assert_eq!(rep.header_rejected, 0, "{m:?} {i}");
+        }
+    }
+}
+
+#[test]
+fn v1_qpsk_long_body_needs_the_estimate_over_the_header() {
+    // QPSK, 255-byte payloads, offsets within +-0.002 cycles per symbol, 12 dB, fixed seed. The
+    // preamble alone cannot see so small an offset, and by the end of the header and a long body
+    // the phase has turned too far. The second estimate over the known header fixes it. With that
+    // step removed 4 of these 40 frames fail the CRC-16 (checked by disabling it).
+    let md = modem_v1(Modulation::Qpsk);
+    let mut ch = Channel::new(41);
+    let n0 = n0_for_ebn0(12.0, md.energy_per_bit());
+    let mut ok = 0;
+    for _ in 0..40 {
+        let payload = ch.rng().bytes(255);
+        let tx = md.modulate(&payload).unwrap();
+        let cfo = (ch.rng().uniform() - 0.5) * 0.004;
+        let imp = Impairments {
+            n0,
+            phase_rad: ch.rng().uniform() * 2.0 * PI,
+            frac_delay: ch.rng().uniform(),
+            cfo_cycles_per_sample: cfo / 8.0,
+            lead: 80,
+            tail: 30,
+        };
+        let got = md.demodulate(&ch.apply(&tx, &imp));
+        ok += got.iter().any(|f| f.crc_ok && f.payload == payload) as usize;
+    }
+    assert_eq!(ok, 40);
+}
+
+#[test]
+fn v1_coarse_search_decodes_across_the_range() {
+    for m in ALL {
+        let md = modem_v1(m);
+        let mut ch = Channel::new(23);
+        let ebn0 = if m == Modulation::Fsk2 { 16.0 } else { 12.0 };
+        let n0 = n0_for_ebn0(ebn0, md.energy_per_bit());
+        for cfo in [-1.5, -0.6, -0.0253, 0.0, 0.31, 1.0, 1.5] {
+            for _ in 0..3 {
+                let len = ch.rng().below(256) as usize;
+                let payload = ch.rng().bytes(len);
+                let tx = md.modulate(&payload).unwrap();
+                let lead = 10 + ch.rng().below(190) as usize;
+                let imp = Impairments {
+                    n0,
+                    phase_rad: ch.rng().uniform() * 2.0 * PI,
+                    cfo_cycles_per_sample: cfo / 8.0,
+                    frac_delay: ch.rng().uniform(),
+                    lead,
+                    tail: 40,
+                };
+                let got = md.demodulate_with(&ch.apply(&tx, &imp), &wide());
+                assert_eq!(got.len(), 1, "{m:?} cfo {cfo}: {} frames", got.len());
+                assert!(
+                    got[0].crc_ok && got[0].payload == payload,
+                    "{m:?} cfo {cfo}"
+                );
+                assert!(got[0].start.abs_diff(lead) <= 1, "{m:?} cfo {cfo}");
+            }
+        }
+    }
+}
+
+/// Send a frame made from `tx` through a clean channel and return what the receiver says.
+fn receive(md: &Modem, tx: &[Complex32], rx: &RxConfig) -> (Vec<RxFrame>, RxReport) {
+    md.demodulate_report(&clean(tx, 77), rx)
+}
+
+#[test]
+fn v1_header_rules_reject_and_count() {
+    let payload = [1u8, 2, 3, 4, 5];
+    for m in ALL {
+        let md = modem_v1(m);
+        let good = HeaderFields::new(m.code(), 5);
+        let other_mod = Modulation::from_code((m.code() + 1) % 3).unwrap().code();
+        let bad = [
+            HeaderFields { version: 1, ..good },
+            HeaderFields {
+                extension: 1,
+                ..good
+            },
+            HeaderFields { pilots: 1, ..good },
+            HeaderFields {
+                payload_code: 1,
+                ..good
+            },
+            HeaderFields {
+                payload_code: 7,
+                ..good
+            },
+            HeaderFields {
+                modulation: other_mod,
+                ..good
+            },
+            HeaderFields {
+                modulation: 3,
+                ..good
+            },
+        ];
+        for h in bad {
+            let tx = md.modulate_v1(&payload, &h).unwrap();
+            let (got, rep) = receive(&md, &tx, &RxConfig::default());
+            assert!(got.is_empty(), "{m:?} {h:?} was accepted");
+            assert!(rep.header_rejected >= 1, "{m:?} {h:?}");
+        }
+        // a wrong CRC-8
+        let f = good.to_bytes();
+        let block = [f[0], f[1], f[2], crc8(&f) ^ 0x10];
+        let tx = md
+            .modulate_v1_parts(&header_symbols_raw(block), &body_bits_v1(&good, &payload))
+            .unwrap();
+        let (got, rep) = receive(&md, &tx, &RxConfig::default());
+        assert!(got.is_empty(), "{m:?}");
+        assert!(rep.header_rejected >= 1, "{m:?}");
+        // and the good one passes
+        let tx = md.modulate_v1(&payload, &good).unwrap();
+        let (got, rep) = receive(&md, &tx, &RxConfig::default());
+        assert_eq!(got.len(), 1);
+        assert_eq!(rep.header_rejected, 0);
+    }
+}
+
+#[test]
+fn v1_header_rules_hold_on_the_coarse_path_too() {
+    let md = modem_v1(Modulation::Bpsk);
+    let payload = [9u8; 6];
+    let h = HeaderFields {
+        extension: 1,
+        ..HeaderFields::new(0, 6)
+    };
+    let tx = md.modulate_v1(&payload, &h).unwrap();
+    let (got, rep) = receive(&md, &tx, &wide());
+    assert!(got.is_empty());
+    assert!(rep.header_rejected >= 1);
+}
+
+#[test]
+fn v1_reserved_fields_are_accepted_and_reported() {
+    for m in ALL {
+        let md = modem_v1(m);
+        let h = HeaderFields {
+            channel_plan: 0xB,
+            coexistence: 0x5,
+            ..HeaderFields::new(m.code(), 9)
+        };
+        let payload = [0x5Au8; 9];
+        let tx = md.modulate_v1(&payload, &h).unwrap();
+        for rx in [RxConfig::default(), wide()] {
+            let (got, rep) = receive(&md, &tx, &rx);
+            assert_eq!(got.len(), 1, "{m:?}");
+            assert!(got[0].crc_ok && got[0].payload == payload);
+            assert_eq!(got[0].header, Some(h));
+            assert_eq!(rep.header_rejected, 0);
+        }
+    }
+}
+
+#[test]
+fn v1_damaged_body_fails_the_crc16() {
+    // Blank a stretch of samples inside the body: the header decodes, the CRC-16 fails.
+    for m in ALL {
+        let md = modem_v1(m);
+        let payload: Vec<u8> = (0..40u8).collect();
+        let mut tx = md.modulate(&payload).unwrap();
+        let body0 = (63 + 16 + HEADER_SYMBOLS) * 8 + 8 * 8;
+        for s in &mut tx[body0..body0 + 5 * 8] {
+            *s = Complex32::ZERO;
+        }
+        let (got, _) = receive(&md, &tx, &RxConfig::default());
+        assert_eq!(got.len(), 1, "{m:?}");
+        assert!(!got[0].crc_ok, "{m:?}");
+        assert!(got[0].header.is_some());
+    }
+}
+
+#[test]
+fn v1_a_miscorrected_length_is_caught_by_the_crc16() {
+    // A header that decodes (CRC-8 fine) to another length than the one the CRC-16 was made
+    // for: here the sender's CRC-16 covered length 20, the header says 21 and 19.
+    for m in ALL {
+        let md = modem_v1(m);
+        let payload: Vec<u8> = (0..20u8).collect();
+        let real = HeaderFields::new(m.code(), 20);
+        for wrong in [19u8, 21] {
+            let h = HeaderFields::new(m.code(), wrong);
+            let tx = md
+                .modulate_v1_parts(&header_symbols(&h), &body_bits_v1(&real, &payload))
+                .unwrap();
+            let (got, _) = receive(&md, &tx, &RxConfig::default());
+            // 21 may run off the buffer; whatever comes back must not be trusted
+            assert!(got.iter().all(|f| !f.crc_ok), "{m:?} length {wrong}");
+        }
+    }
+}
+
+#[test]
+fn v1_noise_only_gives_no_frames() {
+    for m in ALL {
+        let md = modem_v1(m);
+        let mut ch = Channel::new(78);
+        let y = ch.noise(200_000, 1.0);
+        let (got, rep) = md.demodulate_report(&y, &RxConfig::default());
+        assert!(got.is_empty(), "{m:?}: {} false frames", got.len());
+        assert_eq!(rep.preambles, 0);
+        let got = md.demodulate_with(&y, &wide());
+        assert!(got.is_empty(), "{m:?} coarse");
+    }
+}
+
+#[test]
+fn a_w0_modem_does_not_send_v1_and_formats_do_not_mix() {
+    let w0 = modem(Modulation::Bpsk);
+    let v1 = modem_v1(Modulation::Bpsk);
+    assert!(w0.modulate_v1(&[1], &HeaderFields::default()).is_err());
+    let tx = v1.modulate(&[1, 2, 3]).unwrap();
+    let (got, rep) = receive(&w0, &tx, &RxConfig::default());
+    assert!(got.iter().all(|f| !f.crc_ok));
+    assert!(rep.preambles >= 1);
+    let tx = w0.modulate(&[1, 2, 3]).unwrap();
+    let (got, _) = receive(&v1, &tx, &RxConfig::default());
+    assert!(got.is_empty());
+}
+
+#[test]
+fn report_counts_add_up() {
+    // Every candidate ends in a frame or exactly one count, in both formats and on both paths.
+    for frame in [FrameFormat::W0, FrameFormat::V1] {
+        let md = Modem::new(ModemConfig {
+            frame,
+            ..ModemConfig::new(Modulation::Bpsk)
+        })
+        .unwrap();
+        let mut ch = Channel::new(31);
+        let n0 = n0_for_ebn0(1.0, md.energy_per_bit());
+        for rx in [RxConfig::default(), wide()] {
+            for _ in 0..30 {
+                let tx = md.modulate(&ch.rng().bytes(30)).unwrap();
+                let imp = Impairments {
+                    n0,
+                    lead: 40,
+                    tail: if ch.rng().below(2) == 0 { 8 } else { 3000 },
+                    ..Default::default()
+                };
+                let (got, r) = md.demodulate_report(&ch.apply(&tx, &imp), &rx);
+                assert_eq!(
+                    r.preambles,
+                    got.len() + r.sync_rejected + r.header_rejected + r.too_short + r.inside_frame,
+                    "{frame:?} {r:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn candidates_inside_a_found_frame_are_not_lost_frames() {
+    // A long v1 frame at 6 dB: its header is good, so its span is known, and the candidates its
+    // body makes are counted as inside the frame.
+    let md = modem_v1(Modulation::Bpsk);
+    let mut ch = Channel::new(32);
+    let n0 = n0_for_ebn0(6.0, md.energy_per_bit());
+    let mut inside = 0;
+    for _ in 0..40 {
+        let tx = md.modulate(&ch.rng().bytes(255)).unwrap();
+        let y = ch.apply(
+            &tx,
+            &Impairments {
+                n0,
+                lead: 50,
+                tail: 50,
+                ..Default::default()
+            },
+        );
+        let (got, r) = md.demodulate_report(&y, &RxConfig::default());
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (r.sync_rejected, r.header_rejected, r.too_short),
+            (0, 0, 0),
+            "{r:?}"
+        );
+        inside += r.inside_frame;
+    }
+    assert!(
+        inside > 0,
+        "no body candidates seen; the test checks nothing"
+    );
+}
+
+/// The report says where W0 loses frames. BPSK, 200 frames each, seed 5, no `expected_len`:
+/// `header_rejected` is close to frames sent minus frames found, and far above the other counts.
+/// Measured: lost 161 / header_rejected 147 at 0 dB, 100 / 98 at 2 dB, 34 / 34 at 4 dB.
+#[test]
+fn w0_report_blames_the_header() {
+    let w0 = BerOptions::default();
+    for db in [0.0, 2.0, 4.0] {
+        let a = run_found(Modulation::Bpsk, db, 200, 5, &w0).unwrap();
+        let (r, lost) = (&a.report, 200 - a.found as usize);
+        assert!(lost >= 20, "{db} dB: too few losses to say anything");
+        assert!(
+            r.header_rejected as f64 >= 0.8 * lost as f64
+                && r.header_rejected as f64 <= 1.1 * lost as f64,
+            "{db} dB: lost {lost}, {r:?}"
+        );
+        assert!(
+            r.header_rejected >= 5 * (r.sync_rejected + r.too_short),
+            "{db} dB: {r:?}"
+        );
+    }
+}
+
+/// The point of v1: at low Eb/N0 the W0 header is the weak link. BPSK, no frequency offset, no
+/// `expected_len`, 200 frames each, fixed seeds. Theory for W0: found = 0.9214^16 = 27 % at 0 dB,
+/// 54 % at 2 dB (the preamble detector itself finds about every frame).
+#[test]
+fn v1_finds_frames_where_w0_loses_them_to_the_header() {
+    let w0 = BerOptions::default();
+    let v1 = BerOptions {
+        frame: FrameFormat::V1,
+        ..BerOptions::default()
+    };
+    for (db, w0_max) in [(0.0, 0.40), (2.0, 0.65)] {
+        let a = run_found(Modulation::Bpsk, db, 200, 5, &w0).unwrap();
+        let b = run_found(Modulation::Bpsk, db, 200, 5, &v1).unwrap();
+        eprintln!(
+            "{db} dB: W0 {} / 200, {:?}; V1 {} / 200, {:?}",
+            a.found, a.report, b.found, b.report
+        );
+        assert!(
+            a.found as f64 <= w0_max * 200.0,
+            "W0 at {db} dB: {} found",
+            a.found
+        );
+        assert!(
+            b.found as f64 >= 0.97 * 200.0,
+            "V1 at {db} dB: {} found",
+            b.found
+        );
+        assert!(b.report.header_rejected <= 2, "{:?}", b.report);
+    }
+    // 6 dB: v1 finds every frame; the report shows no lost frames, only candidates inside frames
+    let b = run_found(Modulation::Bpsk, 6.0, 200, 5, &v1).unwrap();
+    assert_eq!(b.found, 200);
+    let r = &b.report;
+    assert!(
+        r.header_rejected + r.sync_rejected + r.too_short <= 3,
+        "{r:?}"
+    );
+    assert!(r.inside_frame > 100, "{r:?}");
+}
+
+/// Sync tolerance for the docs (v1, BPSK, 400 frames, seed 11): `cargo test --release -p
+/// oasa-waveform --test frames sync_tolerance_table -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn sync_tolerance_table() {
+    for sync_max_errors in [3, 5, 8] {
+        let opts = BerOptions {
+            frame: FrameFormat::V1,
+            rx: RxConfig {
+                sync_max_errors,
+                ..RxConfig::default()
+            },
+            ..BerOptions::default()
+        };
+        let mut row = format!("sync_max_errors {sync_max_errors}:");
+        for db in [-2.0, -1.0, 0.0, 2.0, 6.0] {
+            let p = run_found(Modulation::Bpsk, db, 400, 11, &opts).unwrap();
+            row += &format!(" {} ({:?})", p.found, p.report);
+        }
+        println!("{row}");
+    }
+}
+
+/// Found-frame rates for the docs: `cargo test --release -p oasa-waveform --test frames
+/// found_rate_table -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn found_rate_table() {
+    for (label, cfo_search, cfo_random) in [
+        ("no offset", 0.0f32, 0.0),
+        ("cfo_search 0.1, offset +-0.018", 0.1, 0.018),
+    ] {
+        println!("{label}: frames found / 400");
+        for m in [Modulation::Bpsk, Modulation::Qpsk] {
+            for frame in [FrameFormat::W0, FrameFormat::V1] {
+                let opts = BerOptions {
+                    frame,
+                    cfo_random,
+                    rx: RxConfig {
+                        cfo_search,
+                        ..RxConfig::default()
+                    },
+                    ..BerOptions::default()
+                };
+                let mut row = format!("{:5} {:2}:", m.name(), frame.name());
+                for db in [-2.0, -1.0, 0.0, 1.0, 2.0, 4.0, 6.0] {
+                    let p = run_found(m, db, 400, 11, &opts).unwrap();
+                    row += &format!(
+                        " {:3} ({:3} hdr rej, {:3} pre)",
+                        p.found, p.report.header_rejected, p.report.preambles
+                    );
+                }
+                println!("{row}");
+            }
+        }
     }
 }

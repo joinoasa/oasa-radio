@@ -70,12 +70,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Xtensa Rust toolchain (espup)
-        uses: esp-rs/xtensa-toolchain@v1.6.0
+        uses: esp-rs/xtensa-toolchain@v1.7.0
         with:
           buildtargets: esp32s3
           default: false
       - name: Cache crates and build output
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
