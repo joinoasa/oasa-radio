@@ -1049,7 +1049,20 @@ impl Modem {
         let mut mu_final = mu;
         if self.cfg.modulation != Modulation::Fsk2 && rx.refine_phase {
             let rho = amp * amp / noise_per_sample;
-            let (mut a, mut b) = self.track(&z, rho);
+            // The preamble and sync word are known: their matched filter outputs with the data
+            // taken off, at their symbol index counted from the body's first symbol (negative).
+            let known_at = |dm: &SymbolDemod| -> Vec<(f64, Complex32)> {
+                self.ref_bits
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &bit)| {
+                        let s = 1.0 - 2.0 * (bit & 1) as f32;
+                        (j as f64 - body_start as f64, dm.z(j) * s)
+                    })
+                    .collect()
+            };
+            let known = known_at(&dem);
+            let (mut a, mut b) = self.track(&z, rho, &known);
             bits = decide_psk(self.cfg.modulation, &z, a, b);
             // Timing: the preamble fixes it to a fraction of a sample at best. The frame's own
             // symbols, compared with the decisions just made, do better: pick the shift of the
@@ -1091,7 +1104,7 @@ impl Modem {
                 z.clear();
                 bits.clear();
                 dm.body_symbols(body_start, total_syms - body_start, &mut z, &mut bits);
-                (a, b) = self.track(&z, rho);
+                (a, b) = self.track(&z, rho, &known_at(&dm));
                 bits = decide_psk(self.cfg.modulation, &z, a, b);
             }
         }
@@ -1123,9 +1136,17 @@ impl Modem {
         })
     }
 
-    /// Carrier phase and frequency of the frame body: the power-law fit, then decision-directed polish.
-    /// Returns `(a, b)`: turn symbol `k` back by `a + b * k` radians.
-    fn track(&self, z: &[Complex32], rho: f64) -> (f64, f64) {
+    /// Carrier phase and frequency of the frame body. Returns `(a, b)`: turn body symbol `k` back by
+    /// `a + b * k` radians.
+    ///
+    /// First the power-law fit ([`refine_phase`]) with decision-directed polish, as before. Then, if
+    /// the known symbols (`known`: preamble and sync word, data taken off, at their index from the
+    /// body's first symbol) and the body together are more likely under another phase line, that line
+    /// is used ([`ml_line`]). The power law knows the phase only to a quarter turn (QPSK) and its
+    /// slope is noisy at low SNR; a drift left by the preamble's frequency estimate then put the
+    /// body on the wrong quarter, or let it turn away, in a few percent of QPSK frames at 0 dB
+    /// Eb/N0 (oasa-radio#14). The known symbols fix the phase near the frame start without ambiguity.
+    fn track(&self, z: &[Complex32], rho: f64, known: &[(f64, Complex32)]) -> (f64, f64) {
         let m = self.cfg.modulation;
         let (mut a, b) = refine_phase(m, z, rho);
         // Decision-directed polish: with the data mostly right it uses the whole frame without
@@ -1133,7 +1154,16 @@ impl Modem {
         for _ in 0..2 {
             a += dd_phase_error(m, z, a, b);
         }
-        (a, b)
+        if known.is_empty() {
+            return (a, b);
+        }
+        let ll = |a: f64, b: f64| line_log_likelihood(m, z, known, rho, a, b);
+        let (ma, mb) = ml_line(m, z, known, rho);
+        if ll(ma, mb) > ll(a, b) {
+            (ma, mb)
+        } else {
+            (a, b)
+        }
     }
 
     /// Payload bits of a frame body as the receiver sees them, for tests: modulate `bits`,
@@ -1359,6 +1389,119 @@ fn refine_phase(m: Modulation, z: &[Complex32], rho: f64) -> (f64, f64) {
     } else {
         (mean_t, 0.0)
     }
+}
+
+/// `ln cosh(u)`, without overflow for large `|u|`.
+fn ln_cosh(u: f64) -> f64 {
+    let u = u.abs();
+    if u > 18.0 {
+        // exp(-36) is below f64 resolution next to u
+        return u - std::f64::consts::LN_2;
+    }
+    u + (-2.0 * u).exp().ln_1p() - std::f64::consts::LN_2
+}
+
+/// Log-likelihood (up to a constant) of the phase line `a + b * k` given the body symbols `z`
+/// (unknown, equally likely data) and the known symbols `known` (data taken off; one bit per symbol,
+/// unit energy). `rho` is Es/N0: the matched filter outputs have amplitude 1 and noise variance
+/// `1 / rho`. Exact for BPSK and Gray QPSK in white noise.
+fn line_log_likelihood(
+    m: Modulation,
+    z: &[Complex32],
+    known: &[(f64, Complex32)],
+    rho: f64,
+    a: f64,
+    b: f64,
+) -> f64 {
+    let turn = |v: Complex32, (c, s): (f64, f64)| {
+        let (x, y) = (v.re as f64, v.im as f64);
+        (x * c - y * s, x * s + y * c)
+    };
+    let mut ll = 0.0;
+    for &(k, w) in known {
+        let (s, c) = (-(a + b * k)).sin_cos();
+        ll += 2.0 * rho * turn(w, (c, s)).0;
+    }
+    let g = if m == Modulation::Bpsk {
+        2.0 * rho
+    } else {
+        std::f64::consts::SQRT_2 * rho
+    };
+    // the rotation for symbol k, stepped by e^{-jb} (re-anchored every 64 symbols against drift)
+    let (s1, c1) = (-b).sin_cos();
+    let mut rot = (1.0f64, 0.0f64);
+    for (k, &v) in z.iter().enumerate() {
+        if k % 64 == 0 {
+            let (s, c) = (-(a + b * k as f64)).sin_cos();
+            rot = (c, s);
+        }
+        let (x, y) = turn(v, rot);
+        ll += ln_cosh(g * x);
+        if m == Modulation::Qpsk {
+            ll += ln_cosh(g * y);
+        }
+        rot = (rot.0 * c1 - rot.1 * s1, rot.0 * s1 + rot.1 * c1);
+    }
+    ll
+}
+
+/// The phase line `(a, b)` that maximizes [`line_log_likelihood`]: slopes within 5 times the
+/// Cramer-Rao bound of the preamble's frequency estimate (at most +-[`SLOPE_SEARCH_CYCLES`] cycles
+/// per symbol), and for each the phase within 16 degrees of what the
+/// known symbols alone give at that slope (they are long and strong enough that the truth is well
+/// inside that); then a finer search around the best.
+fn ml_line(m: Modulation, z: &[Complex32], known: &[(f64, Complex32)], rho: f64) -> (f64, f64) {
+    let anchor = |b: f64| {
+        let (mut sr, mut si) = (0.0f64, 0.0f64);
+        for &(k, w) in known {
+            let (s, c) = (-b * k).sin_cos();
+            sr += w.re as f64 * c - w.im as f64 * s;
+            si += w.re as f64 * s + w.im as f64 * c;
+        }
+        si.atan2(sr)
+    };
+    let ll = |a: f64, b: f64| line_log_likelihood(m, z, known, rho, a, b);
+    let span = (z.len() as f64 + known.len() as f64).max(1.0);
+    // What the preamble's frequency estimate can leave: its Cramer-Rao bound from the known symbols,
+    // sqrt(6 / (rho N (N^2 - 1))) radians per symbol, 5 of those (the estimate is near the bound,
+    // and an offset the preamble did not take as real is under about 4). Never more than
+    // SLOPE_SEARCH_CYCLES. Narrower at high SNR: fewer false peaks to choose from, and faster.
+    let n = known.len().max(2) as f64;
+    let crb = (6.0 / (rho.max(1e-3) * n * (n * n - 1.0))).sqrt();
+    let b_max = (5.0 * crb).min(2.0 * PI * SLOPE_SEARCH_CYCLES);
+    // coarse: slope step = half a radian over the whole span; phase step 8 degrees
+    let b_step = 0.5 / span;
+    let a_step = 8f64.to_radians();
+    let nb = (b_max / b_step).ceil() as i64;
+    let (mut best, mut ba, mut bb) = (f64::NEG_INFINITY, 0.0, 0.0);
+    for i in -nb..=nb {
+        let b = i as f64 * b_step;
+        let a0 = anchor(b);
+        for j in -2..=2 {
+            let a = a0 + j as f64 * a_step;
+            let v = ll(a, b);
+            if v > best {
+                (best, ba, bb) = (v, a, b);
+            }
+        }
+    }
+    // fine: shrink the steps around the best, a few rounds
+    let (mut sa, mut sb) = (a_step / 2.0, b_step / 2.0);
+    for _ in 0..5 {
+        let (ca, cb) = (ba, bb);
+        for i in -1..=1 {
+            for j in -1..=1 {
+                let (a, b) = (ca + j as f64 * sa, cb + i as f64 * sb);
+                let v = ll(a, b);
+                if v > best {
+                    (best, ba, bb) = (v, a, b);
+                }
+            }
+        }
+        sa /= 2.0;
+        sb /= 2.0;
+    }
+    (ba, bb)
 }
 
 /// Largest residual frequency [`power_law_slope`] searches, in cycles per symbol. After the

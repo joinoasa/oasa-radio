@@ -162,21 +162,27 @@ fn small_frequency_offset_does_not_change_the_ber() {
 
 #[test]
 fn qpsk_with_the_coarse_search_tracks_at_low_snr() {
-    // oasa-radio#14: with the coarse search on, the preamble leaves a frequency error that QPSK's
-    // power-law fit could not take out at low SNR (1.40 x theory at 2 dB, this offset and seed). The
-    // slope search over the whole body brings it to 1.11 x.
-    let opts = BerOptions {
-        cfo_cycles_per_symbol: 0.018,
-        rx: RxConfig {
-            cfo_search: 0.1,
-            ..RxConfig::default()
-        },
-        ..BerOptions::default()
-    };
-    let p = run_ber(Modulation::Qpsk, 2.0, 300_000, 1, &opts).unwrap();
-    println!("cfo 0.018, search 0.1: {}", show(&p));
-    assert_eq!(p.detected, p.frames);
-    assert!(p.ber < 1.25 * p.theory, "{}", show(&p));
+    // oasa-radio#14: with the coarse search on, the preamble leaves a frequency error (near its
+    // Cramer-Rao bound) that QPSK's power-law fit could not take out at low SNR: a few percent of
+    // frames turned away or landed on the wrong quarter turn. Before the fix, at this seed: 1.32 x
+    // theory at 0 dB with no offset, 1.52 x with the bench's offset 0.018. The joint phase-line
+    // search over the known symbols and the body brings every point within 1.1 x.
+    for cfo in [0.0, 0.018] {
+        let opts = BerOptions {
+            cfo_cycles_per_symbol: cfo,
+            rx: RxConfig {
+                cfo_search: 0.1,
+                ..RxConfig::default()
+            },
+            ..BerOptions::default()
+        };
+        for db in [0.0, 1.0, 2.0] {
+            let p = run_ber(Modulation::Qpsk, db, 300_000, 5, &opts).unwrap();
+            println!("cfo {cfo}, search 0.1: {}", show(&p));
+            assert_eq!(p.detected, p.frames);
+            assert!(p.ber < 1.1 * p.theory, "cfo {cfo}: {}", show(&p));
+        }
+    }
 }
 
 /// 0 to 10 dB, a million bits a point. Slow: run in release with `--ignored`.
