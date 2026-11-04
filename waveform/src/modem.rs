@@ -644,36 +644,46 @@ impl Modem {
             acc += s.norm_sqr() as f64;
             prefix.push(acc);
         }
-        let mut best = vec![0.0f32; positions];
         let bins = rx.cfo_bins as isize;
-        let (mut pre, mut pim) = (vec![0.0f32; m], vec![0.0f32; m]);
-        for b in -bins..=bins {
-            let theta = 2.0 * PI * (b as f64) * rx.cfo_step as f64 / self.cfg.sps as f64;
-            for (n, p) in self.refw.iter().enumerate() {
-                let rot = Complex32::from_polar(1.0, (theta * n as f64) as f32);
-                let v = *p * rot;
-                pre[n] = v.re;
-                pim[n] = v.im;
-            }
-            for (tau, slot) in best.iter_mut().enumerate() {
-                let win = &r[tau..tau + m];
-                let (mut cr, mut ci) = (0.0f32, 0.0f32);
-                for ((w, &a), &b) in win.iter().zip(&pre).zip(&pim) {
-                    // r * conj(p)
-                    cr += w.re * a + w.im * b;
-                    ci += w.im * a - w.re * b;
-                }
-                let e = prefix[tau + m] - prefix[tau];
-                if e > 1e-30 {
-                    let v = ((cr as f64 * cr as f64 + ci as f64 * ci as f64)
-                        / (self.ref_energy * e)) as f32;
-                    if v > *slot {
-                        *slot = v;
+        // the reference turned to each frequency bin, as separate real and imaginary parts
+        let refs: Vec<(Vec<f32>, Vec<f32>)> = (-bins..=bins)
+            .map(|b| {
+                let theta = 2.0 * PI * (b as f64) * rx.cfo_step as f64 / self.cfg.sps as f64;
+                self.refw
+                    .iter()
+                    .enumerate()
+                    .map(|(n, p)| {
+                        let v = *p * Complex32::from_polar(1.0, (theta * n as f64) as f32);
+                        (v.re, v.im)
+                    })
+                    .unzip()
+            })
+            .collect();
+        // Every position is independent: split them over the CPUs. The result is the same, bit for bit.
+        let one = |range: std::ops::Range<usize>| -> Vec<f32> {
+            let mut best = vec![0.0f32; range.len()];
+            for (pre, pim) in &refs {
+                for (slot, tau) in best.iter_mut().zip(range.clone()) {
+                    let win = &r[tau..tau + m];
+                    let (mut cr, mut ci) = (0.0f32, 0.0f32);
+                    for ((w, &a), &b) in win.iter().zip(pre).zip(pim) {
+                        // r * conj(p)
+                        cr += w.re * a + w.im * b;
+                        ci += w.im * a - w.re * b;
+                    }
+                    let e = prefix[tau + m] - prefix[tau];
+                    if e > 1e-30 {
+                        let v = ((cr as f64 * cr as f64 + ci as f64 * ci as f64)
+                            / (self.ref_energy * e)) as f32;
+                        if v > *slot {
+                            *slot = v;
+                        }
                     }
                 }
             }
-        }
-        best
+            best
+        };
+        in_parallel(positions, 4096, one)
     }
 
     /// The coarse frequency search for `rx`, or `None` if `rx.cfo_search` is 0.
@@ -737,50 +747,56 @@ impl Modem {
         }
         let n = cs.fft_len;
         let span = (n * cs.chunk) as f64;
-        let mut buf = vec![Complex32::ZERO; n];
-        let mut out = Vec::with_capacity(positions.div_ceil(cs.step));
-        for tau in (0..positions).step_by(cs.step) {
-            buf.fill(Complex32::ZERO);
-            let win = &r[tau..tau + m];
-            for (slot, (w, p)) in buf
-                .iter_mut()
-                .zip(win.chunks(cs.chunk).zip(self.refw.chunks(cs.chunk)))
-            {
-                let (mut cr, mut ci) = (0.0f32, 0.0f32);
-                for (a, b) in w.iter().zip(p) {
-                    // a * conj(b)
-                    cr += a.re * b.re + a.im * b.im;
-                    ci += a.im * b.re - a.re * b.im;
+        let count = positions.div_ceil(cs.step);
+        // Every position is independent: split them over the CPUs. The result is the same, bit for bit.
+        let one = |range: std::ops::Range<usize>| -> Vec<(f32, f32)> {
+            let mut buf = vec![Complex32::ZERO; n];
+            let mut out = Vec::with_capacity(range.len());
+            for tau in range.map(|i| i * cs.step) {
+                buf.fill(Complex32::ZERO);
+                let win = &r[tau..tau + m];
+                for (slot, (w, p)) in buf
+                    .iter_mut()
+                    .zip(win.chunks(cs.chunk).zip(self.refw.chunks(cs.chunk)))
+                {
+                    let (mut cr, mut ci) = (0.0f32, 0.0f32);
+                    for (a, b) in w.iter().zip(p) {
+                        // a * conj(b)
+                        cr += a.re * b.re + a.im * b.im;
+                        ci += a.im * b.re - a.re * b.im;
+                    }
+                    *slot = Complex32::new(cr, ci);
                 }
-                *slot = Complex32::new(cr, ci);
-            }
-            cs.fft.forward(&mut buf);
-            let (mut best, mut best_k) = (-1.0f32, 0isize);
-            for k in -(cs.bins as isize)..=cs.bins as isize {
-                let v = buf[k.rem_euclid(n as isize) as usize].norm_sqr();
-                if v > best {
-                    best = v;
-                    best_k = k;
+                cs.fft.forward(&mut buf);
+                let (mut best, mut best_k) = (-1.0f32, 0isize);
+                for k in -(cs.bins as isize)..=cs.bins as isize {
+                    let v = buf[k.rem_euclid(n as isize) as usize].norm_sqr();
+                    if v > best {
+                        best = v;
+                        best_k = k;
+                    }
                 }
+                let mag =
+                    |k: isize| buf[k.rem_euclid(n as isize) as usize].norm_sqr().sqrt() as f64;
+                let (a, b, c) = (mag(best_k - 1), mag(best_k), mag(best_k + 1));
+                let den = a - 2.0 * b + c;
+                let delta = if den < 0.0 {
+                    (0.5 * (a - c) / den).clamp(-0.5, 0.5)
+                } else {
+                    0.0
+                };
+                let e = prefix[tau + m] - prefix[tau];
+                let metric = if e > 1e-30 {
+                    (best as f64 / (self.ref_energy * e)) as f32
+                } else {
+                    0.0
+                };
+                let f = (best_k as f64 + delta) / span * self.cfg.sps as f64;
+                out.push((metric, f as f32));
             }
-            let mag = |k: isize| buf[k.rem_euclid(n as isize) as usize].norm_sqr().sqrt() as f64;
-            let (a, b, c) = (mag(best_k - 1), mag(best_k), mag(best_k + 1));
-            let den = a - 2.0 * b + c;
-            let delta = if den < 0.0 {
-                (0.5 * (a - c) / den).clamp(-0.5, 0.5)
-            } else {
-                0.0
-            };
-            let e = prefix[tau + m] - prefix[tau];
-            let metric = if e > 1e-30 {
-                (best as f64 / (self.ref_energy * e)) as f32
-            } else {
-                0.0
-            };
-            let f = (best_k as f64 + delta) / span * self.cfg.sps as f64;
-            out.push((metric, f as f32));
-        }
-        out
+            out
+        };
+        in_parallel(count, 2048, one)
     }
 
     /// [`Modem::demodulate_with`] with the coarse frequency search: find candidates on the coarse
@@ -1397,6 +1413,37 @@ fn refine_phase(m: Modulation, z: &[Complex32], rho: f64) -> (f64, f64) {
     }
 }
 
+/// `f` over `0..count`, split into contiguous ranges run on up to the machine's CPUs (at most 8), the
+/// results joined in order. Below `min_each` items per thread it runs on the calling thread only.
+fn in_parallel<T: Send>(
+    count: usize,
+    min_each: usize,
+    f: impl Fn(std::ops::Range<usize>) -> Vec<T> + Sync,
+) -> Vec<T> {
+    let cpus = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8);
+    let threads = cpus.min(count / min_each.max(1)).max(1);
+    if threads == 1 {
+        return f(0..count);
+    }
+    let each = count.div_ceil(threads);
+    let f = &f;
+    std::thread::scope(|sc| {
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let range = (t * each).min(count)..((t + 1) * each).min(count);
+                sc.spawn(move || f(range))
+            })
+            .collect();
+        let mut out = Vec::with_capacity(count);
+        for h in handles {
+            out.extend(h.join().expect("detection thread panicked"));
+        }
+        out
+    })
+}
+
 /// `ln cosh(u)`, without overflow for large `|u|`.
 fn ln_cosh(u: f64) -> f64 {
     let u = u.abs();
@@ -1623,4 +1670,30 @@ fn parabola_peak(y: &[f32], i: usize) -> f64 {
         return 0.0;
     }
     (0.5 * (a - c) / den).clamp(-0.5, 0.5)
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::in_parallel;
+
+    #[test]
+    fn in_parallel_keeps_every_item_in_order() {
+        for (count, min_each) in [
+            (0, 10),
+            (1, 10),
+            (9, 10),
+            (10_000, 100),
+            (10_007, 1),
+            (65_537, 4096),
+        ] {
+            let got = in_parallel(count, min_each, |r: std::ops::Range<usize>| {
+                r.collect::<Vec<_>>()
+            });
+            assert_eq!(
+                got,
+                (0..count).collect::<Vec<_>>(),
+                "count {count}, min_each {min_each}"
+            );
+        }
+    }
 }
