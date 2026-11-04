@@ -40,7 +40,7 @@ Packets from `oasa-link` arrive on `--udp-listen` and go out the radio. Packets 
 | `udp` | Simulation (put the lab's simulated channel between two bridges), Wi-Fi, Ethernet | Works |
 | `serial` | SiK, mLRS, RFD900x, any transparent UART modem | Works. Framing: [docs/serial-framing.md](docs/serial-framing.md) |
 | `lora` | Our LoRa modem firmware for the Heltec WiFi LoRa 32 V3. It speaks the serial framing: use `--radio serial --baud 115200 --mtu 255`, and `oasa-radio lora` for settings and counters | Works in simulation; real board untested. [firmware/heltec-v3](firmware/heltec-v3/README.md) |
-| `sdr` | OASA's own waveforms on SDRs | Planned. The modem (W0) runs in simulation: `oasa-radio waveform`, [docs/waveform-w0.md](docs/waveform-w0.md) |
+| `sdr` | OASA's own waveforms on SDRs | Planned. The modem (W0) runs in simulation: `oasa-radio waveform`, [docs/waveform-w0.md](docs/waveform-w0.md). Frame format v1 (protected header): [docs/frame-v1.md](docs/frame-v1.md) |
 
 ## Quick start
 
@@ -84,7 +84,7 @@ The bridge prints one JSON line per event (`start`, `drop`, `error`) and a final
 
 | Command | What |
 |---|---|
-| `cargo test --locked` | The waveform modem (`waveform/`: BER against theory with fixed seeds, frame round trips, false alarms, CRC; about 10 s), framing (round trips, every truncation, every bit flip, noise, seeded damage), the adapters, the CLI, and two bridges over a pseudo-terminal relay that drops and garbles bytes at 57600 baud |
+| `cargo test --locked` | The waveform modem (`waveform/`: BER against theory with fixed seeds, frame round trips for both frame formats, false alarms, CRC; about 30 s), framing (round trips, every truncation, every bit flip, noise, seeded damage), the adapters, the CLI, and two bridges over a pseudo-terminal relay that drops and garbles bytes at 57600 baud |
 | `scripts/serial-e2e.sh` | Two real `oasa-link` processes through two serial bridges. Marked packets both ways; the captured line bytes must never hold the marker. A plaintext control proves the scanner can see one |
 
 CI runs both, plus `cargo fmt`, `clippy -D warnings`, `cargo deny` and `cargo audit`. For the end-to-end script, build [oasa-sec](https://github.com/joinoasa/oasa-sec) (`cargo build --locked --bins`) and point `OASA_SEC_BIN_DIR` at its `target/debug`. No `socat` needed: `examples/ptyrelay.rs` makes the pseudo-terminal pair, can drop and garble bytes, limits speed and captures what crosses.
