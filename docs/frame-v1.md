@@ -47,22 +47,39 @@ Header symbols are always one bit per symbol, so a QPSK frame has BPSK-like prea
 
 ## Receiver details worth knowing
 
-* The header's soft values come from the preamble's phase, frequency and amplitude estimate. Once the header decodes, it is known, so the receiver estimates again over preamble, sync word and header (231 symbols instead of 79). This is not in the format; it is there because the body now starts 152 symbols later. Without it a small frequency offset that the preamble alone cannot see (below its noise) turned the phase too far by the start of a long QPSK body: in a test run (40 QPSK frames at 12 dB, offsets within +-0.002 cycles per symbol) 3 frames lost their payload; with it, none.
-* With `expected_len` set (BER measurement) the header is still decoded, but its checks are skipped and the given length is used. `RxFrame::header` holds the decoded fields when the CRC-8 matched, otherwise `None`. `oasa-radio waveform ber --frame v1` prints `header_ok`: frames whose header decoded to what was sent.
+* The header's soft values come from the preamble's phase, frequency and amplitude estimate. Once the header decodes, it is known, so the receiver estimates again over preamble, sync word and header (231 symbols instead of 79). This is not in the format; it is there because the body now starts 152 symbols later. Without it a small frequency offset that the preamble alone cannot see (below its noise) turned the phase too far by the start of a long QPSK body: in a test run (40 QPSK frames at 12 dB, offsets within +-0.002 cycles per symbol) 3 frames lost their payload; with it, none. A seeded test (`v1_qpsk_long_body_needs_the_estimate_over_the_header`: 255-byte payloads, offsets within +-0.002) loses 4 of 40 frames when the step is disabled and none with it.
+* With `expected_len` set (BER measurement) the header is still decoded, but its checks are skipped and the given length is used. `RxFrame::header` holds the decoded fields when the CRC-8 matched, otherwise `None`, and then `crc_ok` is false. `oasa-radio waveform ber --frame v1` prints `header_ok`: frames whose header decoded to what was sent.
 * `RxFrame::header` carries all fields, including `channel_plan` and `coexistence`.
 
 ## Receive report
 
-`Modem::demodulate_report(samples, rx)` returns the frames and an `RxReport`:
+`Modem::demodulate_report(samples, rx)` returns the frames and an `RxReport`. **The counts are of candidates, not of frames.** A candidate is a peak of the detection metric past the threshold. A real frame is one candidate, but its own body adds more (random data correlates with the preamble now and then: about 3 per 64-byte frame at 6 dB) and so does noise. To keep the counts about lost frames, a candidate that lies inside a frame already found is counted as `inside_frame` and not as a rejection.
 
 | Count | Meaning |
 |---|---|
-| `preambles` | candidates past the detection threshold that were tried |
+| `preambles` | all candidates past the detection threshold |
+| `inside_frame` | candidates inside a frame already found, or inside the span a header failure reserves (below), that gave no frame |
 | `sync_rejected` | too many wrong bits in the sync word |
 | `header_rejected` | v1: CRC-8 or a field rule; W0: the length complement check |
 | `too_short` | the frame ran off the end of the buffer |
 
-`preambles = frames + sync_rejected + header_rejected + too_short`. `preambles` can exceed the number of frames sent: a strong preamble has side peaks above the threshold, which are tried and fail the sync check. `oasa-radio waveform decode` prints the counts in its last line (`decode_done`).
+`preambles = frames + sync_rejected + header_rejected + too_short + inside_frame` (a test checks it, both formats, both paths). How the spans work:
+
+* **v1:** a header that passes its CRC-8 and the field rules gives the length, so the frame's end is known whatever its CRC-16 says. Candidates before that end are not tried and count as `inside_frame`.
+* **W0:** the receiver still trusts only a good CRC-16 to skip ahead (unchanged behaviour), but a frame whose length was read also reserves its span for counting.
+* **A header failure** (either format) has no length. It reserves the longest possible frame, 255 bytes, after its start, for counting only: candidates inside are still tried, and a real frame found there is returned. Their failures are counted as `inside_frame`. So a second real frame lost within that span is not counted as lost.
+* **A sync failure** reserves nothing, so a real frame lost at the sync word adds its body candidates to `sync_rejected`. This is small where it matters (W0 below 4 dB loses frames at the header, not at sync).
+
+Measured, BPSK, 200 frames, seed 5, no `expected_len`, no frequency offset (the acceptance tests):
+
+| Format, Eb/N0 | found | lost | `header_rejected` | `sync_rejected` | `too_short` | `inside_frame` | `preambles` |
+|---|---|---|---|---|---|---|---|
+| W0, 0 dB | 39 | 161 | 147 | 6 | 8 | 3 | 203 |
+| W0, 2 dB | 100 | 100 | 98 | 2 | 1 | 29 | 230 |
+| W0, 4 dB | 166 | 34 | 34 | 0 | 0 | 162 | 362 |
+| v1, 6 dB | 200 | 0 | 0 | 0 | 0 | 635 | 835 |
+
+For W0, `header_rejected` is within 10 % of frames sent minus frames found (the rest of the loss is `sync_rejected` and `too_short`). `oasa-radio waveform decode` prints the counts in its last line (`decode_done`).
 
 ## Found-frame rates
 
@@ -90,7 +107,7 @@ The acceptance test (`v1_finds_frames_where_w0_loses_them_to_the_header`, BPSK, 
 
 Where v1 still loses frames:
 
-* **Below about 0 dB, the sync word.** The receiver accepts up to 3 wrong sync bits of 16. At -2 dB the raw bit error rate is 0.13, and v1's losses are `sync_rejected` (63 of 400 for BPSK at -2 dB; none are header losses). With `sync_max_errors` 5 the same run finds 392, 399 and 399 of 400 at -2, -1 and 0 dB (measured, BPSK, seed 11); with 8, 397, 400 and 400, but at 6 dB false candidates then reach the header stage (568 `header_rejected` against 45), costing time. The default is unchanged (3) and is a receiver setting, not part of the format. With v1 the CRC-8 and the code make a looser sync check affordable; decide when the bench says where it matters.
+* **Below about 0 dB, the sync word.** The receiver accepts up to 3 wrong sync bits of 16. At -2 dB the raw bit error rate is 0.13, and v1's losses are `sync_rejected` (62 of 400 for BPSK at -2 dB; none are header losses). With `sync_max_errors` 5 the same run finds 392, 399 and 399 of 400 at -2, -1 and 0 dB; with 8, 397, 400 and 400. A looser check lets more false candidates reach the header decoder, which costs time. Reproduce: `cargo test --release -p oasa-waveform --test frames sync_tolerance_table -- --ignored --nocapture` (BPSK, v1, seed 11, 400 frames, -2, -1, 0, 2, 6 dB; 3, 5 and 8 tolerated errors). The default is unchanged (3) and is a receiver setting, not part of the format. With v1 the CRC-8 and the code make a looser sync check affordable; decide when the bench says where it matters.
 * **With a frequency offset at very low Eb/N0.** The preamble's frequency estimate is noisy at 0 dB and below, which turns the header's phase over its 152 symbols (47 of 400 BPSK frames `header_rejected` at -2 dB). It is rare above 2 dB.
 
 ## Airtime
@@ -124,6 +141,6 @@ The header is **not encrypted and not authenticated**. The CRC-8 and the code pr
 ## Bench check plan (oasa-lab, B200mini to E310 over cable)
 
 1. Rerun `l2-waveform-w1` with `--frame v1` on both radios (same sample rate, same attenuator steps as the W0 run that missed frames). Expect found frames near 100 % at 4 dB Eb/N0 and below, down to about 0 dB. Below that, expect losses to be `sync_rejected` (see above), not headers.
-2. Decode the same recordings from the W0 runs with the receive report: `oasa-radio waveform decode --in REC --mod bpsk` (add `--cfo-search` as the bench did). In `decode_done`, expect `header_rejected` to hold nearly all the missing frames below 4 dB, and `sync_rejected` and `too_short` to stay small. If they do not, the loss is somewhere else, and v1 will not fix it.
-3. Record the report counts for every run next to the found-frame rate, so a result says which stage lost the frames.
+2. Decode the same recordings from the W0 runs with the receive report: `oasa-radio waveform decode --in REC --mod bpsk` (add `--cfo-search` as the bench did). Read `decode_done` like this: the counts are of *candidates* (peaks past the detection threshold), including the ones a frame's own body makes; those are counted as `inside_frame` and are not losses. Compare `header_rejected` with frames sent minus frames found (`frames` in `decode_done`, against the number the sender transmitted). Expect `header_rejected` to be close to that difference below 4 dB (in simulation, within 10 %), with `sync_rejected` and `too_short` small. If it is not, the loss is somewhere else and v1 will not fix it. Where the count is not a clean number: a frame lost at the sync word adds its body candidates to `sync_rejected`; a second frame lost within 255 bytes after a header failure counts as `inside_frame`.
+3. Record all the counts for every run next to the found-frame rate, so a result says which stage lost the frames.
 4. Check the cost: airtime per frame from the table above against the lab's duty cycle limits.
