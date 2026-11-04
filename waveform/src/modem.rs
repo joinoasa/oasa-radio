@@ -236,13 +236,25 @@ pub struct RxFrame {
     pub header: Option<HeaderFields>,
 }
 
-/// What the receiver did with the candidates it tried, from [`Modem::demodulate_report`].
-/// Every preamble candidate ends in exactly one of the four other counts or in a returned frame:
-/// `preambles == frames + sync_rejected + header_rejected + too_short`.
+/// What the receiver did with the candidates it found, from [`Modem::demodulate_report`].
+///
+/// These count *candidates*, not frames: peaks of the detection metric past the threshold. A real
+/// frame is one candidate; its own body and noise add more (random data correlates with the
+/// preamble now and then). Every candidate ends in exactly one of the five other counts or in a
+/// returned frame:
+/// `preambles == frames + sync_rejected + header_rejected + too_short + inside_frame`.
+///
+/// `inside_frame` keeps the others honest. A candidate that lies inside the span of a frame already
+/// accepted, or inside the span a header failure reserves, is counted there and not as a rejection:
+/// it is not a lost frame. An accepted frame's span is its length from the header. A header failure
+/// gives no length, so it reserves the longest possible frame (255 bytes) after its start. A frame
+/// that fails at the sync word reserves nothing, so its own body candidates count as `sync_rejected`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RxReport {
-    /// Candidates past the detection threshold that were tried.
+    /// Candidates past the detection threshold.
     pub preambles: usize,
+    /// Candidates inside the span of an accepted frame or of a header failure, that gave no frame.
+    pub inside_frame: usize,
     /// The sync word had too many wrong bits.
     pub sync_rejected: usize,
     /// The header was refused: v1 CRC-8 or field rules; W0 length complement.
@@ -255,9 +267,28 @@ impl RxReport {
     /// Add another report's counts (for totals over many buffers).
     pub fn add(&mut self, o: &RxReport) {
         self.preambles += o.preambles;
+        self.inside_frame += o.inside_frame;
         self.sync_rejected += o.sync_rejected;
         self.header_rejected += o.header_rejected;
         self.too_short += o.too_short;
+    }
+}
+
+/// Counts and spans kept while scanning a buffer.
+#[derive(Default)]
+struct Tally {
+    rep: RxReport,
+    /// Candidates before this sample are not tried: a frame is surely there.
+    busy_until: usize,
+    /// Rejections of candidates before this sample count as `inside_frame`.
+    span_until: usize,
+}
+
+impl Tally {
+    /// A candidate inside a sure frame: counted, not tried.
+    fn skipped(&mut self) {
+        self.rep.preambles += 1;
+        self.rep.inside_frame += 1;
     }
 }
 
@@ -394,6 +425,8 @@ impl Modem {
     /// A v1 frame with the given header fields, written as they are (the length is not checked
     /// against the payload). For tests: this is how reserved fields and bad headers are sent.
     /// Fails for a W0 modem.
+    // Hidden from the docs: it is for tests and can send a length that does not match the payload.
+    #[doc(hidden)]
     pub fn modulate_v1(
         &self,
         payload: &[u8],
@@ -406,6 +439,8 @@ impl Modem {
     /// A v1 frame from ready-made parts: the 152 header symbols (bits, see
     /// [`crate::frame::header_symbols`]) and the whitened body bits (see
     /// [`crate::frame::body_bits_v1`]; QPSK needs an even number). For tests that damage one part.
+    // Hidden from the docs: it is for tests and can send a header that does not match the body.
+    #[doc(hidden)]
     pub fn modulate_v1_parts(
         &self,
         header_symbols: &[u8],
@@ -502,18 +537,17 @@ impl Modem {
         samples: &[Complex32],
         rx: &RxConfig,
     ) -> (Vec<RxFrame>, RxReport) {
-        let mut rep = RxReport::default();
+        let mut tally = Tally::default();
         if rx.cfo_search > 0.0 {
-            let frames = self.demodulate_coarse(samples, rx, &mut rep);
-            return (frames, rep);
+            let frames = self.demodulate_coarse(samples, rx, &mut tally);
+            return (frames, tally.rep);
         }
         let metric = self.metric(samples, rx);
         let sps = self.cfg.sps;
         let mut out: Vec<RxFrame> = Vec::new();
-        let mut busy_until = 0usize;
         for tau in 0..metric.len() {
             let m = metric[tau];
-            if m < rx.detect_threshold || tau < busy_until {
+            if m < rx.detect_threshold {
                 continue;
             }
             let lo = tau.saturating_sub(sps);
@@ -522,40 +556,65 @@ impl Modem {
             if !is_peak {
                 continue;
             }
+            if tau < tally.busy_until {
+                tally.skipped();
+                continue;
+            }
             let mu = parabola_peak(&metric, tau);
-            if let Some(f) = self.try_decode(samples, tau, mu, m, rx, &mut rep) {
-                if f.crc_ok {
-                    busy_until = f.end;
-                }
+            let res = self.decode_at(samples, tau, mu, m, rx);
+            if let Some(f) = self.record(res, tau, rx, &mut tally) {
                 out.push(f);
             }
         }
-        (out, rep)
+        (out, tally.rep)
     }
 
-    /// `decode_at`, with the outcome counted in `rep`.
-    fn try_decode(
+    /// Count the outcome of one candidate at absolute sample `tau`, update the spans, and return
+    /// the frame if there is one.
+    fn record(
         &self,
-        r: &[Complex32],
+        res: Result<RxFrame, Reject>,
         tau: usize,
-        mu: f64,
-        metric: f32,
         rx: &RxConfig,
-        rep: &mut RxReport,
+        tally: &mut Tally,
     ) -> Option<RxFrame> {
-        rep.preambles += 1;
-        match self.decode_at(r, tau, mu, metric, rx) {
-            Ok(f) => Some(f),
+        tally.rep.preambles += 1;
+        let inside = tau < tally.span_until;
+        let reserve = |tally: &mut Tally| {
+            // no length known: reserve the longest frame (or the expected one)
+            let n = rx.expected_len.unwrap_or(MAX_PAYLOAD).min(MAX_PAYLOAD);
+            tally.span_until = tally.span_until.max(tau + self.frame_samples(n));
+        };
+        let count = |tally: &mut Tally, field: fn(&mut RxReport) -> &mut usize| {
+            if inside {
+                tally.rep.inside_frame += 1;
+            } else {
+                *field(&mut tally.rep) += 1;
+            }
+        };
+        match res {
+            Ok(f) => {
+                tally.span_until = tally.span_until.max(f.end);
+                // A v1 header that passed its CRC-8 and rules gives the length: the frame is
+                // there whatever its CRC-16 says. W0 trusts only a good CRC-16.
+                let sure =
+                    f.crc_ok || (self.cfg.frame == FrameFormat::V1 && rx.expected_len.is_none());
+                if sure {
+                    tally.busy_until = f.end;
+                }
+                Some(f)
+            }
             Err(Reject::Sync) => {
-                rep.sync_rejected += 1;
+                count(tally, |r| &mut r.sync_rejected);
                 None
             }
             Err(Reject::Header) => {
-                rep.header_rejected += 1;
+                count(tally, |r| &mut r.header_rejected);
+                reserve(tally);
                 None
             }
             Err(Reject::TooShort) => {
-                rep.too_short += 1;
+                count(tally, |r| &mut r.too_short);
                 None
             }
         }
@@ -719,12 +778,7 @@ impl Modem {
     /// [`Modem::demodulate_with`] with the coarse frequency search: find candidates on the coarse
     /// grid, then for each one turn the buffer back by its frequency and run the normal detector
     /// (one frequency) and decoder in a small window around it.
-    fn demodulate_coarse(
-        &self,
-        r: &[Complex32],
-        rx: &RxConfig,
-        rep: &mut RxReport,
-    ) -> Vec<RxFrame> {
+    fn demodulate_coarse(&self, r: &[Complex32], rx: &RxConfig, tally: &mut Tally) -> Vec<RxFrame> {
         let Some(cs) = self.coarse_search(rx) else {
             return Vec::new();
         };
@@ -747,11 +801,10 @@ impl Modem {
             ..rx.clone()
         };
         let mut out: Vec<RxFrame> = Vec::new();
-        let mut busy_until = 0usize;
         for i in 0..cm.len() {
             let (v, f) = cm[i];
             let tau_c = i * cs.step;
-            if v < cs.threshold || tau_c < busy_until {
+            if v < cs.threshold {
                 continue;
             }
             let lo_i = i.saturating_sub(reach);
@@ -760,7 +813,11 @@ impl Modem {
             if !is_peak {
                 continue;
             }
-            let lo = tau_c.saturating_sub(sps + cs.step).max(busy_until);
+            if tau_c < tally.busy_until {
+                tally.skipped();
+                continue;
+            }
+            let lo = tau_c.saturating_sub(sps + cs.step).max(tally.busy_until);
             let hi = (tau_c + sps + cs.step).min(last);
             let end = (hi + frame_len + 1).min(r.len());
             let w = f as f64 / sps as f64;
@@ -779,16 +836,16 @@ impl Modem {
                 continue;
             };
             let mu = parabola_peak(&fm, j);
-            if let Some(mut fr) = self.try_decode(&d, j, mu, fm[j], &fine, rep) {
+            let res = self.decode_at(&d, j, mu, fm[j], &fine).map(|mut fr| {
                 fr.start += lo;
                 fr.end += lo;
                 fr.cfo_cycles_per_symbol += f;
                 let turns = (w * fr.start as f64).rem_euclid(1.0);
                 let ph = fr.phase_rad as f64 + 2.0 * PI * turns;
                 fr.phase_rad = ph.sin().atan2(ph.cos()) as f32;
-                if fr.crc_ok {
-                    busy_until = fr.end;
-                }
+                fr
+            });
+            if let Some(fr) = self.record(res, lo + j, rx, tally) {
                 out.push(fr);
             }
         }

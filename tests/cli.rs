@@ -333,12 +333,12 @@ fn waveform_v1_frames_round_trip_and_report_the_header() {
             .unwrap_or_else(|| panic!("{m}: {out}"));
         assert_eq!(field(frame, "crc_ok"), "true", "{m}");
         assert_eq!(field(frame, "payload_hex"), "00ff10a5c3", "{m}");
-        assert!(frame.contains(&format!("\"header\":{{\"modulation\":\"{m}\",\"payload_code\":0,\"length\":5,\"channel_plan\":0,\"coexistence\":0}}")), "{frame}");
+        assert!(frame.contains(&format!("\"header\":{{\"version\":0,\"extension\":0,\"modulation\":\"{m}\",\"payload_code\":0,\"pilots\":0,\"length\":5,\"channel_plan\":0,\"coexistence\":0}}")), "{frame}");
         let done = out.lines().find(|l| l.contains("decode_done")).unwrap();
         assert_eq!(field(done, "frame"), "v1");
         assert_eq!(field(done, "frames"), "1");
         assert_eq!(field(done, "header_rejected"), "0");
-        for k in ["preambles", "sync_rejected", "too_short"] {
+        for k in ["preambles", "sync_rejected", "too_short", "inside_frame"] {
             field(done, k).parse::<u64>().unwrap();
         }
         // read as W0 the same file is not a good frame

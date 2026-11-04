@@ -82,6 +82,11 @@ pub fn viterbi_decode(soft: &[f32], n_info: usize) -> Vec<u8> {
                 }
             }
         }
+        // Keep the numbers small: only differences between states matter.
+        let best = next.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        for m in next.iter_mut() {
+            *m -= best;
+        }
         metric = next;
     }
     // the tail ends the block in state 0

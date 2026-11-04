@@ -42,11 +42,13 @@ WAVEFORM (W0, simulation):
           is always JSON lines.) --cfo-random gives each frame its own offset, uniform in +-MAX.
           With --frame v1 the line also has header_ok: frames whose header decoded, through the
           real header path, to what was sent (the BER measurement itself skips the header checks).
+          In v1 BER mode a header that fails its CRC-8 marks the frame crc_ok false.
   iq      Writes BASE.sigmf-data (cf32_le, little endian float32 I and Q) and BASE.sigmf-meta: one frame
           with BASE delay samples of noise in front and TAIL after. No --ebn0-db means no noise.
   decode  Finds frames in BASE.sigmf-data. Prints sizes and CRC status (and, for v1, the header
           fields); the payload only with --hex. The last line, decode_done, has the counts of
-          what happened to each candidate: preambles, sync_rejected, header_rejected, too_short.
+          what happened to each candidate: preambles, sync_rejected, header_rejected, too_short,
+          inside_frame (candidates inside a frame already found; not lost frames).
 
   --frame w0 is the original format (length byte and complement). --frame v1 protects the header
   with a code and a CRC-8 (docs/frame-v1.md). The sender and the receiver must use the same one.
@@ -477,8 +479,8 @@ fn run_iq(a: &IqArgs, out: &mut dyn Write) -> R<()> {
 fn header_json(h: &HeaderFields) -> String {
     let m = Modulation::from_code(h.modulation).map_or("reserved", Modulation::name);
     format!(
-        ",\"header\":{{\"modulation\":\"{m}\",\"payload_code\":{},\"length\":{},\"channel_plan\":{},\"coexistence\":{}}}",
-        h.payload_code, h.length, h.channel_plan, h.coexistence
+        ",\"header\":{{\"version\":{},\"extension\":{},\"modulation\":\"{m}\",\"payload_code\":{},\"pilots\":{},\"length\":{},\"channel_plan\":{},\"coexistence\":{}}}",
+        h.version, h.extension, h.payload_code, h.pilots, h.length, h.channel_plan, h.coexistence
     )
 }
 
@@ -523,7 +525,7 @@ fn run_decode(a: &DecodeArgs, out: &mut dyn Write) -> R<()> {
     }
     writeln!(
         out,
-        "{{\"ts\":\"{}\",\"event\":\"decode_done\",\"mod\":\"{}\",\"frame\":\"{}\",\"samples\":{},\"frames\":{},\"crc_ok_frames\":{},\"preambles\":{},\"sync_rejected\":{},\"header_rejected\":{},\"too_short\":{}}}",
+        "{{\"ts\":\"{}\",\"event\":\"decode_done\",\"mod\":\"{}\",\"frame\":\"{}\",\"samples\":{},\"frames\":{},\"crc_ok_frames\":{},\"preambles\":{},\"sync_rejected\":{},\"header_rejected\":{},\"too_short\":{},\"inside_frame\":{}}}",
         now(),
         a.modulation.name(),
         a.frame.name(),
@@ -534,6 +536,7 @@ fn run_decode(a: &DecodeArgs, out: &mut dyn Write) -> R<()> {
         rep.sync_rejected,
         rep.header_rejected,
         rep.too_short,
+        rep.inside_frame,
     )
     .map_err(io)?;
     Ok(())
@@ -653,7 +656,7 @@ mod tests {
         };
         assert_eq!(
             header_json(&h),
-            ",\"header\":{\"modulation\":\"qpsk\",\"payload_code\":0,\"length\":64,\"channel_plan\":3,\"coexistence\":1}"
+            ",\"header\":{\"version\":0,\"extension\":0,\"modulation\":\"qpsk\",\"payload_code\":0,\"pilots\":0,\"length\":64,\"channel_plan\":3,\"coexistence\":1}"
         );
     }
 

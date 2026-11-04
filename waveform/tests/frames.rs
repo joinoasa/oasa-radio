@@ -626,6 +626,45 @@ fn coarse_search_settings() {
     assert!(c.bins < c.fft_len / 2);
 }
 
+/// A fingerprint of a waveform: every sample rounded to 1e-4 (so a last-bit difference in a
+/// sine does not matter) and folded into an FNV-1a hash.
+fn fingerprint(x: &[Complex32]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for s in x {
+        for v in [s.re, s.im] {
+            for b in ((v * 1e4).round() as i32).to_le_bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+    h
+}
+
+#[test]
+fn w0_waveform_does_not_drift() {
+    // The default frame format is W0 and its samples must never change: pinned here (length and a
+    // fingerprint of the whole frame, taken from `main` before v1) for payload 0x00..0x2F, 8 samples per symbol.
+    let payload: Vec<u8> = (0..48u8).collect();
+    for (m, len, fp) in GOLDEN {
+        let md = modem(m);
+        assert_eq!(md.config().frame, FrameFormat::W0);
+        let x = md.modulate(&payload).unwrap();
+        assert_eq!(x.len(), len, "{m:?} length");
+        assert_eq!(
+            fingerprint(&x),
+            fp,
+            "{m:?} fingerprint {:#x}",
+            fingerprint(&x)
+        );
+    }
+}
+
+const GOLDEN: [(Modulation, usize, u64); 3] = [
+    (Modulation::Fsk2, 3960, 0x766b_7f2c_708b_112c),
+    (Modulation::Bpsk, 4081, 0xf66f_4d10_d066_050e),
+    (Modulation::Qpsk, 2417, 0x8e88_0300_2278_daa9),
+];
+
 // ---- frame format v1: protected header ----
 
 fn modem_v1(m: Modulation) -> Modem {
@@ -734,6 +773,34 @@ fn v1_noiseless_round_trip_is_exact() {
             assert_eq!(rep.header_rejected, 0, "{m:?} {i}");
         }
     }
+}
+
+#[test]
+fn v1_qpsk_long_body_needs_the_estimate_over_the_header() {
+    // QPSK, 255-byte payloads, offsets within +-0.002 cycles per symbol, 12 dB, fixed seed. The
+    // preamble alone cannot see so small an offset, and by the end of the header and a long body
+    // the phase has turned too far. The second estimate over the known header fixes it. With that
+    // step removed 4 of these 40 frames fail the CRC-16 (checked by disabling it).
+    let md = modem_v1(Modulation::Qpsk);
+    let mut ch = Channel::new(41);
+    let n0 = n0_for_ebn0(12.0, md.energy_per_bit());
+    let mut ok = 0;
+    for _ in 0..40 {
+        let payload = ch.rng().bytes(255);
+        let tx = md.modulate(&payload).unwrap();
+        let cfo = (ch.rng().uniform() - 0.5) * 0.004;
+        let imp = Impairments {
+            n0,
+            phase_rad: ch.rng().uniform() * 2.0 * PI,
+            frac_delay: ch.rng().uniform(),
+            cfo_cycles_per_sample: cfo / 8.0,
+            lead: 80,
+            tail: 30,
+        };
+        let got = md.demodulate(&ch.apply(&tx, &imp));
+        ok += got.iter().any(|f| f.crc_ok && f.payload == payload) as usize;
+    }
+    assert_eq!(ok, 40);
 }
 
 #[test]
@@ -931,21 +998,87 @@ fn a_w0_modem_does_not_send_v1_and_formats_do_not_mix() {
 
 #[test]
 fn report_counts_add_up() {
-    let md = modem(Modulation::Bpsk);
-    let mut ch = Channel::new(31);
-    let n0 = n0_for_ebn0(1.0, md.energy_per_bit());
-    for _ in 0..60 {
-        let tx = md.modulate(&ch.rng().bytes(30)).unwrap();
-        let imp = Impairments {
-            n0,
-            lead: 40,
-            tail: if ch.rng().below(2) == 0 { 8 } else { 3000 },
-            ..Default::default()
-        };
-        let (got, r) = md.demodulate_report(&ch.apply(&tx, &imp), &RxConfig::default());
+    // Every candidate ends in a frame or exactly one count, in both formats and on both paths.
+    for frame in [FrameFormat::W0, FrameFormat::V1] {
+        let md = Modem::new(ModemConfig {
+            frame,
+            ..ModemConfig::new(Modulation::Bpsk)
+        })
+        .unwrap();
+        let mut ch = Channel::new(31);
+        let n0 = n0_for_ebn0(1.0, md.energy_per_bit());
+        for rx in [RxConfig::default(), wide()] {
+            for _ in 0..30 {
+                let tx = md.modulate(&ch.rng().bytes(30)).unwrap();
+                let imp = Impairments {
+                    n0,
+                    lead: 40,
+                    tail: if ch.rng().below(2) == 0 { 8 } else { 3000 },
+                    ..Default::default()
+                };
+                let (got, r) = md.demodulate_report(&ch.apply(&tx, &imp), &rx);
+                assert_eq!(
+                    r.preambles,
+                    got.len() + r.sync_rejected + r.header_rejected + r.too_short + r.inside_frame,
+                    "{frame:?} {r:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn candidates_inside_a_found_frame_are_not_lost_frames() {
+    // A long v1 frame at 6 dB: its header is good, so its span is known, and the candidates its
+    // body makes are counted as inside the frame.
+    let md = modem_v1(Modulation::Bpsk);
+    let mut ch = Channel::new(32);
+    let n0 = n0_for_ebn0(6.0, md.energy_per_bit());
+    let mut inside = 0;
+    for _ in 0..40 {
+        let tx = md.modulate(&ch.rng().bytes(255)).unwrap();
+        let y = ch.apply(
+            &tx,
+            &Impairments {
+                n0,
+                lead: 50,
+                tail: 50,
+                ..Default::default()
+            },
+        );
+        let (got, r) = md.demodulate_report(&y, &RxConfig::default());
+        assert_eq!(got.len(), 1);
         assert_eq!(
-            r.preambles,
-            got.len() + r.sync_rejected + r.header_rejected + r.too_short
+            (r.sync_rejected, r.header_rejected, r.too_short),
+            (0, 0, 0),
+            "{r:?}"
+        );
+        inside += r.inside_frame;
+    }
+    assert!(
+        inside > 0,
+        "no body candidates seen; the test checks nothing"
+    );
+}
+
+/// The report says where W0 loses frames. BPSK, 200 frames each, seed 5, no `expected_len`:
+/// `header_rejected` is close to frames sent minus frames found, and far above the other counts.
+/// Measured: lost 161 / header_rejected 147 at 0 dB, 100 / 98 at 2 dB, 34 / 34 at 4 dB.
+#[test]
+fn w0_report_blames_the_header() {
+    let w0 = BerOptions::default();
+    for db in [0.0, 2.0, 4.0] {
+        let a = run_found(Modulation::Bpsk, db, 200, 5, &w0).unwrap();
+        let (r, lost) = (&a.report, 200 - a.found as usize);
+        assert!(lost >= 20, "{db} dB: too few losses to say anything");
+        assert!(
+            r.header_rejected as f64 >= 0.8 * lost as f64
+                && r.header_rejected as f64 <= 1.1 * lost as f64,
+            "{db} dB: lost {lost}, {r:?}"
+        );
+        assert!(
+            r.header_rejected >= 5 * (r.sync_rejected + r.too_short),
+            "{db} dB: {r:?}"
         );
     }
 }
@@ -977,20 +1110,39 @@ fn v1_finds_frames_where_w0_loses_them_to_the_header() {
             "V1 at {db} dB: {} found",
             b.found
         );
-        // W0 loses them at the header, not at detection or sync
-        assert!(
-            a.report.preambles >= 190,
-            "preambles {}",
-            a.report.preambles
-        );
-        let r = &a.report;
-        let lost = 200 - a.found as usize;
-        assert!(
-            r.header_rejected as f64 >= 0.7 * lost as f64
-                && r.header_rejected >= 3 * (r.sync_rejected + r.too_short),
-            "{r:?}"
-        );
-        assert!(b.report.header_rejected <= 6, "{:?}", b.report);
+        assert!(b.report.header_rejected <= 2, "{:?}", b.report);
+    }
+    // 6 dB: v1 finds every frame; the report shows no lost frames, only candidates inside frames
+    let b = run_found(Modulation::Bpsk, 6.0, 200, 5, &v1).unwrap();
+    assert_eq!(b.found, 200);
+    let r = &b.report;
+    assert!(
+        r.header_rejected + r.sync_rejected + r.too_short <= 3,
+        "{r:?}"
+    );
+    assert!(r.inside_frame > 100, "{r:?}");
+}
+
+/// Sync tolerance for the docs (v1, BPSK, 400 frames, seed 11): `cargo test --release -p
+/// oasa-waveform --test frames sync_tolerance_table -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn sync_tolerance_table() {
+    for sync_max_errors in [3, 5, 8] {
+        let opts = BerOptions {
+            frame: FrameFormat::V1,
+            rx: RxConfig {
+                sync_max_errors,
+                ..RxConfig::default()
+            },
+            ..BerOptions::default()
+        };
+        let mut row = format!("sync_max_errors {sync_max_errors}:");
+        for db in [-2.0, -1.0, 0.0, 2.0, 6.0] {
+            let p = run_found(Modulation::Bpsk, db, 400, 11, &opts).unwrap();
+            row += &format!(" {} ({:?})", p.found, p.report);
+        }
+        println!("{row}");
     }
 }
 
