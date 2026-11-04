@@ -375,6 +375,12 @@ impl Modem {
         self.energy_per_symbol() / self.cfg.modulation.bits_per_symbol() as f64
     }
 
+    /// Length in samples of the known preamble and sync waveform the detector correlates with (the
+    /// detection window, and how far apart two candidates must be to be told apart).
+    pub fn reference_len(&self) -> usize {
+        self.refw.len()
+    }
+
     /// Number of samples [`Modem::modulate`] makes for a payload of `n` bytes.
     pub fn frame_samples(&self, n: usize) -> usize {
         let nsym = self.ref_bits.len() + self.header_syms() + self.body_len_bits(n) / self.bps();

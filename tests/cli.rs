@@ -444,6 +444,103 @@ fn waveform_ber_v1_counts_headers_through_the_real_path() {
 }
 
 #[test]
+fn waveform_rx_stream_gives_what_decode_gives() {
+    // Three frames written by `iq` one after another into one raw file, then decoded as a whole
+    // (`decode`) and as a stream in small blocks (`rx-stream`): the same frames, positions counted
+    // from the stream's start.
+    let dir = std::env::temp_dir().join(format!("oasa-wf-stream-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut raw = Vec::new();
+    for (i, hex) in ["00ff10a5c3", "deadbeef", "0102030405060708"]
+        .iter()
+        .enumerate()
+    {
+        let base = dir.join(format!("f{i}")).display().to_string();
+        let o = run(&[
+            "waveform",
+            "iq",
+            "--mod",
+            "qpsk",
+            "--out",
+            &base,
+            "--ebn0-db",
+            "20",
+            "--payload-hex",
+            hex,
+            "--seed",
+            &i.to_string(),
+            "--delay",
+            "300",
+            "--tail",
+            "700",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        raw.extend(std::fs::read(format!("{base}.sigmf-data")).unwrap());
+    }
+    let all = dir.join("all");
+    std::fs::write(all.with_extension("sigmf-data"), &raw).unwrap();
+    std::fs::copy(dir.join("f0.sigmf-meta"), all.with_extension("sigmf-meta")).unwrap();
+    let frames = |out: &std::process::Output| -> Vec<(String, String, String)> {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains("\"event\":\"frame\""))
+            .map(|l| {
+                (
+                    field(l, "start").to_string(),
+                    field(l, "payload_hex").to_string(),
+                    field(l, "crc_ok").to_string(),
+                )
+            })
+            .collect()
+    };
+    let whole = frames(&run(&[
+        "waveform",
+        "decode",
+        "--mod",
+        "qpsk",
+        "--in",
+        &all.display().to_string(),
+        "--hex",
+    ]));
+    let data = all.with_extension("sigmf-data").display().to_string();
+    let streamed = run(&[
+        "waveform",
+        "rx-stream",
+        "--mod",
+        "qpsk",
+        "--in",
+        &data,
+        "--hex",
+        "--block",
+        "1024",
+    ]);
+    let s = frames(&streamed);
+    assert_eq!(whole.len(), 3, "{whole:?}");
+    assert_eq!(s, whole);
+    assert_eq!(
+        s.iter().map(|f| f.1.as_str()).collect::<Vec<_>>(),
+        ["00ff10a5c3", "deadbeef", "0102030405060708"]
+    );
+    let done = String::from_utf8_lossy(&streamed.stdout)
+        .lines()
+        .last()
+        .unwrap()
+        .to_string();
+    assert_eq!(field(&done, "event"), "stream_done");
+    assert_eq!(field(&done, "frames"), "3");
+    assert_eq!(
+        field(&done, "samples"),
+        (raw.len() / 8).to_string().as_str()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn waveform_bad_arguments_fail_cleanly() {
     for args in [
         vec![

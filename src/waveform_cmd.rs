@@ -18,7 +18,8 @@ use oasa_waveform::frame::{FrameFormat, HeaderFields};
 use oasa_waveform::iq::{from_cf32_le, to_cf32_le};
 use oasa_waveform::rng::Rng;
 use oasa_waveform::sim::{run_ber, BerOptions};
-use oasa_waveform::{Modem, ModemConfig, Modulation, RxConfig};
+use oasa_waveform::stream::StreamReceiver;
+use oasa_waveform::{Modem, ModemConfig, Modulation, RxConfig, RxFrame};
 
 use crate::log::{json_str, rfc3339};
 
@@ -35,6 +36,8 @@ WAVEFORM (W0, simulation):
   oasa-radio waveform decode --in BASE --mod bpsk|qpsk|fsk2 [--sps 8] [--cfo-bins 0]
                              [--cfo-search MAX] [--frame w0|v1] [--hex]
                              [--payload-len N] [--sync-max-errors 3]
+  oasa-radio waveform rx-stream --in -|FILE --mod bpsk|qpsk|fsk2 [--block 65536]
+                                [same receiver options as decode]
 
   ber     Sends random frames through the modem and the simulated channel at each Eb/N0 and prints one
           JSON line per point: errors, bits, BER, the theory value (BPSK and QPSK: Q(sqrt(2Eb/N0));
@@ -54,6 +57,13 @@ WAVEFORM (W0, simulation):
           --sync-max-errors 16 keeps frames with a damaged sync word: what `ber` does, for measuring
           BER on recordings (the W0 header has no error correction, so at 0 dB most W0 headers
           have a bit error and those frames are otherwise lost).
+
+  rx-stream  The receiver for a continuous stream: reads raw cf32_le (no SigMF wrapper) from stdin
+          (--in -) or a file, --block samples at a time, and prints each frame as soon as it is
+          decided (flushed), with start and end counted from the stream's first sample. A frame is
+          decided once one longest frame has arrived after its start; the result is the same as
+          decode on the whole stream. Ends with stream_done (samples, frames, crc_ok_frames,
+          trailing_bytes: an incomplete last sample, ignored). Memory stays about two frames.
 
   --frame w0 is the original format (length byte and complement). --frame v1 protects the header
   with a code and a CRC-8 (docs/frame-v1.md). The sender and the receiver must use the same one.
@@ -124,6 +134,9 @@ pub enum WaveformCommand {
     Ber(BerArgs),
     Iq(IqArgs),
     Decode(DecodeArgs),
+    /// Decode a continuous stream in blocks of `block` samples (`input` is "-" for stdin or a raw
+    /// cf32_le file).
+    RxStream(DecodeArgs, usize),
 }
 
 type R<T> = Result<T, String>;
@@ -132,10 +145,10 @@ type R<T> = Result<T, String>;
 pub fn parse(args: &[String]) -> R<WaveformCommand> {
     let sub = match args.first().map(String::as_str) {
         None | Some("-h" | "--help" | "help") => return Ok(WaveformCommand::Help),
-        Some(s @ ("ber" | "iq" | "decode")) => s,
+        Some(s @ ("ber" | "iq" | "decode" | "rx-stream")) => s,
         Some(other) => {
             return Err(format!(
-                "unknown waveform command {other:?}; use ber, iq or decode"
+                "unknown waveform command {other:?}; use ber, iq, decode or rx-stream"
             ))
         }
     };
@@ -148,7 +161,9 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
             .ok_or(format!("unexpected argument {a:?}"))?;
         match (sub, k) {
             (_, "help") => return Ok(WaveformCommand::Help),
-            ("ber", "json" | "random-frac-delay") | ("decode", "hex") => flags.push(k.to_string()),
+            ("ber", "json" | "random-frac-delay") | ("decode" | "rx-stream", "hex") => {
+                flags.push(k.to_string())
+            }
             _ => {
                 let v = it.next().ok_or(format!("--{k} needs a value"))?;
                 if named.insert(k.to_string(), v.clone()).is_some() {
@@ -232,21 +247,32 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
                 frac_delay: opt_float("frac-delay", named.remove("frac-delay"), 0.0, 0.0, 0.999)?,
             })
         }
-        _ => WaveformCommand::Decode(DecodeArgs {
-            modulation,
-            frame,
-            input: named.remove("in").ok_or("missing --in")?,
-            sps,
-            cfo_bins: int("cfo-bins", named.remove("cfo-bins"), 0, 0, 20)? as usize,
-            cfo_search: opt_float("cfo-search", named.remove("cfo-search"), 0.0, 0.0, half)?,
-            hex: flags.iter().any(|f| f == "hex"),
-            payload_len: match named.remove("payload-len") {
-                None => None,
-                v => Some(int("payload-len", v, 0, 0, 255)? as usize),
-            },
-            sync_max_errors: int("sync-max-errors", named.remove("sync-max-errors"), 3, 0, 16)?
-                as u32,
-        }),
+        _ => {
+            let block = if sub == "rx-stream" {
+                Some(int("block", named.remove("block"), 65_536, 1024, 16_777_216)? as usize)
+            } else {
+                None
+            };
+            let d = DecodeArgs {
+                modulation,
+                frame,
+                input: named.remove("in").ok_or("missing --in")?,
+                sps,
+                cfo_bins: int("cfo-bins", named.remove("cfo-bins"), 0, 0, 20)? as usize,
+                cfo_search: opt_float("cfo-search", named.remove("cfo-search"), 0.0, 0.0, half)?,
+                hex: flags.iter().any(|f| f == "hex"),
+                payload_len: match named.remove("payload-len") {
+                    None => None,
+                    v => Some(int("payload-len", v, 0, 0, 255)? as usize),
+                },
+                sync_max_errors: int("sync-max-errors", named.remove("sync-max-errors"), 3, 0, 16)?
+                    as u32,
+            };
+            match block {
+                Some(b) => WaveformCommand::RxStream(d, b),
+                None => WaveformCommand::Decode(d),
+            }
+        }
     };
     match &cmd {
         WaveformCommand::Ber(a) => {
@@ -259,7 +285,9 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
                 return Err("give --cfo-bins or --cfo-search, not both".into());
             }
         }
-        WaveformCommand::Decode(a) if a.cfo_bins > 0 && a.cfo_search > 0.0 => {
+        WaveformCommand::Decode(a) | WaveformCommand::RxStream(a, _)
+            if a.cfo_bins > 0 && a.cfo_search > 0.0 =>
+        {
             return Err("give --cfo-bins or --cfo-search, not both".into());
         }
         _ => {}
@@ -331,6 +359,7 @@ pub fn run(cmd: &WaveformCommand, out: &mut dyn Write) -> R<()> {
         WaveformCommand::Ber(a) => run_ber_cmd(a, out),
         WaveformCommand::Iq(a) => run_iq(a, out),
         WaveformCommand::Decode(a) => run_decode(a, out),
+        WaveformCommand::RxStream(a, block) => run_rx_stream(a, *block, out),
     }
 }
 
@@ -498,6 +527,99 @@ fn header_json(h: &HeaderFields) -> String {
     )
 }
 
+/// One `frame` JSON line.
+fn write_frame(out: &mut dyn Write, f: &RxFrame, hex_payload: bool) -> R<()> {
+    let payload = if hex_payload {
+        format!(",\"payload_hex\":\"{}\"", hex(&f.payload))
+    } else {
+        String::new()
+    };
+    let header = f.header.as_ref().map(header_json).unwrap_or_default();
+    writeln!(
+        out,
+        "{{\"ts\":\"{}\",\"event\":\"frame\",\"start\":{},\"end\":{},\"len\":{},\"crc_ok\":{},\"sync_errors\":{},\"metric\":{},\"cfo_cycles_per_symbol\":{},\"phase_rad\":{},\"timing_frac\":{}{header}{payload}}}",
+        now(),
+        f.start,
+        f.end,
+        f.payload.len(),
+        f.crc_ok,
+        f.sync_errors,
+        num(f64::from(f.metric)),
+        num(f64::from(f.cfo_cycles_per_symbol)),
+        num(f64::from(f.phase_rad)),
+        num(f64::from(f.timing_frac)),
+    )
+    .map_err(io)
+}
+
+fn rx_config(a: &DecodeArgs) -> RxConfig {
+    RxConfig {
+        cfo_bins: a.cfo_bins,
+        cfo_search: a.cfo_search as f32,
+        expected_len: a.payload_len,
+        sync_max_errors: a.sync_max_errors,
+        ..RxConfig::default()
+    }
+}
+
+/// Decode a continuous stream: read raw cf32_le from stdin or a file in blocks, print each frame as
+/// soon as it is decided (flushed), then `stream_done`. Frame positions count from the stream's
+/// first sample.
+fn run_rx_stream(a: &DecodeArgs, block: usize, out: &mut dyn Write) -> R<()> {
+    use std::io::Read;
+    let modem = Modem::new(ModemConfig {
+        sps: a.sps,
+        frame: a.frame,
+        ..ModemConfig::new(a.modulation)
+    })
+    .map_err(|e| e.to_string())?;
+    let mut rx = StreamReceiver::new(modem, rx_config(a));
+    let mut input: Box<dyn Read> = if a.input == "-" {
+        Box::new(std::io::stdin().lock())
+    } else {
+        Box::new(std::fs::File::open(&a.input).map_err(|e| format!("{}: {e}", a.input))?)
+    };
+    let mut bytes = vec![0u8; block * 8];
+    let (mut have, mut frames, mut good) = (0usize, 0u64, 0u64);
+    loop {
+        let n = input.read(&mut bytes[have..]).map_err(io)?;
+        have += n;
+        // a whole block, or the end: hand over the complete samples, keep a partial one
+        if have == bytes.len() || (n == 0 && have >= 8) {
+            let whole = have / 8 * 8;
+            for f in rx.push(&from_cf32_le(&bytes[..whole])) {
+                write_frame(out, &f, a.hex)?;
+                frames += 1;
+                good += f.crc_ok as u64;
+            }
+            out.flush().map_err(io)?;
+            bytes.copy_within(whole..have, 0);
+            have -= whole;
+        }
+        if n == 0 {
+            break;
+        }
+    }
+    for f in rx.finish() {
+        write_frame(out, &f, a.hex)?;
+        frames += 1;
+        good += f.crc_ok as u64;
+    }
+    writeln!(
+        out,
+        "{{\"ts\":\"{}\",\"event\":\"stream_done\",\"mod\":\"{}\",\"frame\":\"{}\",\"samples\":{},\"frames\":{},\"crc_ok_frames\":{},\"trailing_bytes\":{}}}",
+        now(),
+        a.modulation.name(),
+        a.frame.name(),
+        rx.samples_seen(),
+        frames,
+        good,
+        have,
+    )
+    .map_err(io)?;
+    out.flush().map_err(io)
+}
+
 fn run_decode(a: &DecodeArgs, out: &mut dyn Write) -> R<()> {
     let data_path = with_ext(&base_path(&a.input), ".sigmf-data");
     let bytes = std::fs::read(&data_path).map_err(|e| format!("{}: {e}", data_path.display()))?;
@@ -508,36 +630,10 @@ fn run_decode(a: &DecodeArgs, out: &mut dyn Write) -> R<()> {
         ..ModemConfig::new(a.modulation)
     })
     .map_err(|e| e.to_string())?;
-    let rx = RxConfig {
-        cfo_bins: a.cfo_bins,
-        cfo_search: a.cfo_search as f32,
-        expected_len: a.payload_len,
-        sync_max_errors: a.sync_max_errors,
-        ..RxConfig::default()
-    };
+    let rx = rx_config(a);
     let (frames, rep) = modem.demodulate_report(&samples, &rx);
     for f in &frames {
-        let payload = if a.hex {
-            format!(",\"payload_hex\":\"{}\"", hex(&f.payload))
-        } else {
-            String::new()
-        };
-        let header = f.header.as_ref().map(header_json).unwrap_or_default();
-        writeln!(
-            out,
-            "{{\"ts\":\"{}\",\"event\":\"frame\",\"start\":{},\"end\":{},\"len\":{},\"crc_ok\":{},\"sync_errors\":{},\"metric\":{},\"cfo_cycles_per_symbol\":{},\"phase_rad\":{},\"timing_frac\":{}{header}{payload}}}",
-            now(),
-            f.start,
-            f.end,
-            f.payload.len(),
-            f.crc_ok,
-            f.sync_errors,
-            num(f64::from(f.metric)),
-            num(f64::from(f.cfo_cycles_per_symbol)),
-            num(f64::from(f.phase_rad)),
-            num(f64::from(f.timing_frac)),
-        )
-        .map_err(io)?;
+        write_frame(out, f, a.hex)?;
     }
     writeln!(
         out,
@@ -564,6 +660,35 @@ mod tests {
 
     fn v(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn rx_stream_parses() {
+        match parse(&v(
+            "rx-stream --in - --mod qpsk --cfo-search 0.1 --payload-len 64 --hex",
+        ))
+        .unwrap()
+        {
+            WaveformCommand::RxStream(a, block) => {
+                assert_eq!(
+                    (a.input.as_str(), block, a.payload_len, a.hex),
+                    ("-", 65_536, Some(64), true)
+                );
+                assert_eq!(a.cfo_search, 0.1);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&v("rx-stream --in x --mod bpsk --block 4096")).unwrap() {
+            WaveformCommand::RxStream(_, block) => assert_eq!(block, 4096),
+            other => panic!("{other:?}"),
+        }
+        assert!(parse(&v("rx-stream --in - --mod bpsk --block 10")).is_err());
+        assert!(parse(&v("rx-stream --mod bpsk")).is_err());
+        assert!(parse(&v("decode --in x --mod bpsk --block 4096")).is_err());
+        assert!(parse(&v(
+            "rx-stream --in - --mod bpsk --cfo-bins 2 --cfo-search 0.1"
+        ))
+        .is_err());
     }
 
     #[test]
