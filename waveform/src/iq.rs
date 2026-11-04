@@ -97,9 +97,31 @@ pub fn from_cf32_le(bytes: &[u8]) -> Vec<Complex32> {
         .collect()
 }
 
+/// SigMF `ci16_le` bytes (4 bytes per sample, what UHD's `--type short` writes) as samples scaled to
+/// +-1.0 (divided by 32768). A trailing partial sample is ignored.
+pub fn from_ci16_le(bytes: &[u8]) -> Vec<Complex32> {
+    const K: f32 = 1.0 / 32768.0;
+    bytes
+        .chunks_exact(4)
+        .map(|c| {
+            Complex32::new(
+                f32::from(i16::from_le_bytes([c[0], c[1]])) * K,
+                f32::from(i16::from_le_bytes([c[2], c[3]])) * K,
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ci16_layout() {
+        let b = [0x00, 0x40, 0x00, 0x80, 0xff, 0x7f, 0x01];
+        let v = from_ci16_le(&b);
+        assert_eq!(v, vec![Complex32::new(0.5, -1.0)]);
+    }
 
     #[test]
     fn cf32_round_trip_and_layout() {

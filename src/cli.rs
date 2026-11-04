@@ -18,7 +18,7 @@ USAGE:
                     [--allow-remote-udp] [--duration SECS]
   oasa-radio info [--radio KIND [radio options]]
   oasa-radio lora ACTION --device PATH [...]     (the OASA LoRa modem; see LORA MODEM below)
-  oasa-radio waveform ber|iq|decode [...]        (OASA's own modem in simulation; see WAVEFORM below)
+  oasa-radio waveform ber|iq|decode|df [...]     (OASA's own modem, and two-channel DF; see WAVEFORM below)
 
   --udp-listen   oasa-link's --remote points here. Packets from oasa-link go out the
                  radio. Must be a loopback address unless --allow-remote-udp is given.
