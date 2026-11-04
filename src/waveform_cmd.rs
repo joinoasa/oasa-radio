@@ -2,7 +2,9 @@
 //!
 //! * `ber`: Monte Carlo bit error rate against theory, one JSON line per Eb/N0 point.
 //! * `iq`: write a modulated, noisy frame as a SigMF pair (`cf32_le`) for the lab.
-//! * `decode`: read such a file back and print the frames found.
+//! * `decode`: read such a file back and print the frames found and what happened to the candidates.
+//!
+//! `--frame w0|v1` picks the frame format (default w0; v1 has the protected header).
 //!
 //! The payloads here are test data made from a seed. Payload bytes are printed only when asked for (`--hex`).
 
@@ -12,6 +14,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use oasa_waveform::channel::{n0_for_ebn0, snr_per_sample_db, Channel, Impairments};
+use oasa_waveform::frame::{FrameFormat, HeaderFields};
 use oasa_waveform::iq::{from_cf32_le, to_cf32_le};
 use oasa_waveform::rng::Rng;
 use oasa_waveform::sim::{run_ber, BerOptions};
@@ -24,21 +27,31 @@ WAVEFORM (W0, simulation):
   oasa-radio waveform ber --mod bpsk|qpsk|fsk2 --ebn0-db 0,2,4,6 [--bits N] [--seed S]
                           [--sps 8] [--payload-len 64] [--cfo CYCLES_PER_SYMBOL]
                           [--cfo-random MAX] [--random-frac-delay] [--cfo-bins 0]
-                          [--cfo-search MAX] [--json]
+                          [--cfo-search MAX] [--frame w0|v1] [--json]
   oasa-radio waveform iq --mod bpsk|qpsk|fsk2 --out BASE [--ebn0-db X] [--payload-len 32 | --payload-hex HEX]
                          [--seed S] [--sps 8] [--symbol-rate 25000] [--center-hz 0]
                          [--phase-deg 0] [--delay 64] [--tail 64] [--cfo 0] [--frac-delay 0]
+                         [--frame w0|v1]
   oasa-radio waveform decode --in BASE --mod bpsk|qpsk|fsk2 [--sps 8] [--cfo-bins 0]
-                             [--cfo-search MAX] [--hex]
+                             [--cfo-search MAX] [--frame w0|v1] [--hex]
 
   ber     Sends random frames through the modem and the simulated channel at each Eb/N0 and prints one
           JSON line per point: errors, bits, BER, the theory value (BPSK and QPSK: Q(sqrt(2Eb/N0));
           2-FSK, noncoherent: 0.5 exp(-Eb/2N0)), a 3-sigma Wilson interval and the binomial z-score.
           Default 100000 bits, seed 1. The same seed gives the same lines. (--json is accepted; output
           is always JSON lines.) --cfo-random gives each frame its own offset, uniform in +-MAX.
+          With --frame v1 the line also has header_ok: frames whose header decoded, through the
+          real header path, to what was sent (the BER measurement itself skips the header checks).
+          In v1 BER mode a header that fails its CRC-8 marks the frame crc_ok false.
   iq      Writes BASE.sigmf-data (cf32_le, little endian float32 I and Q) and BASE.sigmf-meta: one frame
           with BASE delay samples of noise in front and TAIL after. No --ebn0-db means no noise.
-  decode  Finds frames in BASE.sigmf-data. Prints sizes and CRC status; the payload only with --hex.
+  decode  Finds frames in BASE.sigmf-data. Prints sizes and CRC status (and, for v1, the header
+          fields); the payload only with --hex. The last line, decode_done, has the counts of
+          what happened to each candidate: preambles, sync_rejected, header_rejected, too_short,
+          inside_frame (candidates inside a frame already found; not lost frames).
+
+  --frame w0 is the original format (length byte and complement). --frame v1 protects the header
+  with a code and a CRC-8 (docs/frame-v1.md). The sender and the receiver must use the same one.
 
   Frequency offsets (--cfo, --cfo-random, --cfo-search) are in cycles per symbol: 1.0 is one symbol
   rate. --cfo-search MAX turns on the coarse frequency search (an FFT over the preamble) for offsets
@@ -49,6 +62,7 @@ WAVEFORM (W0, simulation):
 #[derive(Debug, Clone, PartialEq)]
 pub struct BerArgs {
     pub modulation: Modulation,
+    pub frame: FrameFormat,
     pub ebn0_db: Vec<f64>,
     pub bits: u64,
     pub seed: u64,
@@ -64,6 +78,7 @@ pub struct BerArgs {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IqArgs {
     pub modulation: Modulation,
+    pub frame: FrameFormat,
     pub out: String,
     pub ebn0_db: Option<f64>,
     pub payload: Payload,
@@ -87,6 +102,7 @@ pub enum Payload {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodeArgs {
     pub modulation: Modulation,
+    pub frame: FrameFormat,
     pub input: String,
     pub sps: usize,
     pub cfo_bins: usize,
@@ -137,6 +153,10 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
         let v = named.remove("mod").ok_or("missing --mod")?;
         Modulation::parse(&v).ok_or(format!("--mod {v:?}: use bpsk, qpsk or fsk2"))?
     };
+    let frame = match named.remove("frame") {
+        None => FrameFormat::W0,
+        Some(v) => FrameFormat::parse(&v).ok_or(format!("--frame {v:?}: use w0 or v1"))?,
+    };
     let sps = int("sps", named.remove("sps"), 8, 4, 64)? as usize;
     // Frequencies in cycles per symbol stay inside the sampled band, +-sps/2.
     let half = sps as f64 / 2.0;
@@ -152,6 +172,7 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
             }
             WaveformCommand::Ber(BerArgs {
                 modulation,
+                frame,
                 ebn0_db,
                 bits: int("bits", named.remove("bits"), 100_000, 1, 10_000_000_000)?,
                 seed: int("seed", named.remove("seed"), 1, 0, u64::MAX)?,
@@ -179,6 +200,7 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
             }
             WaveformCommand::Iq(IqArgs {
                 modulation,
+                frame,
                 out: named.remove("out").ok_or("missing --out")?,
                 ebn0_db: match named.remove("ebn0-db") {
                     None => None,
@@ -204,6 +226,7 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
         }
         _ => WaveformCommand::Decode(DecodeArgs {
             modulation,
+            frame,
             input: named.remove("in").ok_or("missing --in")?,
             sps,
             cfo_bins: int("cfo-bins", named.remove("cfo-bins"), 0, 0, 20)? as usize,
@@ -304,6 +327,7 @@ fn io(e: std::io::Error) -> String {
 fn run_ber_cmd(a: &BerArgs, out: &mut dyn Write) -> R<()> {
     let opts = BerOptions {
         sps: a.sps,
+        frame: a.frame,
         payload_len: a.payload_len,
         cfo_cycles_per_symbol: a.cfo,
         cfo_random: a.cfo_random,
@@ -323,7 +347,7 @@ fn run_ber_cmd(a: &BerArgs, out: &mut dyn Write) -> R<()> {
         let p = run_ber(a.modulation, db, a.bits, a.seed, &opts).map_err(|e| e.to_string())?;
         writeln!(
             out,
-            "{{\"ts\":\"{}\",\"event\":\"ber\",\"mod\":\"{}\",\"ebn0_db\":{},\"bits\":{},\"errors\":{},\"ber\":{},\"theory\":{},\"ci_lo\":{},\"ci_hi\":{},\"z\":{},\"frames\":{},\"detected\":{},\"crc_ok\":{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"theory_kind\":{}}}",
+            "{{\"ts\":\"{}\",\"event\":\"ber\",\"mod\":\"{}\",\"ebn0_db\":{},\"bits\":{},\"errors\":{},\"ber\":{},\"theory\":{},\"ci_lo\":{},\"ci_hi\":{},\"z\":{},\"frame\":\"{}\",\"frames\":{},\"detected\":{},\"crc_ok\":{}{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"theory_kind\":{}}}",
             now(),
             a.modulation.name(),
             num(db),
@@ -334,9 +358,15 @@ fn run_ber_cmd(a: &BerArgs, out: &mut dyn Write) -> R<()> {
             num(p.ci_lo),
             num(p.ci_hi),
             num(p.z),
+            a.frame.name(),
             p.frames,
             p.detected,
             p.crc_ok,
+            if a.frame == FrameFormat::V1 {
+                format!(",\"header_ok\":{}", p.header_ok)
+            } else {
+                String::new()
+            },
             a.seed,
             a.sps,
             a.payload_len,
@@ -371,6 +401,7 @@ fn with_ext(base: &std::path::Path, ext: &str) -> PathBuf {
 fn run_iq(a: &IqArgs, out: &mut dyn Write) -> R<()> {
     let modem = Modem::new(ModemConfig {
         sps: a.sps,
+        frame: a.frame,
         ..ModemConfig::new(a.modulation)
     })
     .map_err(|e| e.to_string())?;
@@ -402,14 +433,16 @@ fn run_iq(a: &IqArgs, out: &mut dyn Write) -> R<()> {
     let rate = a.symbol_rate * a.sps as f64;
     let ts = now();
     let desc = format!(
-        "OASA waveform W0 test frame: {} with RRC (or tones for fsk2), {} bytes, simulated channel",
+        "OASA waveform test frame ({}): {} with RRC (or tones for fsk2), {} bytes, simulated channel",
+        a.frame.name(),
         a.modulation.name(),
         payload.len()
     );
     let meta = format!(
-        "{{\n  \"global\": {{\n    \"core:datatype\": \"cf32_le\",\n    \"core:sample_rate\": {rate:?},\n    \"core:version\": \"1.2.0\",\n    \"core:num_channels\": 1,\n    \"core:description\": {},\n    \"core:recorder\": \"oasa-radio waveform iq\",\n    \"oasa:modulation\": \"{}\",\n    \"oasa:samples_per_symbol\": {},\n    \"oasa:symbol_rate\": {:?},\n    \"oasa:ebn0_db\": {},\n    \"oasa:simulated\": true\n  }},\n  \"captures\": [\n    {{ \"core:sample_start\": 0, \"core:frequency\": {:?}, \"core:datetime\": \"{}\" }}\n  ],\n  \"annotations\": [\n    {{ \"core:sample_start\": {}, \"core:sample_count\": {}, \"core:label\": {} }}\n  ]\n}}\n",
+        "{{\n  \"global\": {{\n    \"core:datatype\": \"cf32_le\",\n    \"core:sample_rate\": {rate:?},\n    \"core:version\": \"1.2.0\",\n    \"core:num_channels\": 1,\n    \"core:description\": {},\n    \"core:recorder\": \"oasa-radio waveform iq\",\n    \"oasa:modulation\": \"{}\",\n    \"oasa:frame\": \"{}\",\n    \"oasa:samples_per_symbol\": {},\n    \"oasa:symbol_rate\": {:?},\n    \"oasa:ebn0_db\": {},\n    \"oasa:simulated\": true\n  }},\n  \"captures\": [\n    {{ \"core:sample_start\": 0, \"core:frequency\": {:?}, \"core:datetime\": \"{}\" }}\n  ],\n  \"annotations\": [\n    {{ \"core:sample_start\": {}, \"core:sample_count\": {}, \"core:label\": {} }}\n  ]\n}}\n",
         json_str(&desc),
         a.modulation.name(),
+        a.frame.name(),
         a.sps,
         a.symbol_rate,
         a.ebn0_db.map(num).unwrap_or_else(|| "null".into()),
@@ -426,8 +459,9 @@ fn run_iq(a: &IqArgs, out: &mut dyn Write) -> R<()> {
         .unwrap_or_else(|| "null".into());
     writeln!(
         out,
-        "{{\"ts\":\"{ts}\",\"event\":\"iq\",\"mod\":\"{}\",\"data\":{},\"meta\":{},\"samples\":{},\"sample_rate\":{rate:?},\"frame_start\":{},\"frame_samples\":{},\"payload_len\":{},\"ebn0_db\":{},\"snr_per_sample_db\":{snr},\"seed\":{}}}",
+        "{{\"ts\":\"{ts}\",\"event\":\"iq\",\"mod\":\"{}\",\"frame\":\"{}\",\"data\":{},\"meta\":{},\"samples\":{},\"sample_rate\":{rate:?},\"frame_start\":{},\"frame_samples\":{},\"payload_len\":{},\"ebn0_db\":{},\"snr_per_sample_db\":{snr},\"seed\":{}}}",
         a.modulation.name(),
+        a.frame.name(),
         json_str(&data_path.display().to_string()),
         json_str(&meta_path.display().to_string()),
         y.len(),
@@ -441,12 +475,22 @@ fn run_iq(a: &IqArgs, out: &mut dyn Write) -> R<()> {
     Ok(())
 }
 
+/// `,"header":{...}` for a decoded v1 header.
+fn header_json(h: &HeaderFields) -> String {
+    let m = Modulation::from_code(h.modulation).map_or("reserved", Modulation::name);
+    format!(
+        ",\"header\":{{\"version\":{},\"extension\":{},\"modulation\":\"{m}\",\"payload_code\":{},\"pilots\":{},\"length\":{},\"channel_plan\":{},\"coexistence\":{}}}",
+        h.version, h.extension, h.payload_code, h.pilots, h.length, h.channel_plan, h.coexistence
+    )
+}
+
 fn run_decode(a: &DecodeArgs, out: &mut dyn Write) -> R<()> {
     let data_path = with_ext(&base_path(&a.input), ".sigmf-data");
     let bytes = std::fs::read(&data_path).map_err(|e| format!("{}: {e}", data_path.display()))?;
     let samples = from_cf32_le(&bytes);
     let modem = Modem::new(ModemConfig {
         sps: a.sps,
+        frame: a.frame,
         ..ModemConfig::new(a.modulation)
     })
     .map_err(|e| e.to_string())?;
@@ -455,16 +499,17 @@ fn run_decode(a: &DecodeArgs, out: &mut dyn Write) -> R<()> {
         cfo_search: a.cfo_search as f32,
         ..RxConfig::default()
     };
-    let frames = modem.demodulate_with(&samples, &rx);
+    let (frames, rep) = modem.demodulate_report(&samples, &rx);
     for f in &frames {
         let payload = if a.hex {
             format!(",\"payload_hex\":\"{}\"", hex(&f.payload))
         } else {
             String::new()
         };
+        let header = f.header.as_ref().map(header_json).unwrap_or_default();
         writeln!(
             out,
-            "{{\"ts\":\"{}\",\"event\":\"frame\",\"start\":{},\"end\":{},\"len\":{},\"crc_ok\":{},\"sync_errors\":{},\"metric\":{},\"cfo_cycles_per_symbol\":{},\"phase_rad\":{},\"timing_frac\":{}{payload}}}",
+            "{{\"ts\":\"{}\",\"event\":\"frame\",\"start\":{},\"end\":{},\"len\":{},\"crc_ok\":{},\"sync_errors\":{},\"metric\":{},\"cfo_cycles_per_symbol\":{},\"phase_rad\":{},\"timing_frac\":{}{header}{payload}}}",
             now(),
             f.start,
             f.end,
@@ -480,12 +525,18 @@ fn run_decode(a: &DecodeArgs, out: &mut dyn Write) -> R<()> {
     }
     writeln!(
         out,
-        "{{\"ts\":\"{}\",\"event\":\"decode_done\",\"mod\":\"{}\",\"samples\":{},\"frames\":{},\"crc_ok_frames\":{}}}",
+        "{{\"ts\":\"{}\",\"event\":\"decode_done\",\"mod\":\"{}\",\"frame\":\"{}\",\"samples\":{},\"frames\":{},\"crc_ok_frames\":{},\"preambles\":{},\"sync_rejected\":{},\"header_rejected\":{},\"too_short\":{},\"inside_frame\":{}}}",
         now(),
         a.modulation.name(),
+        a.frame.name(),
         samples.len(),
         frames.len(),
-        frames.iter().filter(|f| f.crc_ok).count()
+        frames.iter().filter(|f| f.crc_ok).count(),
+        rep.preambles,
+        rep.sync_rejected,
+        rep.header_rejected,
+        rep.too_short,
+        rep.inside_frame,
     )
     .map_err(io)?;
     Ok(())
@@ -576,6 +627,37 @@ mod tests {
             WaveformCommand::Ber(a) => assert_eq!((a.cfo_random, a.cfo_search), (2.0, 2.05)),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn frame_option_parses_and_defaults_to_w0() {
+        match parse(&v("ber --mod bpsk --ebn0-db 2 --frame v1")).unwrap() {
+            WaveformCommand::Ber(a) => assert_eq!(a.frame, FrameFormat::V1),
+            other => panic!("{other:?}"),
+        }
+        match parse(&v("iq --mod bpsk --out x")).unwrap() {
+            WaveformCommand::Iq(a) => assert_eq!(a.frame, FrameFormat::W0),
+            other => panic!("{other:?}"),
+        }
+        match parse(&v("decode --mod qpsk --in x --frame v1")).unwrap() {
+            WaveformCommand::Decode(a) => assert_eq!(a.frame, FrameFormat::V1),
+            other => panic!("{other:?}"),
+        }
+        assert!(parse(&v("ber --mod bpsk --ebn0-db 2 --frame v2")).is_err());
+        assert!(parse(&v("decode --mod bpsk --in x --frame")).is_err());
+    }
+
+    #[test]
+    fn header_json_names_the_fields() {
+        let h = HeaderFields {
+            channel_plan: 3,
+            coexistence: 1,
+            ..HeaderFields::new(1, 64)
+        };
+        assert_eq!(
+            header_json(&h),
+            ",\"header\":{\"version\":0,\"extension\":0,\"modulation\":\"qpsk\",\"payload_code\":0,\"pilots\":0,\"length\":64,\"channel_plan\":3,\"coexistence\":1}"
+        );
     }
 
     #[test]
