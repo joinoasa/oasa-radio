@@ -29,7 +29,7 @@ WAVEFORM (W0, simulation):
                          [--seed S] [--sps 8] [--symbol-rate 25000] [--center-hz 0]
                          [--phase-deg 0] [--delay 64] [--tail 64] [--cfo 0] [--frac-delay 0]
   oasa-radio waveform decode --in BASE --mod bpsk|qpsk|fsk2 [--sps 8] [--cfo-bins 0]
-                             [--cfo-search MAX] [--hex]
+                             [--cfo-search MAX] [--hex] [--payload-len N] [--sync-max-errors 3]
 
   ber     Sends random frames through the modem and the simulated channel at each Eb/N0 and prints one
           JSON line per point: errors, bits, BER, the theory value (BPSK and QPSK: Q(sqrt(2Eb/N0));
@@ -39,6 +39,10 @@ WAVEFORM (W0, simulation):
   iq      Writes BASE.sigmf-data (cf32_le, little endian float32 I and Q) and BASE.sigmf-meta: one frame
           with BASE delay samples of noise in front and TAIL after. No --ebn0-db means no noise.
   decode  Finds frames in BASE.sigmf-data. Prints sizes and CRC status; the payload only with --hex.
+          --payload-len N takes the length as known instead of reading the header, and
+          --sync-max-errors 16 keeps frames with a damaged sync word: what `ber` does, for measuring
+          BER on recordings (the header has no error correction, so at 0 dB most headers have a bit
+          error and those frames are otherwise lost).
 
   Frequency offsets (--cfo, --cfo-random, --cfo-search) are in cycles per symbol: 1.0 is one symbol
   rate. --cfo-search MAX turns on the coarse frequency search (an FFT over the preamble) for offsets
@@ -92,6 +96,9 @@ pub struct DecodeArgs {
     pub cfo_bins: usize,
     pub cfo_search: f64,
     pub hex: bool,
+    /// Take the payload length as known instead of reading it from the header (BER measurement).
+    pub payload_len: Option<usize>,
+    pub sync_max_errors: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -209,6 +216,12 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
             cfo_bins: int("cfo-bins", named.remove("cfo-bins"), 0, 0, 20)? as usize,
             cfo_search: opt_float("cfo-search", named.remove("cfo-search"), 0.0, 0.0, half)?,
             hex: flags.iter().any(|f| f == "hex"),
+            payload_len: match named.remove("payload-len") {
+                None => None,
+                v => Some(int("payload-len", v, 0, 0, 255)? as usize),
+            },
+            sync_max_errors: int("sync-max-errors", named.remove("sync-max-errors"), 3, 0, 16)?
+                as u32,
         }),
     };
     match &cmd {
@@ -453,6 +466,8 @@ fn run_decode(a: &DecodeArgs, out: &mut dyn Write) -> R<()> {
     let rx = RxConfig {
         cfo_bins: a.cfo_bins,
         cfo_search: a.cfo_search as f32,
+        expected_len: a.payload_len,
+        sync_max_errors: a.sync_max_errors,
         ..RxConfig::default()
     };
     let frames = modem.demodulate_with(&samples, &rx);
@@ -568,6 +583,22 @@ mod tests {
                 ..
             })
         ));
+        match parse(&v(
+            "decode --mod bpsk --in /tmp/x --payload-len 64 --sync-max-errors 16",
+        ))
+        .unwrap()
+        {
+            WaveformCommand::Decode(a) => {
+                assert_eq!((a.payload_len, a.sync_max_errors), (Some(64), 16))
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&v("decode --mod bpsk --in /tmp/x")).unwrap() {
+            WaveformCommand::Decode(a) => assert_eq!((a.payload_len, a.sync_max_errors), (None, 3)),
+            other => panic!("{other:?}"),
+        }
+        assert!(parse(&v("decode --mod bpsk --in /tmp/x --sync-max-errors 17")).is_err());
+        assert!(parse(&v("decode --mod bpsk --in /tmp/x --payload-len 256")).is_err());
         match parse(&v(
             "ber --mod bpsk --ebn0-db 8 --cfo-random 2 --cfo-search 2.05",
         ))

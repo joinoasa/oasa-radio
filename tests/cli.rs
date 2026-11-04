@@ -295,6 +295,57 @@ fn waveform_iq_writes_a_sigmf_pair_that_decode_reads_back() {
 }
 
 #[test]
+fn waveform_decode_can_take_the_length_as_known() {
+    let dir = std::env::temp_dir().join(format!("oasa-wf-len-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let base_s = dir.join("frame").display().to_string();
+    let o = run(&[
+        "waveform",
+        "iq",
+        "--mod",
+        "bpsk",
+        "--out",
+        &base_s,
+        "--ebn0-db",
+        "20",
+        "--payload-hex",
+        "00ff10a5c3",
+        "--seed",
+        "4",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let frame_with = |len: &str| {
+        let d = run(&[
+            "waveform",
+            "decode",
+            "--mod",
+            "bpsk",
+            "--in",
+            &base_s,
+            "--payload-len",
+            len,
+            "--sync-max-errors",
+            "16",
+            "--hex",
+        ]);
+        assert!(d.status.success());
+        String::from_utf8_lossy(&d.stdout)
+            .lines()
+            .find(|l| l.contains("\"event\":\"frame\""))
+            .unwrap()
+            .to_string()
+    };
+    let right = frame_with("5");
+    assert_eq!(field(&right, "crc_ok"), "true");
+    assert_eq!(field(&right, "payload_hex"), "00ff10a5c3");
+    // a wrong known length is used as given (the header is not read): 4 bytes, and the CRC fails
+    let wrong = frame_with("4");
+    assert_eq!(field(&wrong, "len"), "4");
+    assert_eq!(field(&wrong, "crc_ok"), "false");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn waveform_bad_arguments_fail_cleanly() {
     for args in [
         vec!["waveform", "ber", "--mod", "bpsk"],

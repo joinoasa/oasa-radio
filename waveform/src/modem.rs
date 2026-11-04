@@ -375,7 +375,7 @@ impl Modem {
             }
             let mu = parabola_peak(&metric, tau);
             if let Some(f) = self.decode_at(samples, tau, mu, m, rx) {
-                if f.crc_ok {
+                if skip_past(&f, rx) {
                     busy_until = f.end;
                 }
                 out.push(f);
@@ -604,7 +604,7 @@ impl Modem {
                 let turns = (w * fr.start as f64).rem_euclid(1.0);
                 let ph = fr.phase_rad as f64 + 2.0 * PI * turns;
                 fr.phase_rad = ph.sin().atan2(ph.cos()) as f32;
-                if fr.crc_ok {
+                if skip_past(&fr, rx) {
                     busy_until = fr.end;
                 }
                 out.push(fr);
@@ -1043,6 +1043,18 @@ fn refine_phase(m: Modulation, z: &[Complex32], rho: f64) -> (f64, f64) {
 
 /// Where the peak of three neighbouring metric values lies, as an offset from `i` in samples
 /// (a parabola through the three points; clamped to half a sample).
+/// Sync errors up to which a damaged frame of known length is still taken as a real frame (the
+/// default `sync_max_errors`). A false start in noise has about 8 of 16 wrong.
+const SKIP_SYNC_MAX_ERRORS: u32 = 3;
+
+/// Whether the search skips past this frame. A frame's extent is known when its CRC passes, or when
+/// the length is given and its sync word matched: then the body of a damaged frame is not searched
+/// again for false starts. With sync rejection off (BER measurement), a false start in the noise
+/// before a frame must not hide the frame, so its sync word must match.
+fn skip_past(f: &RxFrame, rx: &RxConfig) -> bool {
+    f.crc_ok || (rx.expected_len.is_some() && f.sync_errors <= SKIP_SYNC_MAX_ERRORS)
+}
+
 fn parabola_peak(y: &[f32], i: usize) -> f64 {
     if i == 0 || i + 1 >= y.len() {
         return 0.0;
