@@ -75,7 +75,7 @@ jobs:
           buildtargets: esp32s3
           default: false
       - name: Cache crates and build output
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
