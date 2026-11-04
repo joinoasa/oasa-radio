@@ -3,6 +3,7 @@
 //! * `ber`: Monte Carlo bit error rate against theory, one JSON line per Eb/N0 point.
 //! * `iq`: write a modulated, noisy frame as a SigMF pair (`cf32_le`) for the lab.
 //! * `decode`: read such a file back and print the frames found and what happened to the candidates.
+//! * `df`: two receive channels' phase difference and the direction of arrival (T-RF3).
 //!
 //! `--frame w0|v1` picks the frame format (default w0; v1 has the protected header).
 //!
@@ -14,8 +15,9 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use oasa_waveform::channel::{n0_for_ebn0, snr_per_sample_db, Channel, Impairments};
+use oasa_waveform::df;
 use oasa_waveform::frame::{FrameFormat, HeaderFields};
-use oasa_waveform::iq::{from_cf32_le, to_cf32_le};
+use oasa_waveform::iq::{from_cf32_le, from_ci16_le, to_cf32_le};
 use oasa_waveform::rng::Rng;
 use oasa_waveform::sim::{run_ber, BerOptions};
 use oasa_waveform::stream::StreamReceiver;
@@ -38,6 +40,9 @@ WAVEFORM (W0, simulation):
                              [--payload-len N] [--sync-max-errors 3]
   oasa-radio waveform rx-stream --in -|FILE --mod bpsk|qpsk|fsk2 [--block 65536]
                                 [same receiver options as decode]
+  oasa-radio waveform df --in1 FILE --in2 FILE [--format ci16|cf32] [--block N]
+                         [--burst-db 10] [--win 256] [--min-len 4096] [--skip 0]
+                         [--cal-deg 0] [--spacing-wl D]
 
   ber     Sends random frames through the modem and the simulated channel at each Eb/N0 and prints one
           JSON line per point: errors, bits, BER, the theory value (BPSK and QPSK: Q(sqrt(2Eb/N0));
@@ -64,6 +69,16 @@ WAVEFORM (W0, simulation):
           decided once one longest frame has arrived after its start; the result is the same as
           decode on the whole stream. Ends with stream_done (samples, frames, crc_ok_frames,
           trailing_bytes: an incomplete last sample, ignored). Memory stays about two frames.
+
+  df      Two channels recorded together (one multi-channel stream; raw files, no SigMF wrapper,
+          default ci16 as UHD's --type short writes). Measures r = mean(x2 conj(x1)) per burst (runs
+          --burst-db over the noise floor in --win sample windows, at least --min-len long) or, with
+          --block N, per fixed block (a continuous tone). One JSON line per segment: phase of channel 2
+          relative to channel 1 (degrees, positive: channel 2 leads), coherence, power ratio, SNR per
+          channel; then df_done with the circular mean and standard deviation. --cal-deg subtracts the
+          receiver offset; with --spacing-wl (antenna spacing in wavelengths) each line also has
+          doa_deg, from broadside, positive toward channel 2. --skip drops samples at the start (the
+          radio settling). Carrier offset and modulation cancel, so any source works.
 
   --frame w0 is the original format (length byte and complement). --frame v1 protects the header
   with a code and a CRC-8 (docs/frame-v1.md). The sender and the receiver must use the same one.
@@ -137,6 +152,23 @@ pub enum WaveformCommand {
     /// Decode a continuous stream in blocks of `block` samples (`input` is "-" for stdin or a raw
     /// cf32_le file).
     RxStream(DecodeArgs, usize),
+    Df(DfArgs),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DfArgs {
+    pub in1: String,
+    pub in2: String,
+    /// true: cf32_le; false: ci16_le.
+    pub cf32: bool,
+    /// Fixed blocks of this many samples instead of finding bursts.
+    pub block: Option<usize>,
+    pub burst_db: f64,
+    pub win: usize,
+    pub min_len: usize,
+    pub skip: usize,
+    pub cal_deg: f64,
+    pub spacing_wl: Option<f64>,
 }
 
 type R<T> = Result<T, String>;
@@ -145,10 +177,10 @@ type R<T> = Result<T, String>;
 pub fn parse(args: &[String]) -> R<WaveformCommand> {
     let sub = match args.first().map(String::as_str) {
         None | Some("-h" | "--help" | "help") => return Ok(WaveformCommand::Help),
-        Some(s @ ("ber" | "iq" | "decode" | "rx-stream")) => s,
+        Some(s @ ("ber" | "iq" | "decode" | "rx-stream" | "df")) => s,
         Some(other) => {
             return Err(format!(
-                "unknown waveform command {other:?}; use ber, iq, decode or rx-stream"
+                "unknown waveform command {other:?}; use ber, iq, decode, rx-stream or df"
             ))
         }
     };
@@ -171,6 +203,9 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
                 }
             }
         }
+    }
+    if sub == "df" {
+        return parse_df(named);
     }
     let modulation = {
         let v = named.remove("mod").ok_or("missing --mod")?;
@@ -298,6 +333,36 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
     Ok(cmd)
 }
 
+fn parse_df(mut named: BTreeMap<String, String>) -> R<WaveformCommand> {
+    let cf32 = match named.remove("format").as_deref() {
+        None | Some("ci16") => false,
+        Some("cf32") => true,
+        Some(v) => return Err(format!("--format {v:?}: use ci16 or cf32")),
+    };
+    let a = DfArgs {
+        in1: named.remove("in1").ok_or("missing --in1")?,
+        in2: named.remove("in2").ok_or("missing --in2")?,
+        cf32,
+        block: match named.remove("block") {
+            None => None,
+            v => Some(int("block", v, 0, 16, 1 << 28)? as usize),
+        },
+        burst_db: opt_float("burst-db", named.remove("burst-db"), 10.0, 1.0, 60.0)?,
+        win: int("win", named.remove("win"), 256, 8, 1 << 20)? as usize,
+        min_len: int("min-len", named.remove("min-len"), 4096, 16, 1 << 28)? as usize,
+        skip: int("skip", named.remove("skip"), 0, 0, 1 << 32)? as usize,
+        cal_deg: opt_float("cal-deg", named.remove("cal-deg"), 0.0, -360.0, 360.0)?,
+        spacing_wl: match named.remove("spacing-wl") {
+            None => None,
+            Some(v) => Some(float("spacing-wl", &v, 0.01, 10.0)?),
+        },
+    };
+    if let Some(k) = named.keys().next() {
+        return Err(format!("unknown option --{k} for waveform df"));
+    }
+    Ok(WaveformCommand::Df(a))
+}
+
 fn int(k: &str, v: Option<String>, default: u64, min: u64, max: u64) -> R<u64> {
     match v {
         None => Ok(default),
@@ -360,7 +425,89 @@ pub fn run(cmd: &WaveformCommand, out: &mut dyn Write) -> R<()> {
         WaveformCommand::Iq(a) => run_iq(a, out),
         WaveformCommand::Decode(a) => run_decode(a, out),
         WaveformCommand::RxStream(a, block) => run_rx_stream(a, *block, out),
+        WaveformCommand::Df(a) => run_df(a, out),
     }
+}
+
+fn opt_num(x: Option<f64>) -> String {
+    x.map_or("null".to_string(), num)
+}
+
+/// Phase difference per burst (or block) of a two-channel capture, then the summary.
+fn run_df(a: &DfArgs, out: &mut dyn Write) -> R<()> {
+    let load = |p: &str| -> R<Vec<oasa_waveform::Complex32>> {
+        let b = std::fs::read(p).map_err(|e| format!("{p}: {e}"))?;
+        let mut v = if a.cf32 {
+            from_cf32_le(&b)
+        } else {
+            from_ci16_le(&b)
+        };
+        v.drain(..a.skip.min(v.len()));
+        Ok(v)
+    };
+    let (x1, x2) = (load(&a.in1)?, load(&a.in2)?);
+    if x1.len() != x2.len() {
+        return Err(format!(
+            "the two channels differ in length ({} and {} samples after --skip): not one stream?",
+            x1.len(),
+            x2.len()
+        ));
+    }
+    let noise = (df::noise_floor(&x1, a.win), df::noise_floor(&x2, a.win));
+    let segments = match a.block {
+        Some(b) => df::fixed_blocks(x1.len(), b),
+        None => df::find_bursts(&x1, &x2, a.win, a.burst_db, a.min_len),
+    };
+    let mut phases = Vec::with_capacity(segments.len());
+    let mut ratios = Vec::with_capacity(segments.len());
+    for &(s, len) in &segments {
+        // with fixed blocks the noise floor is not known (all signal)
+        let m = df::measure(&x1, &x2, s, len, a.block.is_none().then_some(noise));
+        let corrected = df::wrap_deg(m.phase_deg - a.cal_deg);
+        let doa = a
+            .spacing_wl
+            .and_then(|d| df::doa_deg(m.phase_deg, a.cal_deg, d));
+        writeln!(
+            out,
+            "{{\"ts\":\"{}\",\"event\":\"segment\",\"start\":{},\"len\":{},\"phase_deg\":{},\"phase_cal_deg\":{},\"coherence\":{},\"ratio_db\":{},\"snr1_db\":{},\"snr2_db\":{},\"doa_deg\":{}}}",
+            now(),
+            m.start + a.skip,
+            m.len,
+            num(m.phase_deg),
+            num(corrected),
+            num(m.coherence),
+            num(m.ratio_db),
+            opt_num(m.snr1_db),
+            opt_num(m.snr2_db),
+            opt_num(doa),
+        )
+        .map_err(io)?;
+        phases.push(corrected);
+        ratios.push(m.ratio_db);
+    }
+    let stats = df::circ_stats_deg(&phases);
+    let mean_ratio = (!ratios.is_empty()).then(|| ratios.iter().sum::<f64>() / ratios.len() as f64);
+    let doa = match (stats, a.spacing_wl) {
+        (Some((m, _)), Some(d)) => df::doa_deg(m, 0.0, d),
+        _ => None,
+    };
+    writeln!(
+        out,
+        "{{\"ts\":\"{}\",\"event\":\"df_done\",\"samples\":{},\"segments\":{},\"phase_mean_deg\":{},\"phase_std_deg\":{},\"ratio_mean_db\":{},\"noise1\":{},\"noise2\":{},\"cal_deg\":{},\"spacing_wl\":{},\"doa_mean_deg\":{}}}",
+        now(),
+        x1.len(),
+        segments.len(),
+        opt_num(stats.map(|s| s.0)),
+        opt_num(stats.map(|s| s.1)),
+        opt_num(mean_ratio),
+        num(noise.0),
+        num(noise.1),
+        num(a.cal_deg),
+        opt_num(a.spacing_wl),
+        opt_num(doa),
+    )
+    .map_err(io)?;
+    out.flush().map_err(io)
 }
 
 fn io(e: std::io::Error) -> String {

@@ -40,7 +40,7 @@ Packets from `oasa-link` arrive on `--udp-listen` and go out the radio. Packets 
 | `udp` | Simulation (put the lab's simulated channel between two bridges), Wi-Fi, Ethernet | Works |
 | `serial` | SiK, mLRS, RFD900x, any transparent UART modem | Works. Framing: [docs/serial-framing.md](docs/serial-framing.md) |
 | `lora` | Our LoRa modem firmware for the Heltec WiFi LoRa 32 V3. It speaks the serial framing: use `--radio serial --baud 115200 --mtu 255`, and `oasa-radio lora` for settings and counters | Works in simulation; real board untested. [firmware/heltec-v3](firmware/heltec-v3/README.md) |
-| `sdr` | OASA's own waveforms on SDRs | Planned. The modem (W0) runs in simulation: `oasa-radio waveform`, [docs/waveform-w0.md](docs/waveform-w0.md). Frame format v1 (protected header): [docs/frame-v1.md](docs/frame-v1.md) |
+| `sdr` | OASA's own waveforms on SDRs | Planned. The modem (W0) runs in simulation: `oasa-radio waveform`, [docs/waveform-w0.md](docs/waveform-w0.md). Frame format v1 (protected header): [docs/frame-v1.md](docs/frame-v1.md). Two-channel direction finding: [docs/direction-finding.md](docs/direction-finding.md) |
 
 ## Quick start
 

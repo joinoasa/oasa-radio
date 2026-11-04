@@ -2,6 +2,8 @@
 
 Goal: with an Ettus USRP E310 (2 receive channels), two 915 MHz antennas and a Heltec V3 running the oasa-radio LoRa firmware as the source, (1) calibrate the channel offset, (2) measure direction of arrival (DOA), (3) measure diversity gain. Numbers in "expected" come from this folder's simulation ([results.md](results.md)). Pass criteria are proposals; change them if the first run shows the simulation was too optimistic. Not yet run.
 
+**2026-11-04 (owner):** the source is the lab's B200mini (a tone or W1 frames), not the Heltec. Step 1 and a cable-length stand-in for step 2 run over the lab's 60 dB cabled path first (no antennas yet). Analysis: `oasa-radio waveform df` ([docs/direction-finding.md](../../docs/direction-finding.md)).
+
 ## Facts checked and not checked
 
 Checked (Ettus E310 product page and UHD manual, E3xx page):

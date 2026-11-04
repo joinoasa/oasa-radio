@@ -9,6 +9,7 @@
 //! - [`theory`]: erfc, Q and the textbook BER curves the simulation is checked against.
 //! - [`sim`]: the Monte Carlo BER harness used by the tests and `oasa-radio waveform ber`.
 //! - [`stream`]: [`stream::StreamReceiver`], the receiver for a continuous stream of samples in blocks.
+//! - [`df`]: two receive channels' phase difference and the direction of arrival (T-RF3).
 //! - [`fec`]: the convolutional code and its Viterbi decoder (the frame v1 header uses them).
 //! - [`frame`], [`pulse`], [`rng`], [`iq`]: frame formats (W0, v1) and CRCs, the RRC pulse, the seeded generator,
 //!   the sample type and cf32 byte conversion.
@@ -21,6 +22,7 @@
 #![forbid(unsafe_code)]
 
 pub mod channel;
+pub mod df;
 pub mod fec;
 pub mod fft;
 pub mod frame;

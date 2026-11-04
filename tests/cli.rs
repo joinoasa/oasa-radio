@@ -571,3 +571,119 @@ fn waveform_bad_arguments_fail_cleanly() {
     let o = run(&["waveform"]);
     assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("WAVEFORM"));
 }
+
+/// Two ci16 channels as UHD writes them: noise, then three tone bursts with channel 2 leading by
+/// `phase` degrees and a shared frequency offset that must cancel.
+fn df_files(dir: &std::path::Path, phase: f64) -> (String, String) {
+    let mut seed = 12345u64;
+    let mut noise = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((seed >> 33) as f64 / (1u64 << 31) as f64 - 0.5) * 0.004
+    };
+    let (mut b1, mut b2) = (Vec::new(), Vec::new());
+    for i in 0..60_000usize {
+        let on = [(5_000..15_000), (25_000..37_000), (45_000..55_000)]
+            .iter()
+            .any(|r| r.contains(&i));
+        let t = std::f64::consts::TAU * 0.0123 * i as f64;
+        let a = if on { 0.25 } else { 0.0 };
+        let p2 = t + phase.to_radians();
+        for (buf, re, im) in [
+            (&mut b1, a * t.cos() + noise(), a * t.sin() + noise()),
+            (&mut b2, a * p2.cos() + noise(), a * p2.sin() + noise()),
+        ] {
+            for x in [re, im] {
+                buf.extend_from_slice(&((x * 32767.0).round() as i16).to_le_bytes());
+            }
+        }
+    }
+    let (f1, f2) = (dir.join("rx.00.dat"), dir.join("rx.01.dat"));
+    std::fs::write(&f1, b1).unwrap();
+    std::fs::write(&f2, b2).unwrap();
+    (f1.display().to_string(), f2.display().to_string())
+}
+
+#[test]
+fn waveform_df_measures_phase_per_burst_and_direction() {
+    let dir = std::env::temp_dir().join(format!("oasa-df-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // receiver offset 20 degrees plus a source 30 degrees toward channel 2 at half-wavelength spacing:
+    // 20 + 180 sin(30) = 110
+    let (f1, f2) = df_files(&dir, 110.0);
+    let o = run(&[
+        "waveform",
+        "df",
+        "--in1",
+        &f1,
+        "--in2",
+        &f2,
+        "--cal-deg",
+        "20",
+        "--spacing-wl",
+        "0.5",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout);
+    let lines: Vec<&str> = out.lines().collect();
+    let segs: Vec<&&str> = lines
+        .iter()
+        .filter(|l| field(l, "event") == "segment")
+        .collect();
+    assert_eq!(segs.len(), 3, "{out}");
+    for s in &segs {
+        let p: f64 = field(s, "phase_deg").parse().unwrap();
+        let d: f64 = field(s, "doa_deg").parse().unwrap();
+        assert!((p - 110.0).abs() < 0.5, "{s}");
+        assert!((d - 30.0).abs() < 0.5, "{s}");
+        assert!(field(s, "snr1_db").parse::<f64>().unwrap() > 20.0, "{s}");
+    }
+    let done = lines.last().unwrap();
+    assert_eq!(field(done, "event"), "df_done");
+    assert_eq!(field(done, "segments"), "3");
+    assert!((field(done, "doa_mean_deg").parse::<f64>().unwrap() - 30.0).abs() < 0.5);
+
+    // fixed blocks over a stretch that is all signal
+    let o = run(&[
+        "waveform", "df", "--in1", &f1, "--in2", &f2, "--skip", "25000", "--block", "4000",
+    ]);
+    let out = String::from_utf8_lossy(&o.stdout);
+    let segs = out
+        .lines()
+        .filter(|l| field(l, "event") == "segment")
+        .count();
+    assert_eq!(segs, 8, "{out}"); // 35000 samples after the skip
+    let first = out.lines().next().unwrap();
+    assert_eq!(field(first, "start"), "25000");
+    assert_eq!(field(first, "snr1_db"), "null");
+
+    // a channel cut short is refused: the two files must be one stream
+    std::fs::write(&f2, [0u8; 400]).unwrap();
+    let o = run(&["waveform", "df", "--in1", &f1, "--in2", &f2]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("differ in length"));
+    for bad in [
+        vec!["waveform", "df", "--in1", &f1],
+        vec![
+            "waveform", "df", "--in1", &f1, "--in2", &f1, "--format", "sc8",
+        ],
+        vec![
+            "waveform",
+            "df",
+            "--in1",
+            &f1,
+            "--in2",
+            &f1,
+            "--spacing-wl",
+            "0",
+        ],
+        vec![
+            "waveform", "df", "--in1", &f1, "--in2", &f1, "--mod", "bpsk",
+        ],
+    ] {
+        let o = run(&bad);
+        assert!(!o.status.success(), "{bad:?}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
