@@ -626,6 +626,67 @@ fn coarse_search_settings() {
     assert!(c.bins < c.fft_len / 2);
 }
 
+#[test]
+fn many_frames_in_one_buffer_with_the_length_known() {
+    // A recording holds many frames. With the length known (BER measurement on recordings) every
+    // frame is found once: a damaged frame is skipped like a good one, so its body is not searched
+    // again for false starts, and a damaged header does not lose it.
+    let md = modem(Modulation::Bpsk);
+    for (ebn0, search) in [(0.0, 0.0f32), (3.0, 0.0), (6.0, 0.0), (3.0, 0.1)] {
+        let mut ch = Channel::new(21);
+        let (sent, len) = (20usize, 64usize);
+        let mut buf = Vec::new();
+        let mut payloads = Vec::new();
+        for _ in 0..sent {
+            let p = ch.rng().bytes(len);
+            buf.extend(md.modulate(&p).unwrap());
+            buf.extend(std::iter::repeat_n(Complex32::new(0.0, 0.0), 400));
+            payloads.push(p);
+        }
+        let imp = Impairments {
+            n0: n0_for_ebn0(ebn0, md.energy_per_bit()),
+            phase_rad: 1.0,
+            lead: 300,
+            tail: 300,
+            ..Default::default()
+        };
+        let y = ch.apply(&buf, &imp);
+        let rx = RxConfig {
+            expected_len: Some(len),
+            cfo_search: search,
+            ..RxConfig::default()
+        };
+        let got = md.demodulate_with(&y, &rx);
+        assert!(
+            got.len() <= sent && got.len() >= sent - 2,
+            "{ebn0} dB, search {search}: {} frames from {sent}",
+            got.len()
+        );
+        // in order, one per frame sent: compare bit errors with theory
+        let (mut errors, mut bits) = (0u64, 0u64);
+        for f in &got {
+            let best = payloads
+                .iter()
+                .map(|p| {
+                    p.iter()
+                        .zip(&f.payload)
+                        .map(|(a, b)| (a ^ b).count_ones() as u64)
+                        .sum::<u64>()
+                })
+                .min()
+                .unwrap();
+            errors += best;
+            bits += 8 * len as u64;
+        }
+        let ber = errors as f64 / bits as f64;
+        let theory = oasa_waveform::theory::ber_bpsk(oasa_waveform::theory::db_to_ratio(ebn0));
+        assert!(
+            ber < 1.6 * theory + 2e-4 && ber > 0.6 * theory - 2e-4,
+            "{ebn0} dB: BER {ber:.3e}, theory {theory:.3e}"
+        );
+    }
+}
+
 /// A fingerprint of a waveform: every sample rounded to 1e-4 (so a last-bit difference in a
 /// sine does not matter) and folded into an FNV-1a hash.
 fn fingerprint(x: &[Complex32]) -> u64 {

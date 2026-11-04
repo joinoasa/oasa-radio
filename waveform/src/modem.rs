@@ -597,8 +597,10 @@ impl Modem {
                 tally.span_until = tally.span_until.max(f.end);
                 // A v1 header that passed its CRC-8 and rules gives the length: the frame is
                 // there whatever its CRC-16 says. W0 trusts only a good CRC-16.
-                let sure =
-                    f.crc_ok || (self.cfg.frame == FrameFormat::V1 && rx.expected_len.is_none());
+                // With the length known, a frame whose sync word matched is skipped past even
+                // with a bad CRC-16, so its body is not searched again for false starts.
+                let sure = skip_past(&f, rx)
+                    || (self.cfg.frame == FrameFormat::V1 && rx.expected_len.is_none());
                 if sure {
                     tally.busy_until = f.end;
                 }
@@ -1361,6 +1363,18 @@ fn refine_phase(m: Modulation, z: &[Complex32], rho: f64) -> (f64, f64) {
 
 /// Where the peak of three neighbouring metric values lies, as an offset from `i` in samples
 /// (a parabola through the three points; clamped to half a sample).
+/// Sync errors up to which a damaged frame of known length is still taken as a real frame (the
+/// default `sync_max_errors`). A false start in noise has about 8 of 16 wrong.
+const SKIP_SYNC_MAX_ERRORS: u32 = 3;
+
+/// Whether the search skips past this frame. A frame's extent is known when its CRC passes, or when
+/// the length is given and its sync word matched: then the body of a damaged frame is not searched
+/// again for false starts. With sync rejection off (BER measurement), a false start in the noise
+/// before a frame must not hide the frame, so its sync word must match.
+fn skip_past(f: &RxFrame, rx: &RxConfig) -> bool {
+    f.crc_ok || (rx.expected_len.is_some() && f.sync_errors <= SKIP_SYNC_MAX_ERRORS)
+}
+
 fn parabola_peak(y: &[f32], i: usize) -> f64 {
     if i == 0 || i + 1 >= y.len() {
         return 0.0;
