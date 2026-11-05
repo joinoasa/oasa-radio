@@ -42,7 +42,7 @@ Packets from `oasa-link` arrive on `--udp-listen` and go out the radio. Packets 
 | `udp` | Simulation (put the lab's simulated channel between two bridges), Wi-Fi, Ethernet | Works |
 | `serial` | SiK, mLRS, RFD900x, any transparent UART modem | Works. Framing: [docs/serial-framing.md](docs/serial-framing.md). SiK: `oasa-radio sik show/set` and `--sik-expect`, [docs/sik.md](docs/sik.md) |
 | `lora` | Our LoRa modem firmware for the Heltec WiFi LoRa 32 V3. It speaks the serial framing: use `--radio serial --baud 115200 --mtu 255`, and `oasa-radio lora` for settings and counters | Works in simulation; real board untested. [firmware/heltec-v3](firmware/heltec-v3/README.md) |
-| `sdr` | OASA's own waveforms on SDRs | Planned. The modem (W0) runs in simulation: `oasa-radio waveform`, [docs/waveform-w0.md](docs/waveform-w0.md). Frame format v1 (protected header): [docs/frame-v1.md](docs/frame-v1.md). Light error correction for v1 (`--code light`): [docs/fec-light.md](docs/fec-light.md). Two-channel direction finding: [docs/direction-finding.md](docs/direction-finding.md) |
+| `sdr` | OASA's own waveforms on SDRs | Works on the bench (B200mini and E310, not yet a counted lab run): frame v1 over two continuous IQ streams, [docs/sdr-adapter.md](docs/sdr-adapter.md). The modem (W0) runs in simulation: `oasa-radio waveform`, [docs/waveform-w0.md](docs/waveform-w0.md). Frame format v1 (protected header): [docs/frame-v1.md](docs/frame-v1.md). Light error correction for v1 (`--code light`): [docs/fec-light.md](docs/fec-light.md). Two-channel direction finding: [docs/direction-finding.md](docs/direction-finding.md) |
 
 ## Quick start
 

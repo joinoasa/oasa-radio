@@ -16,6 +16,7 @@
 
 pub mod adapters;
 pub mod bridge;
+pub mod cable;
 pub mod cli;
 pub mod framing;
 pub mod log;

@@ -167,6 +167,14 @@ pub struct RxConfig {
     /// two symbol rates either way). 0 turns it off. It is capped at half the sample rate
     /// (`sps / 2` cycles per symbol). See [`Modem::coarse_metric`] for the method and its cost.
     pub cfo_search: f32,
+    /// v1 without `expected_len`: frames whose header announces more payload bytes than this are
+    /// rejected at the header, and the receiver needs (and keeps) no more of the buffer than a frame
+    /// of this length takes. A radio sets it to its MTU. `None`: 255.
+    pub max_len: Option<usize>,
+    /// v1 without `expected_len`: accept only frames with this body code; any other is rejected at
+    /// the header, and the longest frame is counted with this code. A radio that sends one code sets
+    /// it. `None`: any code a v1 header can announce.
+    pub only_code: Option<PayloadCode>,
 }
 
 impl Default for RxConfig {
@@ -179,6 +187,8 @@ impl Default for RxConfig {
             cfo_bins: 0,
             cfo_step: 0.005,
             cfo_search: 0.0,
+            max_len: None,
+            only_code: None,
         }
     }
 }
@@ -420,15 +430,23 @@ impl Modem {
     pub fn longest_frame_samples(&self, rx: &RxConfig) -> usize {
         match rx.expected_len {
             Some(n) => self.frame_samples(n.min(MAX_PAYLOAD)),
-            None => self.frame_samples_coded(MAX_PAYLOAD, self.longest_code()),
+            None => self.frame_samples_coded(self.longest_len(rx), self.longest_code(rx)),
         }
     }
 
-    /// The code of the longest frame a header can announce: light for v1, none for W0.
-    fn longest_code(&self) -> PayloadCode {
+    /// The code of the longest frame a header can announce: light for v1 (or `only_code`), none for W0.
+    fn longest_code(&self, rx: &RxConfig) -> PayloadCode {
         match self.cfg.frame {
             FrameFormat::W0 => PayloadCode::None,
-            FrameFormat::V1 => PayloadCode::Light,
+            FrameFormat::V1 => rx.only_code.unwrap_or(PayloadCode::Light),
+        }
+    }
+
+    /// The most payload bytes a header may announce: 255, or `max_len` for v1.
+    fn longest_len(&self, rx: &RxConfig) -> usize {
+        match self.cfg.frame {
+            FrameFormat::W0 => MAX_PAYLOAD,
+            FrameFormat::V1 => rx.max_len.unwrap_or(MAX_PAYLOAD).clamp(1, MAX_PAYLOAD),
         }
     }
 
@@ -1035,7 +1053,7 @@ impl Modem {
         let body_start = n_ref + self.header_syms();
         let max_bits = match rx.expected_len {
             Some(n) => self.body_len_bits(n, self.cfg.code),
-            None => self.body_len_bits(MAX_PAYLOAD, self.longest_code()),
+            None => self.body_len_bits(self.longest_len(rx), self.longest_code(rx)),
         };
         let want_syms = body_start + max_bits / bps;
         let avail = r.len() - tau;
@@ -1099,7 +1117,11 @@ impl Modem {
                 header = parse_header_v1(&soft);
                 match (rx.expected_len, &header) {
                     (Some(n), _) => n,
-                    (None, Some(h)) if h.acceptable(self.cfg.modulation.code()) => {
+                    (None, Some(h))
+                        if h.acceptable(self.cfg.modulation.code())
+                            && h.length as usize <= self.longest_len(rx)
+                            && rx.only_code.is_none_or(|c| c.code() == h.payload_code) =>
+                    {
                         h.length as usize
                     }
                     _ => return Err(Reject::Header),
