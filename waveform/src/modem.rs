@@ -22,14 +22,18 @@
 //! and amplitude are estimated again over preamble, sync word and header, since the body starts
 //! that much later. The CRC-16 covers the header bytes.
 //!
+//! With the light code (`payload_code` 1, `docs/fec-light.md`) the body symbols become soft values
+//! (log-likelihood ratios, see [`fsk_llr`] and `decode_at`), are de-interleaved and Viterbi decoded.
+//!
 //! Handled: unknown start sample (integer), unknown carrier phase, a small carrier frequency offset
 //! (see `docs/waveform-w0.md` for the range), unknown gain. Not handled: fractional timing, sample clock
 //! offset, multipath, a stream in chunks (a call takes one buffer).
 
 use crate::frame::{
-    body_bits, body_bits_v1, body_len_bits, body_len_bits_v1, header_symbols, parse_body,
-    parse_body_v1, parse_header, parse_header_v1, preamble_bits, sync_bits, FrameFormat,
-    HeaderFields, DEFAULT_SYNC_WORD, HEADER_SYMBOLS, MAX_PAYLOAD, PREAMBLE_LEN,
+    body_bits, body_bits_light, body_bits_v1, body_len_bits, body_len_bits_coded, header_symbols,
+    parse_body, parse_body_light, parse_body_v1, parse_header, parse_header_v1, preamble_bits,
+    sync_bits, FrameFormat, HeaderFields, PayloadCode, DEFAULT_SYNC_WORD, HEADER_SYMBOLS,
+    MAX_PAYLOAD, PREAMBLE_LEN,
 };
 use crate::iq::Complex32;
 use crate::pulse::{rrc, rrc_shifted};
@@ -101,6 +105,10 @@ pub struct ModemConfig {
     pub sync_word: u16,
     /// Frame format sent and expected. W0 by default.
     pub frame: FrameFormat,
+    /// Error correction on the body (v1 only). The receiver takes the code from each frame's
+    /// header; this setting is what the modem sends, and what it assumes when the length is given
+    /// (`RxConfig::expected_len`).
+    pub code: PayloadCode,
 }
 
 impl Default for ModemConfig {
@@ -112,6 +120,7 @@ impl Default for ModemConfig {
             rrc_span: 16,
             sync_word: DEFAULT_SYNC_WORD,
             frame: FrameFormat::W0,
+            code: PayloadCode::None,
         }
     }
 }
@@ -336,6 +345,11 @@ impl Modem {
         if cfg.rrc_span % 2 != 0 || !(4..=32).contains(&cfg.rrc_span) {
             return Err(ConfigError("rrc_span must be even, 4 to 32".into()));
         }
+        if cfg.frame == FrameFormat::W0 && cfg.code != PayloadCode::None {
+            return Err(ConfigError(
+                "error correction needs frame format v1 (W0 has no payload_code)".into(),
+            ));
+        }
         let h = rrc(cfg.sps, cfg.rrc_span, cfg.rolloff as f64);
         let mut ref_bits = preamble_bits().to_vec();
         ref_bits.extend(sync_bits(cfg.sync_word));
@@ -370,9 +384,12 @@ impl Modem {
         1.0
     }
 
-    /// Energy of one information bit, `Es / bits_per_symbol`.
+    /// Energy of one information bit: `Es / (bits_per_symbol * code rate)`. With the light code
+    /// (rate 1/2) a bit costs two coded bits, so `Eb = 2 Es` for BPSK: Es/N0 per coded symbol is
+    /// Eb/N0 - 3 dB. The tail and the CRC are overhead and not counted, as in W0.
     pub fn energy_per_bit(&self) -> f64 {
-        self.energy_per_symbol() / self.cfg.modulation.bits_per_symbol() as f64
+        self.energy_per_symbol()
+            / (self.cfg.modulation.bits_per_symbol() as f64 * self.cfg.code.rate())
     }
 
     /// Length in samples of the known preamble and sync waveform the detector correlates with (the
@@ -383,8 +400,36 @@ impl Modem {
 
     /// Number of samples [`Modem::modulate`] makes for a payload of `n` bytes.
     pub fn frame_samples(&self, n: usize) -> usize {
-        let nsym = self.ref_bits.len() + self.header_syms() + self.body_len_bits(n) / self.bps();
+        self.frame_samples_coded(n, self.cfg.code)
+    }
+
+    /// Symbols [`Modem::modulate`] makes for a payload of `n` bytes: the airtime in symbol periods.
+    pub fn frame_symbols(&self, n: usize) -> usize {
+        self.ref_bits.len() + self.header_syms() + self.body_len_bits(n, self.cfg.code) / self.bps()
+    }
+
+    fn frame_samples_coded(&self, n: usize, code: PayloadCode) -> usize {
+        let nsym =
+            self.ref_bits.len() + self.header_syms() + self.body_len_bits(n, code) / self.bps();
         self.waveform_len(nsym)
+    }
+
+    /// The longest frame the receiver can be given with `rx`, in samples: the expected length if
+    /// set, otherwise 255 bytes, with the code that makes it longest that a v1 header can announce
+    /// (light). Used for how much of the buffer a candidate may need.
+    pub fn longest_frame_samples(&self, rx: &RxConfig) -> usize {
+        match rx.expected_len {
+            Some(n) => self.frame_samples(n.min(MAX_PAYLOAD)),
+            None => self.frame_samples_coded(MAX_PAYLOAD, self.longest_code()),
+        }
+    }
+
+    /// The code of the longest frame a header can announce: light for v1, none for W0.
+    fn longest_code(&self) -> PayloadCode {
+        match self.cfg.frame {
+            FrameFormat::W0 => PayloadCode::None,
+            FrameFormat::V1 => PayloadCode::Light,
+        }
     }
 
     fn bps(&self) -> usize {
@@ -400,10 +445,10 @@ impl Modem {
     }
 
     /// Bits of the body (everything after the header symbols) for a payload of `n` bytes.
-    fn body_len_bits(&self, n: usize) -> usize {
+    fn body_len_bits(&self, n: usize, code: PayloadCode) -> usize {
         match self.cfg.frame {
             FrameFormat::W0 => body_len_bits(n),
-            FrameFormat::V1 => body_len_bits_v1(n),
+            FrameFormat::V1 => body_len_bits_coded(n, code),
         }
     }
 
@@ -422,15 +467,18 @@ impl Modem {
         match self.cfg.frame {
             FrameFormat::W0 => Ok(self.waveform(&self.ref_bits, &body_bits(payload))),
             FrameFormat::V1 => {
-                let h = HeaderFields::new(self.cfg.modulation.code(), payload.len() as u8);
+                let h = HeaderFields {
+                    payload_code: self.cfg.code.code(),
+                    ..HeaderFields::new(self.cfg.modulation.code(), payload.len() as u8)
+                };
                 self.modulate_v1(payload, &h)
             }
         }
     }
 
     /// A v1 frame with the given header fields, written as they are (the length is not checked
-    /// against the payload). For tests: this is how reserved fields and bad headers are sent.
-    /// Fails for a W0 modem.
+    /// against the payload). The body is coded as `payload_code` says (1: light; any other value:
+    /// none). For tests: this is how reserved fields and bad headers are sent. Fails for a W0 modem.
     // Hidden from the docs: it is for tests and can send a length that does not match the payload.
     #[doc(hidden)]
     pub fn modulate_v1(
@@ -439,7 +487,11 @@ impl Modem {
         header: &HeaderFields,
     ) -> Result<Vec<Complex32>, ConfigError> {
         check_len(payload)?;
-        self.modulate_v1_parts(&header_symbols(header), &body_bits_v1(header, payload))
+        let body = match PayloadCode::from_code(header.payload_code) {
+            Some(PayloadCode::Light) => body_bits_light(header, payload),
+            _ => body_bits_v1(header, payload),
+        };
+        self.modulate_v1_parts(&header_symbols(header), &body)
     }
 
     /// A v1 frame from ready-made parts: the 152 header symbols (bits, see
@@ -588,8 +640,7 @@ impl Modem {
         let inside = tau < tally.span_until;
         let reserve = |tally: &mut Tally| {
             // no length known: reserve the longest frame (or the expected one)
-            let n = rx.expected_len.unwrap_or(MAX_PAYLOAD).min(MAX_PAYLOAD);
-            tally.span_until = tally.span_until.max(tau + self.frame_samples(n));
+            tally.span_until = tally.span_until.max(tau + self.longest_frame_samples(rx));
         };
         let count = |tally: &mut Tally, field: fn(&mut RxReport) -> &mut usize| {
             if inside {
@@ -818,7 +869,7 @@ impl Modem {
         // matches well), and a one-symbol window lets them through as false starts. Real frames
         // are always further apart than this; overlapping frames are not separated anyway.
         let reach = m.div_ceil(cs.step);
-        let frame_len = self.frame_samples(rx.expected_len.unwrap_or(MAX_PAYLOAD).min(MAX_PAYLOAD));
+        let frame_len = self.longest_frame_samples(rx);
         let fine = RxConfig {
             cfo_bins: 0,
             cfo_search: 0.0,
@@ -983,8 +1034,8 @@ impl Modem {
         // the body starts after the preamble, the sync word and (v1) the header symbols
         let body_start = n_ref + self.header_syms();
         let max_bits = match rx.expected_len {
-            Some(n) => self.body_len_bits(n),
-            None => self.body_len_bits(MAX_PAYLOAD),
+            Some(n) => self.body_len_bits(n, self.cfg.code),
+            None => self.body_len_bits(MAX_PAYLOAD, self.longest_code()),
         };
         let want_syms = body_start + max_bits / bps;
         let avail = r.len() - tau;
@@ -996,9 +1047,13 @@ impl Modem {
         if usable_syms < body_start + 16 / bps {
             return Err(Reject::TooShort);
         }
-        let take = end_needed(usable_syms);
-        // derotate and normalize the part we use
-        let derotate = |omega: f64, psi: f64, amp: f64| -> Vec<Complex32> {
+        // derotate and normalize the part we use: W0 all of it now; v1 up to the end of the header
+        // now, and the body once the header has given its length and code
+        let take = end_needed(match self.cfg.frame {
+            FrameFormat::W0 => usable_syms,
+            FrameFormat::V1 => body_start,
+        });
+        let derotate = |omega: f64, psi: f64, amp: f64, take: usize| -> Vec<Complex32> {
             (0..take)
                 .map(|n| {
                     let (s, co) = (-(psi + omega * n as f64)).sin_cos();
@@ -1006,7 +1061,7 @@ impl Modem {
                 })
                 .collect()
         };
-        let mut rr = derotate(omega, psi, amp);
+        let mut rr = derotate(omega, psi, amp, take);
         let taps = if self.cfg.modulation == Modulation::Fsk2 {
             Vec::new()
         } else {
@@ -1057,24 +1112,48 @@ impl Modem {
         if let Some(h) = &header {
             let e = self.estimate(r, tau, &self.header_reference(h));
             (omega, psi, amp, noise_per_sample) = (e.omega, e.psi, e.amp, e.noise_per_sample);
-            rr = derotate(omega, psi, amp);
         }
-        let dem = SymbolDemod::new(self, &taps, &rr);
-        let total_syms = body_start + self.body_len_bits(n) / bps;
+        // The body's code: from the header, or the modem's own setting when the length is given.
+        let code = match (self.cfg.frame, rx.expected_len, &header) {
+            (FrameFormat::W0, _, _) => PayloadCode::None,
+            (FrameFormat::V1, None, Some(h)) => {
+                PayloadCode::from_code(h.payload_code).unwrap_or(PayloadCode::None)
+            }
+            (FrameFormat::V1, _, _) => self.cfg.code,
+        };
+        let total_syms = body_start + self.body_len_bits(n, code) / bps;
         if end_needed(total_syms) > avail || (rx.expected_len.is_none() && total_syms > usable_syms)
         {
             return Err(Reject::TooShort);
         }
+        if self.cfg.frame == FrameFormat::V1 {
+            rr = derotate(omega, psi, amp, end_needed(total_syms));
+        }
+        let dem = SymbolDemod::new(self, &taps, &rr);
         z.clear();
         bits.clear();
         dem.body_symbols(body_start, total_syms - body_start, &mut z, &mut bits);
         let mut mu_final = mu;
+        // Es/N0 of this frame: the matched filter outputs have amplitude 1 and noise variance 1 / rho
+        let rho = amp * amp / noise_per_sample;
+        // the phase line the PSK body is turned back by (none without the refinement)
+        let (mut line_a, mut line_b) = (0.0f64, 0.0f64);
         if self.cfg.modulation != Modulation::Fsk2 && rx.refine_phase {
-            let rho = amp * amp / noise_per_sample;
             // The preamble and sync word are known: their matched filter outputs with the data
             // taken off, at their symbol index counted from the body's first symbol (negative).
+            // A light-coded body runs at half the Es/N0 and twice the length: there the decoded
+            // header counts as known too, which narrows the slope search (the bound shrinks about
+            // five times) and anchors the phase better. Uncoded frames keep the preamble only.
+            let known_bits = match (code, &header) {
+                (PayloadCode::Light, Some(h)) => {
+                    let mut k = self.ref_bits.clone();
+                    k.extend(header_symbols(h));
+                    k
+                }
+                _ => self.ref_bits.clone(),
+            };
             let known_at = |dm: &SymbolDemod| -> Vec<(f64, Complex32)> {
-                self.ref_bits
+                known_bits
                     .iter()
                     .enumerate()
                     .map(|(j, &bit)| {
@@ -1129,15 +1208,27 @@ impl Modem {
                 (a, b) = self.track(&z, rho, &known_at(&dm));
                 bits = decide_psk(self.cfg.modulation, &z, a, b);
             }
+            (line_a, line_b) = (a, b);
         }
-        let (payload, crc_ok) = match (self.cfg.frame, &header) {
-            (FrameFormat::W0, _) => parse_body(&bits, n),
+        let (payload, crc_ok) = match self.cfg.frame {
+            FrameFormat::W0 => parse_body(&bits, n),
             // v1: the CRC-16 covers the header bytes. If the header was not decoded (only with
             // `expected_len`), the frame cannot be trusted.
-            (FrameFormat::V1, Some(h)) => parse_body_v1(&bits, h, n),
-            (FrameFormat::V1, None) => {
-                let blank = HeaderFields::default();
-                (parse_body_v1(&bits, &blank, n).0, false)
+            FrameFormat::V1 => {
+                let h = header.unwrap_or_default();
+                let (payload, ok) = match code {
+                    PayloadCode::None => parse_body_v1(&bits, &h, n),
+                    PayloadCode::Light => {
+                        let soft = match self.cfg.modulation {
+                            Modulation::Fsk2 => (body_start..total_syms)
+                                .map(|k| dem.fsk_llr(k, rho))
+                                .collect(),
+                            m => psk_llr(m, &z, line_a, line_b, rho),
+                        };
+                        parse_body_light(&soft, &h, n)
+                    }
+                };
+                (payload, ok && header.is_some())
             }
         };
         Ok(RxFrame {
@@ -1265,6 +1356,15 @@ impl<'a> SymbolDemod<'a> {
         }
     }
 
+    /// Log-likelihood ratio of 2-FSK symbol `k` as one coded bit (positive: bit 0), at Es/N0 `rho`.
+    /// Noncoherent: `ln I0(2 rho |c-|) - ln I0(2 rho |c+|)`, with `c-` and `c+` the tone
+    /// correlations scaled so that the sent tone has magnitude 1 (their energies are what
+    /// [`SymbolDemod::tones`] returns). See [`fsk_llr`].
+    fn fsk_llr(&self, k: usize, rho: f64) -> f32 {
+        let (p, m) = self.tones(k);
+        fsk_llr(m as f64, p as f64, rho)
+    }
+
     /// Demodulate `count` body symbols starting at symbol `first`. PSK: appends the matched filter
     /// outputs to `z` and the hard decisions (no phase correction beyond the preamble's) to `bits`.
     fn body_symbols(&self, first: usize, count: usize, z: &mut Vec<Complex32>, bits: &mut Vec<u8>) {
@@ -1296,6 +1396,60 @@ fn decide_psk(m: Modulation, z: &[Complex32], a: f64, b: f64) -> Vec<u8> {
         bits.extend(slice_symbol(m, y));
     }
     bits
+}
+
+/// Log-likelihood ratios (positive: bit 0) of PSK matched filter outputs `z`, each turned back by
+/// `a + b * k` radians, at Es/N0 `rho`. The outputs have amplitude 1 and complex noise variance
+/// `1 / rho` (`1 / (2 rho)` per dimension). BPSK: `4 rho Re(y)`. QPSK (each axis carries `1/sqrt 2`):
+/// `2 sqrt(2) rho Re(y)` for the first bit and the same of `Im(y)` for the second.
+fn psk_llr(m: Modulation, z: &[Complex32], a: f64, b: f64, rho: f64) -> Vec<f32> {
+    let mut out = Vec::with_capacity(z.len() * 2);
+    let g = if m == Modulation::Bpsk {
+        4.0 * rho
+    } else {
+        2.0 * std::f64::consts::SQRT_2 * rho
+    };
+    for (k, &v) in z.iter().enumerate() {
+        let (s, c) = (-(a + b * k as f64)).sin_cos();
+        let (x, y) = (v.re as f64, v.im as f64);
+        out.push((g * (x * c - y * s)) as f32);
+        if m == Modulation::Qpsk {
+            out.push((g * (x * s + y * c)) as f32);
+        }
+    }
+    out
+}
+
+/// Noncoherent 2-FSK log-likelihood ratio for bit 0 from the energies of the bit-0 tone `e0` and the
+/// bit-1 tone `e1` (scaled so that the sent tone has energy 1 without noise), at Es/N0 `rho`. With
+/// unknown phase the sent tone's correlation `c` has likelihood `exp(-rho (|c|^2 + 1)) I0(2 rho |c|)`
+/// and the other `exp(-rho |c|^2)`; the ratio is `ln I0(2 rho sqrt e0) - ln I0(2 rho sqrt e1)`.
+pub fn fsk_llr(e0: f64, e1: f64, rho: f64) -> f32 {
+    (ln_i0(2.0 * rho * e0.max(0.0).sqrt()) - ln_i0(2.0 * rho * e1.max(0.0).sqrt())) as f32
+}
+
+/// `ln I0(x)` for `x >= 0`, the modified Bessel function of order 0: the polynomial approximations
+/// of Abramowitz and Stegun 9.8.1 (`x <= 3.75`) and 9.8.2 (above), relative error under 2e-7.
+pub fn ln_i0(x: f64) -> f64 {
+    let x = x.abs();
+    if x <= 3.75 {
+        let t = (x / 3.75).powi(2);
+        (1.0 + t
+            * (3.515_622_9
+                + t * (3.089_942_4
+                    + t * (1.206_749_2 + t * (0.265_973_2 + t * (0.036_076_8 + t * 0.004_581_3))))))
+            .ln()
+    } else {
+        let t = 3.75 / x;
+        let p = 0.398_942_28
+            + t * (0.013_285_92
+                + t * (0.002_253_19
+                    + t * (-0.001_575_65
+                        + t * (0.009_162_81
+                            + t * (-0.020_577_06
+                                + t * (0.026_355_37 + t * (-0.016_476_33 + t * 0.003_923_77)))))));
+        x - 0.5 * x.ln() + p.ln()
+    }
 }
 
 /// Hard decisions as unit-energy symbols (`+-1`, or `(+-1 +-j)/sqrt 2`), to compare matched filter outputs with.
@@ -1670,6 +1824,52 @@ fn parabola_peak(y: &[f32], i: usize) -> f64 {
         return 0.0;
     }
     (0.5 * (a - c) / den).clamp(-0.5, 0.5)
+}
+
+#[cfg(test)]
+mod llr_tests {
+    use super::*;
+
+    #[test]
+    fn ln_i0_matches_its_series() {
+        // I0(x) = sum (x^2/4)^k / (k!)^2
+        for x in [0.0f64, 0.1, 1.0, 3.0, 3.75, 3.76, 5.0, 10.0, 30.0, 100.0] {
+            let (mut term, mut sum) = (1.0f64, 1.0f64);
+            for k in 1..400 {
+                term *= x * x / 4.0 / (k as f64 * k as f64);
+                sum += term;
+            }
+            let want = sum.ln();
+            assert!(
+                (ln_i0(x) - want).abs() <= 2e-7 * want.abs().max(1.0),
+                "x {x}: {} vs {want}",
+                ln_i0(x)
+            );
+        }
+    }
+
+    #[test]
+    fn llr_signs_and_scale() {
+        // PSK: positive for bit 0, and QPSK gives two values per symbol
+        let z = [Complex32::new(0.5, -0.25)];
+        let b = psk_llr(Modulation::Bpsk, &z, 0.0, 0.0, 2.0);
+        assert_eq!(b, vec![4.0]);
+        let q = psk_llr(Modulation::Qpsk, &z, 0.0, 0.0, 2.0);
+        let r2 = std::f32::consts::SQRT_2;
+        assert!((q[0] - 2.0 * r2).abs() < 1e-5 && (q[1] + r2).abs() < 1e-5);
+        // a quarter turn back moves Im onto Re
+        let t = psk_llr(
+            Modulation::Bpsk,
+            &[Complex32::new(0.0, 1.0)],
+            PI / 2.0,
+            0.0,
+            1.0,
+        );
+        assert!((t[0] - 4.0).abs() < 1e-5);
+        // FSK: more energy in the bit-0 tone means bit 0
+        assert!(fsk_llr(1.0, 0.1, 3.0) > 0.0 && fsk_llr(0.1, 1.0, 3.0) < 0.0);
+        assert_eq!(fsk_llr(0.5, 0.5, 3.0), 0.0);
+    }
 }
 
 #[cfg(test)]

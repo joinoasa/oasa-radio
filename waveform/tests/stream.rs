@@ -2,6 +2,7 @@
 //! it must return the same frames (start, payload, CRC), each once, while holding a bounded window.
 
 use oasa_waveform::channel::{n0_for_ebn0, Channel, Impairments};
+use oasa_waveform::frame::PayloadCode;
 use oasa_waveform::stream::StreamReceiver;
 use oasa_waveform::{Complex32, FrameFormat, Modem, ModemConfig, Modulation, RxConfig, RxFrame};
 
@@ -71,7 +72,22 @@ fn check(
     cfo: f64,
     seed: u64,
 ) {
-    let md = modem(m, frame);
+    check_cfg(
+        ModemConfig {
+            frame,
+            ..ModemConfig::new(m)
+        },
+        rx,
+        len,
+        ebn0,
+        cfo,
+        seed,
+    );
+}
+
+fn check_cfg(cfg: ModemConfig, rx: RxConfig, len: Option<usize>, ebn0: f64, cfo: f64, seed: u64) {
+    let (m, frame) = (cfg.modulation, cfg.frame);
+    let md = Modem::new(cfg.clone()).unwrap();
     let x = recording(&md, 30, len, ebn0, cfo, seed);
     let whole: Vec<_> = md.demodulate_with(&x, &rx).iter().map(key).collect();
     assert!(
@@ -79,7 +95,7 @@ fn check(
         "{m:?} {frame:?}: only {} frames in the whole buffer",
         whole.len()
     );
-    let longest = md.frame_samples(rx.expected_len.unwrap_or(255).min(255));
+    let longest = md.longest_frame_samples(&rx);
     for sizes in [
         vec![x.len()],
         vec![65_536],
@@ -87,7 +103,7 @@ fn check(
         vec![1000, 7, 333, 20_000, 1],
         vec![511],
     ] {
-        let (got, most) = stream(modem(m, frame), &rx, &x, &sizes);
+        let (got, most) = stream(Modem::new(cfg.clone()).unwrap(), &rx, &x, &sizes);
         let got: Vec<_> = got.iter().map(key).collect();
         assert_eq!(
             got.len(),
@@ -148,6 +164,28 @@ fn stream_matches_the_whole_buffer_v1_and_known_length() {
         0.01,
         4,
     );
+}
+
+#[test]
+fn stream_matches_the_whole_buffer_light_code() {
+    let light = |m| ModemConfig {
+        frame: FrameFormat::V1,
+        code: PayloadCode::Light,
+        ..ModemConfig::new(m)
+    };
+    check_cfg(
+        light(Modulation::Bpsk),
+        RxConfig::default(),
+        None,
+        4.0,
+        0.0,
+        6,
+    );
+    let rx = RxConfig {
+        cfo_search: 0.1,
+        ..RxConfig::default()
+    };
+    check_cfg(light(Modulation::Qpsk), rx, None, 4.0, 0.01, 7);
 }
 
 #[test]
