@@ -246,8 +246,11 @@ impl Mismatch {
 
 /// Lines of a reply: split on LF, CR dropped. Bytes that are not printable
 /// ASCII make a line unreadable (it is skipped, never shown).
+/// Only lines ended by LF count: a fragment still arriving (for example an
+/// echo before its CR) is not a line yet.
 fn lines(reply: &[u8]) -> Vec<Option<String>> {
-    reply
+    let end = reply.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    reply[..end]
         .split(|b| *b == b'\n')
         .map(|l| {
             let l: Vec<u8> = l.iter().copied().filter(|b| *b != b'\r').collect();
@@ -339,12 +342,9 @@ pub fn parse_ati(reply: &[u8]) -> Result<String, String> {
         .ok_or_else(|| "ATI gave no SiK version line (not a SiK radio?)".to_string())
 }
 
-/// Did the radio say `OK` after `+++`? Packets from the air may come just
-/// before it with no line break, so look for the bytes `OK` CR LF (or `OK` LF)
-/// anywhere, not for a whole line.
-fn ok_after_escape(reply: &[u8]) -> bool {
-    reply.windows(3).any(|w| w == b"OK\n") || reply.windows(4).any(|w| w == b"OK\r\n")
-}
+/// Pause after a confirmed `ATO`: SiK echoes a line before it runs it and
+/// drops serial input meanwhile, so the first bridge bytes must wait a moment.
+const AFTER_ATO: Duration = Duration::from_millis(100);
 
 /// Does the reply hold a line that is exactly `word`?
 fn has_line(reply: &[u8], word: &str) -> bool {
@@ -429,37 +429,54 @@ impl AtPort {
     }
 
     /// Enter command mode. Waits out the guard time on both sides of `+++`.
-    /// Anything the radio sends meanwhile (packets from the air) is thrown away.
-    /// With `recover`, a radio left in command mode is recovered with `\r` and
-    /// `AT\r`; in data mode those three bytes go out on the air (the other
-    /// bridge drops them as a bad frame). The bridge's check does not recover:
-    /// it fails, and `oasa-radio sik show` recovers.
+    ///
+    /// Everything that arrives during the second guard is thrown away, the
+    /// radio's own `OK` included: until it switches, one second after the last
+    /// `+`, the radio is in data mode, and our `+++` went out on the air, so a
+    /// linked radio could answer anything, a fake `OK` too. Once the guard has
+    /// passed, a SiK radio that got `+++` is in command mode and passes no data
+    /// from the air; `AT` CR must then come back as its echo and `OK`. (If the
+    /// device is not a SiK radio, or the escape failed, those 3 bytes go out as
+    /// data; the other bridge drops them as noise.)
+    ///
+    /// With `recover`, a radio left in command mode is recovered with CR and a
+    /// second `AT`. The bridge's check does not recover: it fails, and
+    /// `oasa-radio sik show` recovers.
     pub fn enter(&mut self, recover: bool) -> Result<(), String> {
         let _ = termios::tcflush(&self.file, FlushArg::TCIFLUSH);
         self.read_until(GUARD, None, &|_| false)?;
         self.write(b"+++")?;
-        let r = self.read_until(GUARD + ENTER_WAIT, None, &ok_after_escape)?;
-        if ok_after_escape(&r) {
+        self.read_until(GUARD, None, &|_| false)?;
+        if self.confirm_at()? {
             return Ok(());
         }
-        if !recover {
-            return Err(format!(
-                "{}: no reply to +++ (not a SiK radio, wrong --baud, the port in use, or the radio left in command mode: oasa-radio sik show recovers that)",
-                self.device
-            ));
-        }
-        // Maybe it was in command mode already: then "+++" sits in its line buffer.
-        self.write(b"\r")?;
-        self.read_until(Duration::from_millis(300), None, &|_| false)?;
-        self.write(b"AT\r")?;
-        let r = self.read_until(Duration::from_secs(1), None, &|b| has_line(b, "OK"))?;
-        if has_line(&r, "OK") {
-            return Ok(());
+        if recover {
+            // It was in command mode already: "+++AT" was one ignored line.
+            self.write(b"\r")?;
+            self.read_until(Duration::from_millis(300), None, &|_| false)?;
+            if self.confirm_at()? {
+                return Ok(());
+            }
         }
         Err(format!(
-            "{}: no reply to +++ (is it a SiK radio? check --baud against its SERIAL_SPEED, and that nothing else has the port open)",
-            self.device
+            "{}: not in command mode after +++ (not a SiK radio, wrong --baud, the port in use{})",
+            self.device,
+            if recover {
+                ""
+            } else {
+                ", or the radio left in command mode: oasa-radio sik show recovers that"
+            }
         ))
+    }
+
+    /// `AT` CR answered by its own echo and then `OK`.
+    fn confirm_at(&mut self) -> Result<bool, String> {
+        let _ = termios::tcflush(&self.file, FlushArg::TCIFLUSH);
+        self.write(b"AT\r")?;
+        let r = self.read_until(ENTER_WAIT, None, &|b| has_line(b, "OK"))?;
+        let ls = lines(&r);
+        Ok(matches!(ls.iter().position(|l| l.as_deref() == Some("AT")),
+            Some(i) if ls[i + 1..].iter().any(|l| l.as_deref() == Some("OK"))))
     }
 
     /// Send one command; return the reply (the echo included).
@@ -510,6 +527,7 @@ impl AtPort {
             self.write(b"ATO\r")?;
             let r = self.read_until(Duration::from_millis(500), None, &|b| has_line(b, "ATO"))?;
             if has_line(&r, "ATO") {
+                std::thread::sleep(AFTER_ATO);
                 return Ok(());
             }
         }
@@ -679,11 +697,11 @@ S13:MANCHESTER=0\r\nS14:RTSCTS=0\r\nS15:MAX_WINDOW=131\r\n";
     }
 
     #[test]
-    fn ok_after_air_bytes_counts() {
-        assert!(ok_after_escape(b"\x01\x9fjunk-from-the-airOK\r\n"));
-        assert!(ok_after_escape(b"OK\n"));
-        assert!(!ok_after_escape(b"OK"));
-        assert!(!ok_after_escape(b"+++"));
+    fn only_finished_lines_count() {
+        assert!(has_line(b"ATO\r\n", "ATO"));
+        assert!(!has_line(b"ATO", "ATO"));
+        assert!(!has_line(b"OK\r", "OK"));
+        assert!(has_line(b"junk\r\nOK\r\nATI", "OK"));
     }
 
     #[test]

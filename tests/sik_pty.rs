@@ -197,7 +197,7 @@ fn show_on_something_that_is_not_a_sik_radio_fails_clearly() {
     ]);
     assert!(!o.status.success());
     assert!(
-        text(&o.stderr).contains("no reply to +++"),
+        text(&o.stderr).contains("not in command mode after +++"),
         "{}",
         text(&o.stderr)
     );
@@ -430,4 +430,93 @@ fn a_failed_save_reboots_without_the_changes() {
         );
         assert!(!r[0].at_mode);
     });
+}
+
+/// A hostile host behind the other radio: whatever it sees from the air that
+/// looks like our AT traffic, it answers at once with forged replies (they go
+/// back over the air as data). Returns a stop flag and what it saw.
+fn forger(
+    path: &std::path::Path,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<Vec<u8>>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let st = stop.clone();
+    let mut port = AtPortReader::open(path);
+    let h = std::thread::spawn(move || {
+        let mut seen = Vec::new();
+        while !st.load(Ordering::SeqCst) {
+            let got = port.read_for(Duration::from_millis(20));
+            if got.is_empty() {
+                continue;
+            }
+            seen.extend_from_slice(&got);
+            let mut reply = Vec::new();
+            if got.windows(3).any(|w| w == b"+++") {
+                reply.extend_from_slice(b"OK\r\n");
+            }
+            if got.windows(3).any(|w| w == b"AT\r") {
+                reply.extend_from_slice(b"AT\r\nOK\r\n");
+            }
+            if got.windows(4).any(|w| w == b"ATI\r") {
+                reply.extend_from_slice(b"ATI\r\nSiK 2.2 on FORGED\r\n");
+            }
+            if got.windows(5).any(|w| w == b"ATI5\r") {
+                reply.extend_from_slice(b"ATI5\r\nS3:NETID=4242\r\nS6:MAVLINK=0\r\n");
+            }
+            if got.windows(4).any(|w| w == b"ATO\r") {
+                reply.extend_from_slice(b"ATO\r\n");
+            }
+            if !reply.is_empty() {
+                let _ = port.0.write_all(&reply);
+            }
+        }
+        seen
+    });
+    (stop, h)
+}
+
+#[test]
+fn a_peer_answering_ok_to_our_escape_is_not_command_mode() {
+    // Both radios on NETID 25; a hostile host behind B forges every reply.
+    let mut p = DEFAULTS;
+    p[reg("MAVLINK")] = 0;
+    let sik = SimSikPair::start(p, p);
+    let (stop, h) = forger(&sik.path_b);
+    let o = run(&["sik", "show", "--device", &sik.path_a.display().to_string()]);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let seen = h.join().unwrap();
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    let out = text(&o.stdout);
+    // the real radio's answers, not the forgery
+    assert!(
+        out.contains("\"NETID\":25") && out.contains("SIM-HM-TRP"),
+        "{out}"
+    );
+    assert!(!out.contains("FORGED"), "{out}");
+    // the forger heard our +++ (it goes on the air) and nothing after it
+    assert!(seen.windows(3).any(|w| w == b"+++"));
+    assert!(!seen.windows(2).any(|w| w == b"AT"), "{:?}", text(&seen));
+}
+
+#[test]
+fn forged_replies_cannot_make_the_bridge_check_pass() {
+    let mut p = DEFAULTS;
+    p[reg("MAVLINK")] = 0;
+    let sik = SimSikPair::start(p, p);
+    let (stop, h) = forger(&sik.path_b);
+    let b = Bridge::start(&sik.path_a, "netid=4242,mavlink=0");
+    let lines = b.wait_for("sik_check", Duration::from_secs(15));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    h.join().unwrap();
+    let l = lines.last().unwrap();
+    assert!(l.contains("\"ok\":false"), "{l}");
+    assert!(
+        l.contains("{\"name\":\"NETID\",\"want\":4242,\"got\":25}"),
+        "{l}"
+    );
+    let (out, _) = b.stop();
+    assert!(!out.contains("\"event\":\"start\""), "{out}");
 }

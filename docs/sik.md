@@ -68,9 +68,10 @@ The check costs about 3 seconds: SiK wants a second of silence before and after 
 
 How the check talks to the radio:
 
-- After `+++` it looks for the bytes `OK` CR LF, not a whole line: packets from the air may arrive just before with no line break.
+- Our `+++` also goes out on the air, so for the second guard the other side could send anything, a fake `OK` too. Everything that arrives in that second is thrown away, the radio's own `OK` included. After it, a SiK radio that got `+++` is in command mode and passes nothing from the air; the check then sends `AT` and needs its echo and `OK`. If the device is not a SiK radio (or at the wrong baud) those three bytes go out as data. A test has a hostile host behind the other radio forge `OK`, `ATI`, `ATI5` and `ATO` replies: the check still reads the real settings.
+- A line counts only once it ends (LF): `ATO` is confirmed by its full echo, then the check waits 100 ms before the bridge opens the port, because SiK drops serial input while it runs a line.
 - It does **not** try to recover a radio left in command mode (`sik show` and `sik set` do, with `\r` and `AT\r`; in data mode those bytes would go on the air). The bridge then refuses and says to run `oasa-radio sik show`.
-- `ATO` prints only its echo, and the radio echoes a line before it runs it, so the echo is the proof it was received. Without it the check sends `ATO` once more, and if there is still no echo it refuses to bridge: the radio may still be in command mode, where the bridge's packets would reach its AT parser.
+- `ATO` prints only its echo, and the radio echoes a line before it runs it, so the full echo is the proof it was received. Without it the check sends `ATO` once more, and if there is still no echo it refuses to bridge: the radio may still be in command mode, where the bridge's packets would reach its AT parser.
 - The version is the `ATI` line that starts with `SiK ` (or `RFD SiK `), as the firmware's banner does (`main.c` `g_banner_string`); other lines are ignored.
 
 ## Packet bytes and the AT code
