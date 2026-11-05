@@ -6,6 +6,7 @@ Tech tree nodes **R-COM1** (basic radio link) and the radio side of **R-COM2**. 
 
 - Plan: [oasa-lab/docs/r-com2-plan.md](https://github.com/joinoasa/oasa-lab/blob/main/docs/r-com2-plan.md)
 - Encryption lives in [oasa-sec](https://github.com/joinoasa/oasa-sec); tests in [oasa-lab](https://github.com/joinoasa/oasa-lab).
+- Security review (R-COM1, internal): [docs/security-review-r-com1.md](docs/security-review-r-com1.md)
 
 Status: v0 adapters (`udp`, `serial`), tested on Linux with pseudo-terminals. Not yet tried on real radios. Licensed under [Apache-2.0](LICENSE).
 
