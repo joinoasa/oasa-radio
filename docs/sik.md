@@ -39,10 +39,12 @@ oasa-radio sik set  --device /dev/ttyUSB1 --netid $NETID --mavlink 0 --air-speed
 | `AIR_SPEED` | 64 (the default) | The lab's `sik-64k` profile |
 | `ECC` | 0 (the default) | ArduPilot no longer recommends it; it halves the data rate. `sik-64k-ecc` models it |
 | `SERIAL_SPEED` | 57 (57600 baud, the default) | Give the bridge the same `--baud` |
-| `TXPOWER` | 20 dBm default; lower it on the bench | Over cable, keep 60 dB or more between the radios |
+| `TXPOWER` | 20 dBm default; lower it on the bench | Over cable, keep 60 dB or more between the radios. 100 mW radios (Holybro V3) have steps of 1, 2, 5, 8, 11, 14, 17 and 20 dBm; another value is rounded up to the next step (ArduPilot page), so `sik set --txpower 19` reads back 20 and `sik set` says why |
 | others | the defaults, the same on both radios | `MIN_FREQ`, `MAX_FREQ`, `NUM_CHANNELS`, `LBT_RSSI`, `MAX_WINDOW` must match for the radios to link |
 
-Set the band and power for your country (`MIN_FREQ`, `MAX_FREQ`, `NUM_CHANNELS`, `TXPOWER`). That is your responsibility; the code does not know the rules where you are.
+Set the band and power for your country (`MIN_FREQ`, `MAX_FREQ`, `NUM_CHANNELS`, `TXPOWER`). That is your responsibility; the code does not know the rules where you are. As a sanity check, `sik set` and `--sik-expect` take `MIN_FREQ`/`MAX_FREQ` (kHz) only inside 414 to 454 MHz (SiK's 433 MHz model), 863 to 870 MHz (EU 868) or 902 to 928 MHz (US 915), with `MIN_FREQ` below `MAX_FREQ`; `sik set --any-band` lifts the band check.
+
+If saving fails (`AT&W` answers `ERROR`), `sik set` reboots the radio anyway (`ATZ`): the unsaved changes, some of which apply at once (TXPOWER, MAVLINK), are dropped and the radio leaves command mode.
 
 ## Run the bridge with the check
 
@@ -63,6 +65,13 @@ On a mismatch it prints `"ok":false` with each difference (`{"name":"NETID","wan
 **MTU 242:** a SiK packet carries at most 250 bytes with ECC off ([`tdm.c`](https://github.com/ArduPilot/SiK/blob/master/Firmware/radio/tdm.c)); our framing makes a packet of 242 bytes at most 249 on the wire ([serial-framing.md](serial-framing.md), "Size on the wire"), so one framed packet fits one SiK packet. Larger packets work too (the stream is transparent) but are split over two. Give oasa-link the same `--mtu`.
 
 The check costs about 3 seconds: SiK wants a second of silence before and after `+++`.
+
+How the check talks to the radio:
+
+- After `+++` it looks for the bytes `OK` CR LF, not a whole line: packets from the air may arrive just before with no line break.
+- It does **not** try to recover a radio left in command mode (`sik show` and `sik set` do, with `\r` and `AT\r`; in data mode those bytes would go on the air). The bridge then refuses and says to run `oasa-radio sik show`.
+- `ATO` prints only its echo, and the radio echoes a line before it runs it, so the echo is the proof it was received. Without it the check sends `ATO` once more, and if there is still no echo it refuses to bridge: the radio may still be in command mode, where the bridge's packets would reach its AT parser.
+- The version is the `ATI` line that starts with `SiK ` (or `RFD SiK `), as the firmware's banner does (`main.c` `g_banner_string`); other lines are ignored.
 
 ## Packet bytes and the AT code
 
