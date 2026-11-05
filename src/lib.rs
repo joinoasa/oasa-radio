@@ -6,6 +6,7 @@
 //! - [`radio::Radio`]: the trait every adapter implements.
 //! - [`adapters`]: `udp` and `serial`.
 //! - [`framing`]: how packets are framed on a byte stream.
+//! - [`sik`]: SiK radio settings over AT commands, checked before bridging.
 //! - [`lora`]: control of the OASA LoRa modem firmware (`oasa-radio lora`).
 //! - [`waveform_cmd`]: `oasa-radio waveform` (OASA's own modem, milestone W0; the DSP is in the `oasa-waveform` crate).
 //! - [`bridge`]: UDP on one side, a radio on the other.
@@ -22,4 +23,5 @@ pub mod lora;
 pub mod radio;
 pub mod relay;
 pub mod rng;
+pub mod sik;
 pub mod waveform_cmd;

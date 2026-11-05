@@ -17,6 +17,7 @@ USAGE:
                     --udp-listen HOST:PORT --udp-send HOST:PORT
                     [--allow-remote-udp] [--duration SECS]
   oasa-radio info [--radio KIND [radio options]]
+  oasa-radio sik show|set --device PATH [...]    (SiK radio settings; see SIK RADIOS below)
   oasa-radio lora ACTION --device PATH [...]     (the OASA LoRa modem; see LORA MODEM below)
   oasa-radio waveform ber|iq|decode|df [...]     (OASA's own modem, and two-channel DF; see WAVEFORM below)
 
@@ -35,6 +36,9 @@ RADIOS:
             --device PATH        for example /dev/ttyUSB0
             --baud N             default 57600
             --mtu BYTES          default 252, at most 65535. Give oasa-link the same --mtu.
+            --sik-expect LIST    SiK radios: before bridging, read the radio's settings (AT
+                                 commands) and refuse to start unless they match, for example
+                                 netid=4242,air_speed=64,ecc=0,mavlink=0. Never while bridging.
   lora    LoRa through the OASA modem firmware (firmware/heltec-v3): use `--radio serial
           --baud 115200 --mtu 255` for packets and `oasa-radio lora` for settings.
           Other LoRa boards (RNode): planned.
@@ -62,6 +66,8 @@ pub struct SerialSpec {
     pub device: String,
     pub baud: u32,
     pub mtu: usize,
+    /// Check the SiK radio's settings before bridging.
+    pub sik_expect: Option<crate::sik::Expect>,
 }
 
 impl RadioSpec {
@@ -79,12 +85,47 @@ impl RadioSpec {
     }
 }
 
+/// `oasa-radio sik show|set`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SikCommand {
+    Show {
+        device: String,
+        baud: u32,
+    },
+    Set {
+        device: String,
+        baud: u32,
+        /// SiK name to value.
+        changes: BTreeMap<String, u32>,
+    },
+}
+
+pub const SIK_USAGE: &str = "\
+SIK RADIOS (settings over AT commands; never while a bridge has the port):
+  oasa-radio sik show --device PATH [--baud N]
+      Enter command mode (+++ with 1 s of silence each side), read ATI and ATI5, leave (ATO).
+      Prints one JSON line: {\"event\":\"sik\",\"version\":...,\"settings\":{\"NETID\":...}}.
+  oasa-radio sik set --device PATH [--baud N] [--netid N] [--air-speed KBPS] [--ecc 0|1]
+                     [--mavlink 0|1|2] [--serial-speed 57|115|...] [--txpower DBM]
+                     [--min-freq KHZ] [--max-freq KHZ] [--num-channels N] [--duty-cycle PCT]
+                     [--lbt-rssi N] [--max-window MS] [--oppresend 0|1] [--manchester 0|1]
+                     [--rtscts 0|1] [--any-band]
+      Set (ATSn=v), save (AT&W), reboot (ATZ), read back and print before and after.
+      TXPOWER steps on 100 mW radios: 1, 2, 5, 8, 11, 14, 17, 20 dBm (others round up).
+      MIN_FREQ/MAX_FREQ (kHz) must be inside 414-454, 863-870 or 902-928 MHz unless
+      --any-band; the rules where you are are yours to follow.
+      Set both radios of a pair the same. For the bridge: --mavlink 0 (transparent bytes) and
+      a NETID of your own (see docs/sik.md). NETID is not security; oasa-link is.
+  --baud is the computer's side, the radio's SERIAL_SPEED (default 57600).
+";
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Help,
     Bridge(RadioSpec, BridgeConfig),
     Info(Option<RadioSpec>),
     Lora(crate::lora::LoraCommand),
+    Sik(SikCommand),
     Waveform(crate::waveform_cmd::WaveformCommand),
 }
 
@@ -103,6 +144,9 @@ pub fn parse(args: &[String]) -> R<Command> {
             return Ok(Command::Help);
         }
         return crate::lora::parse(&args[1..]).map(Command::Lora);
+    }
+    if args.first().map(String::as_str) == Some("sik") {
+        return parse_sik(&args[1..]);
     }
     if args.first().map(String::as_str) == Some("waveform") {
         return crate::waveform_cmd::parse(&args[1..]).map(Command::Waveform);
@@ -168,6 +212,87 @@ pub fn parse(args: &[String]) -> R<Command> {
     Ok(Command::Bridge(radio, cfg))
 }
 
+fn parse_sik(args: &[String]) -> R<Command> {
+    let action = match args.first().map(String::as_str) {
+        None | Some("-h" | "--help" | "help") => return Ok(Command::Help),
+        Some(a @ ("show" | "set")) => a,
+        Some(other) => return Err(format!("unknown sik action {other:?}; use show or set")),
+    };
+    let mut named: BTreeMap<String, String> = BTreeMap::new();
+    let mut it = args[1..].iter();
+    let mut any_band = false;
+    while let Some(a) = it.next() {
+        if matches!(a.as_str(), "-h" | "--help") {
+            return Ok(Command::Help);
+        }
+        if a == "--any-band" && action == "set" {
+            any_band = true;
+            continue;
+        }
+        let k = a
+            .strip_prefix("--")
+            .ok_or(format!("unexpected argument {a:?}; run oasa-radio --help"))?;
+        let v = it.next().ok_or(format!("--{k} needs a value"))?;
+        if named.insert(k.to_string(), v.clone()).is_some() {
+            return Err(format!("--{k} given twice"));
+        }
+    }
+    let device = named.remove("device").ok_or("missing --device")?;
+    let baud = number(
+        "baud",
+        named.remove("baud"),
+        u64::from(serial::DEFAULT_BAUD),
+        1,
+        u64::from(u32::MAX),
+    )? as u32;
+    if serial::baud_rate(baud).is_none() {
+        return Err(format!(
+            "--baud {baud} is not supported (try 57600, 115200)"
+        ));
+    }
+    if action == "show" {
+        if let Some(k) = named.keys().next() {
+            return Err(format!("unknown option --{k} for sik show"));
+        }
+        return Ok(Command::Sik(SikCommand::Show { device, baud }));
+    }
+    let mut changes = BTreeMap::new();
+    for (opt, name) in crate::sik::SETTABLE {
+        if let Some(v) = named.remove(*opt) {
+            let n: u32 = v
+                .parse()
+                .map_err(|_| format!("--{opt} needs a whole number"))?;
+            let band_skip = any_band && matches!(*name, "MIN_FREQ" | "MAX_FREQ");
+            if !band_skip {
+                crate::sik::check_value(name, n).map_err(|e| {
+                    if matches!(*name, "MIN_FREQ" | "MAX_FREQ") {
+                        format!("--{opt}: {e} (outside 414-454, 863-870 and 902-928 MHz; --any-band to allow)")
+                    } else {
+                        format!("--{opt}: {e}")
+                    }
+                })?;
+            }
+            changes.insert((*name).to_string(), n);
+        }
+    }
+    if let Some(k) = named.keys().next() {
+        return Err(format!("unknown option --{k} for sik set"));
+    }
+    if let (Some(lo), Some(hi)) = (changes.get("MIN_FREQ"), changes.get("MAX_FREQ")) {
+        if lo >= hi {
+            return Err("--min-freq must be below --max-freq".into());
+        }
+    }
+    if changes.is_empty() {
+        return Err("sik set: nothing to set (for example --netid 4242 --mavlink 0)".into());
+    }
+    Ok(Command::Sik(SikCommand::Set {
+        device,
+        baud,
+        changes,
+    }))
+}
+
 fn addr(k: &str, v: Option<String>) -> R<SocketAddr> {
     let v = v.ok_or(format!("missing --{k}"))?;
     v.to_socket_addrs()
@@ -223,7 +348,16 @@ fn radio_spec(kind: &str, named: &mut BTreeMap<String, String>) -> R<RadioSpec> 
                 1,
                 framing::MAX_MTU as u64,
             )? as usize;
-            Ok(RadioSpec::Serial(SerialSpec { device, baud, mtu }))
+            let sik_expect = named
+                .remove("sik-expect")
+                .map(|v| crate::sik::Expect::parse(&v))
+                .transpose()?;
+            Ok(RadioSpec::Serial(SerialSpec {
+                device,
+                baud,
+                mtu,
+                sik_expect,
+            }))
         }
         "lora" => Err(
             "there is no separate lora adapter: with the OASA modem firmware use --radio serial \
@@ -295,6 +429,9 @@ mod tests {
             format!("{ok} --duration 99999999999"),
             format!("{ok} --duration x"),
             format!("{ok} --device e"), // twice
+            format!("{ok} --sik-expect netid"),
+            format!("{ok} --sik-expect mavlink=9"),
+            format!("bridge --radio udp --bind 127.0.0.1:5 --remote 127.0.0.1:6 {UDPS} --sik-expect netid=1"),
             format!("{ok} stray"),
             format!("bridge --radio lora --device d {UDPS}"),
             format!("bridge --radio sdr {UDPS}"),
@@ -319,6 +456,67 @@ mod tests {
         )))
         .is_ok());
         assert!(parse(&v(&format!("{base} --udp-listen [::1]:2"))).is_ok());
+    }
+
+    #[test]
+    fn sik_expect_on_the_bridge() {
+        let c = parse(&v(&format!(
+            "bridge --radio serial --device d --sik-expect netid=7,mavlink=0 {UDPS}"
+        )))
+        .unwrap();
+        match c {
+            Command::Bridge(RadioSpec::Serial(s), _) => {
+                let e = s.sik_expect.unwrap();
+                assert_eq!(e.0["NETID"], 7);
+                assert_eq!(e.0["MAVLINK"], 0);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn sik_commands_parse() {
+        assert_eq!(
+            parse(&v("sik show --device /dev/x")).unwrap(),
+            Command::Sik(SikCommand::Show {
+                device: "/dev/x".into(),
+                baud: 57_600
+            })
+        );
+        match parse(&v(
+            "sik set --device d --baud 115200 --netid 4242 --mavlink 0 --air-speed 64",
+        ))
+        .unwrap()
+        {
+            Command::Sik(SikCommand::Set { baud, changes, .. }) => {
+                assert_eq!(baud, 115_200);
+                assert_eq!(changes.len(), 3);
+                assert_eq!(changes["AIR_SPEED"], 64);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(parse(&v("sik")).unwrap(), Command::Help);
+        assert!(parse(&v("sik set --device d --max-freq 950000 --any-band")).is_ok());
+        assert!(parse(&v("sik set --device d --min-freq 902000 --max-freq 928000")).is_ok());
+        for bad in [
+            "sik frob --device d",
+            "sik show",
+            "sik show --device d --netid 1",
+            "sik set --device d",
+            "sik set --device d --netid 70000",
+            "sik set --device d --mavlink 3",
+            "sik set --device d --air-speed 65",
+            "sik set --device d --serial-speed 56",
+            "sik set --device d --netid 1 --netid 2",
+            "sik set --device d --format 1",
+            "sik set --device d --max-freq 950000",
+            "sik set --device d --min-freq 920000 --max-freq 910000",
+            "sik show --device d --any-band",
+            "sik set --device d --baud 7 --netid 1",
+            "sik set --device d stray",
+        ] {
+            assert!(parse(&v(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@ Tech tree nodes **R-COM1** (basic radio link) and the radio side of **R-COM2**. 
 - Plan: [oasa-lab/docs/r-com2-plan.md](https://github.com/joinoasa/oasa-lab/blob/main/docs/r-com2-plan.md)
 - Encryption lives in [oasa-sec](https://github.com/joinoasa/oasa-sec); tests in [oasa-lab](https://github.com/joinoasa/oasa-lab).
 - Security review (R-COM1, internal): [docs/security-review-r-com1.md](docs/security-review-r-com1.md)
+- SiK radios (setup and the settings check): [docs/sik.md](docs/sik.md)
 
 Status: v0 adapters (`udp`, `serial`), tested on Linux with pseudo-terminals. Not yet tried on real radios. Licensed under [Apache-2.0](LICENSE).
 
@@ -39,7 +40,7 @@ Packets from `oasa-link` arrive on `--udp-listen` and go out the radio. Packets 
 | Kind | For | Status |
 |---|---|---|
 | `udp` | Simulation (put the lab's simulated channel between two bridges), Wi-Fi, Ethernet | Works |
-| `serial` | SiK, mLRS, RFD900x, any transparent UART modem | Works. Framing: [docs/serial-framing.md](docs/serial-framing.md) |
+| `serial` | SiK, mLRS, RFD900x, any transparent UART modem | Works. Framing: [docs/serial-framing.md](docs/serial-framing.md). SiK: `oasa-radio sik show/set` and `--sik-expect`, [docs/sik.md](docs/sik.md) |
 | `lora` | Our LoRa modem firmware for the Heltec WiFi LoRa 32 V3. It speaks the serial framing: use `--radio serial --baud 115200 --mtu 255`, and `oasa-radio lora` for settings and counters | Works in simulation; real board untested. [firmware/heltec-v3](firmware/heltec-v3/README.md) |
 | `sdr` | OASA's own waveforms on SDRs | Planned. The modem (W0) runs in simulation: `oasa-radio waveform`, [docs/waveform-w0.md](docs/waveform-w0.md). Frame format v1 (protected header): [docs/frame-v1.md](docs/frame-v1.md). Light error correction for v1 (`--code light`): [docs/fec-light.md](docs/fec-light.md). Two-channel direction finding: [docs/direction-finding.md](docs/direction-finding.md) |
 
@@ -63,11 +64,22 @@ oasa-link --dir gcs --peer drone --bind 127.0.0.1:7801 --remote 127.0.0.1:7821 \
 
 The drone side is the same with its own device, its own ports and no `--initiate`. Give `oasa-link` the same `--mtu` as the bridge (at least 128; it makes link packets fit one serial frame). Set the radio itself to transparent (no packet mode, no encryption you rely on).
 
+For a SiK pair, set both radios first (`MAVLINK=0`, a NETID of your own) and let the bridge check them before it starts:
+
+```
+oasa-radio sik set --device /dev/ttyUSB0 --netid 4242 --mavlink 0      # once per radio, same values on both
+oasa-radio bridge --radio serial --device /dev/ttyUSB0 --mtu 242 \
+  --sik-expect netid=4242,air_speed=64,ecc=0,mavlink=0,txpower=20 --udp-listen ... --udp-send ...
+```
+
+See [docs/sik.md](docs/sik.md).
+
 Other commands:
 
 ```
 oasa-radio info                                         # adapters and their status
 oasa-radio info --radio serial --device /dev/ttyUSB0    # open one and show its settings
+oasa-radio sik show --device /dev/ttyUSB0               # a SiK radio's own settings (ATI, ATI5)
 oasa-radio bridge --help
 oasa-radio waveform ber --mod qpsk --ebn0-db 0,2,4,6,8 --bits 200000 --seed 1   # OASA's own modem in simulation: BER against theory
 ```
@@ -80,12 +92,13 @@ The bridge prints one JSON line per event (`start`, `drop`, `error`) and a final
 - Serial: 8N1, no flow control, standard baud rates (9600 to 4 Mbaud, see `oasa-radio bridge --help`).
 - The bridge adds no queue of its own. If `oasa-link` sends faster than the line, the kernel's UDP buffer fills and drops packets, and what is queued arrives late.
 - Radios are reached over cable or in the shielded box unless a test plan says otherwise.
+- **SiK radios trust each other.** Any SiK radio in range with the same NETID and air settings can change ours with remote AT commands (`RT`), for example its NETID, band or power, and save them. Packets stay safe (oasa-link), but the link can be taken down. NETID is not a defence. `--sik-expect` makes the bridge refuse a radio whose settings changed, at its next start; a change while it runs shows as a lost link. [docs/sik.md](docs/sik.md)
 
 ## Tests
 
 | Command | What |
 |---|---|
-| `cargo test --locked` | The waveform modem (`waveform/`: BER against theory with fixed seeds, frame round trips for both frame formats, false alarms, CRC; about 30 s), framing (round trips, every truncation, every bit flip, noise, seeded damage), the adapters, the CLI, and two bridges over a pseudo-terminal relay that drops and garbles bytes at 57600 baud |
+| `cargo test --locked` | SiK settings (`tests/sik_pty.rs`: `sik show`/`set` and `--sik-expect` against two simulated SiK radios that speak the AT protocol, including a remote `RT` change that the bridge then refuses), the waveform modem (`waveform/`: BER against theory with fixed seeds, frame round trips for both frame formats, false alarms, CRC; about 30 s), framing (round trips, every truncation, every bit flip, noise, seeded damage), the adapters, the CLI, and two bridges over a pseudo-terminal relay that drops and garbles bytes at 57600 baud |
 | `scripts/serial-e2e.sh` | Two real `oasa-link` processes through two serial bridges. Marked packets both ways; the captured line bytes must never hold the marker. A plaintext control proves the scanner can see one |
 
 CI runs both, plus `cargo fmt`, `clippy -D warnings`, `cargo deny` and `cargo audit`. For the end-to-end script, build [oasa-sec](https://github.com/joinoasa/oasa-sec) (`cargo build --locked --bins`) and point `OASA_SEC_BIN_DIR` at its `target/debug`. No `socat` needed: `examples/ptyrelay.rs` makes the pseudo-terminal pair, can drop and garble bytes, limits speed and captures what crosses.

@@ -3,6 +3,7 @@
 #![allow(dead_code)]
 
 pub mod sim_modem;
+pub mod sim_sik;
 
 use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
