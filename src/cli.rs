@@ -109,8 +109,11 @@ SIK RADIOS (settings over AT commands; never while a bridge has the port):
                      [--mavlink 0|1|2] [--serial-speed 57|115|...] [--txpower DBM]
                      [--min-freq KHZ] [--max-freq KHZ] [--num-channels N] [--duty-cycle PCT]
                      [--lbt-rssi N] [--max-window MS] [--oppresend 0|1] [--manchester 0|1]
-                     [--rtscts 0|1]
+                     [--rtscts 0|1] [--any-band]
       Set (ATSn=v), save (AT&W), reboot (ATZ), read back and print before and after.
+      TXPOWER steps on 100 mW radios: 1, 2, 5, 8, 11, 14, 17, 20 dBm (others round up).
+      MIN_FREQ/MAX_FREQ (kHz) must be inside 414-454, 863-870 or 902-928 MHz unless
+      --any-band; the rules where you are are yours to follow.
       Set both radios of a pair the same. For the bridge: --mavlink 0 (transparent bytes) and
       a NETID of your own (see docs/sik.md). NETID is not security; oasa-link is.
   --baud is the computer's side, the radio's SERIAL_SPEED (default 57600).
@@ -217,9 +220,14 @@ fn parse_sik(args: &[String]) -> R<Command> {
     };
     let mut named: BTreeMap<String, String> = BTreeMap::new();
     let mut it = args[1..].iter();
+    let mut any_band = false;
     while let Some(a) = it.next() {
         if matches!(a.as_str(), "-h" | "--help") {
             return Ok(Command::Help);
+        }
+        if a == "--any-band" && action == "set" {
+            any_band = true;
+            continue;
         }
         let k = a
             .strip_prefix("--")
@@ -254,12 +262,26 @@ fn parse_sik(args: &[String]) -> R<Command> {
             let n: u32 = v
                 .parse()
                 .map_err(|_| format!("--{opt} needs a whole number"))?;
-            crate::sik::check_value(name, n).map_err(|e| format!("--{opt}: {e}"))?;
+            let band_skip = any_band && matches!(*name, "MIN_FREQ" | "MAX_FREQ");
+            if !band_skip {
+                crate::sik::check_value(name, n).map_err(|e| {
+                    if matches!(*name, "MIN_FREQ" | "MAX_FREQ") {
+                        format!("--{opt}: {e} (outside 414-454, 863-870 and 902-928 MHz; --any-band to allow)")
+                    } else {
+                        format!("--{opt}: {e}")
+                    }
+                })?;
+            }
             changes.insert((*name).to_string(), n);
         }
     }
     if let Some(k) = named.keys().next() {
         return Err(format!("unknown option --{k} for sik set"));
+    }
+    if let (Some(lo), Some(hi)) = (changes.get("MIN_FREQ"), changes.get("MAX_FREQ")) {
+        if lo >= hi {
+            return Err("--min-freq must be below --max-freq".into());
+        }
     }
     if changes.is_empty() {
         return Err("sik set: nothing to set (for example --netid 4242 --mavlink 0)".into());
@@ -474,6 +496,8 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(parse(&v("sik")).unwrap(), Command::Help);
+        assert!(parse(&v("sik set --device d --max-freq 950000 --any-band")).is_ok());
+        assert!(parse(&v("sik set --device d --min-freq 902000 --max-freq 928000")).is_ok());
         for bad in [
             "sik frob --device d",
             "sik show",
@@ -485,6 +509,9 @@ mod tests {
             "sik set --device d --serial-speed 56",
             "sik set --device d --netid 1 --netid 2",
             "sik set --device d --format 1",
+            "sik set --device d --max-freq 950000",
+            "sik set --device d --min-freq 920000 --max-freq 910000",
+            "sik show --device d --any-band",
             "sik set --device d --baud 7 --netid 1",
             "sik set --device d stray",
         ] {
