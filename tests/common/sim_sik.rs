@@ -70,6 +70,11 @@ pub struct Radio {
     /// Bytes this radio put on the air (data only).
     pub aired: Vec<u8>,
     pub reboots: u32,
+    /// Lose this many `ATO` lines whole (no echo, not run), as a noisy line would.
+    pub lose_ato: u32,
+    held: Vec<u8>,
+    /// `AT&W` answers ERROR (a failing flash write).
+    pub fail_save: bool,
 }
 
 impl Radio {
@@ -86,6 +91,9 @@ impl Radio {
             out: Vec::new(),
             aired: Vec::new(),
             reboots: 0,
+            lose_ato: 0,
+            held: Vec::new(),
+            fail_save: false,
         }
     }
 
@@ -114,6 +122,7 @@ impl Radio {
                 self.reboots += 1;
                 String::new()
             }
+            "&W" if self.fail_save => "ERROR\n".into(),
             "&W" => {
                 self.saved = self.params;
                 "OK\n".into()
@@ -196,6 +205,25 @@ impl Air {
 
     fn at_input(&mut self, i: usize, c: u8, now: Instant) {
         let me = &mut self.r[i];
+        if me.lose_ato > 0 && me.line.is_empty() {
+            let mut cand = me.held.clone();
+            cand.push(c.to_ascii_uppercase());
+            if c == b'\r' && me.held == b"ATO" {
+                me.held.clear();
+                me.lose_ato -= 1;
+                return;
+            }
+            if b"ATO".starts_with(&cand) {
+                me.held = cand;
+                return;
+            }
+            // not an ATO after all: give back what was held
+            let held = std::mem::take(&mut me.held);
+            for h in held {
+                me.line.push(h);
+                me.out.push(h);
+            }
+        }
         if c == b'\r' {
             me.out.extend_from_slice(b"\r\n");
             let line = String::from_utf8_lossy(&me.line).into_owned();

@@ -151,7 +151,7 @@ fn sik_check(
     expect: &oasa_radio::sik::Expect,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let ts = || rfc3339(SystemTime::now());
-    let report = match oasa_radio::sik::read_report(device, baud) {
+    let report = match oasa_radio::sik::read_report(device, baud, false) {
         Ok(r) => r,
         Err(e) => {
             println!(
@@ -190,7 +190,7 @@ fn sik(c: &SikCommand) -> Result<(), Box<dyn std::error::Error>> {
     let ts = rfc3339(SystemTime::now());
     match c {
         SikCommand::Show { device, baud } => {
-            let r = oasa_radio::sik::read_report(device, *baud)?;
+            let r = oasa_radio::sik::read_report(device, *baud, true)?;
             println!(
                 "{{\"ts\":\"{ts}\",\"event\":\"sik\",\"device\":{},{}}}",
                 json_str(device),
@@ -218,7 +218,14 @@ fn sik(c: &SikCommand) -> Result<(), Box<dyn std::error::Error>> {
             );
             if !bad.is_empty() {
                 let text = bad.iter().map(|m| m.text()).collect::<Vec<_>>().join("; ");
-                return Err(format!("saved, but the radio reads back differently: {text}").into());
+                let hint = if bad.iter().any(|m| m.name == "TXPOWER") {
+                    " (SiK rounds TXPOWER up to its board's steps: 1, 2, 5, 8, 11, 14, 17, 20 dBm on 100 mW radios)"
+                } else {
+                    ""
+                };
+                return Err(
+                    format!("saved, but the radio reads back differently: {text}{hint}").into(),
+                );
             }
         }
     }

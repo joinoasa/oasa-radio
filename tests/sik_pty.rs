@@ -328,7 +328,7 @@ fn a_remote_change_by_another_radio_is_caught_before_bridging() {
     // H1: any radio with the same air settings can change ours with RT commands.
     let sik = SimSikPair::matched(4242);
     let mut attacker = AtPort::open(&sik.path_b.display().to_string(), 57_600).unwrap();
-    attacker.enter().unwrap();
+    attacker.enter(true).unwrap();
     attacker.command_ok("RTS4=1").unwrap();
     attacker.leave().unwrap();
     drop(attacker);
@@ -348,4 +348,86 @@ fn a_remote_change_by_another_radio_is_caught_before_bridging() {
     );
     let (_, err) = b.stop();
     assert!(err.contains("TXPOWER is 1, expected 20"), "{err}");
+}
+
+#[test]
+fn a_lost_ato_is_sent_again() {
+    let sik = SimSikPair::matched(4242);
+    sik.with(|r| r[0].lose_ato = 1);
+    let o = run(&["sik", "show", "--device", &sik.path_a.display().to_string()]);
+    assert!(o.status.success(), "{}", text(&o.stderr));
+    sik.with(|r| {
+        assert_eq!(r[0].lose_ato, 0, "the first ATO should have been lost");
+        assert!(!r[0].at_mode, "left in command mode");
+    });
+}
+
+#[test]
+fn the_bridge_refuses_when_ato_is_never_confirmed() {
+    let sik = SimSikPair::matched(4242);
+    sik.with(|r| r[0].lose_ato = 2);
+    let mut b = Bridge::start(&sik.path_a, EXPECT);
+    let s = b.child.wait().unwrap();
+    assert!(!s.success());
+    let mut err = String::new();
+    b.child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert!(err.contains("did not confirm ATO"), "{err}");
+    let out: Vec<String> = b.lines.try_iter().collect();
+    assert!(
+        !out.iter().any(|l| l.contains("\"event\":\"start\"")),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn the_bridge_does_not_poke_a_radio_left_in_command_mode() {
+    let sik = SimSikPair::matched(4242);
+    sik.with(|r| r[0].at_mode = true);
+    let mut b = Bridge::start(&sik.path_a, EXPECT);
+    assert!(!b.child.wait().unwrap().success());
+    let mut err = String::new();
+    b.child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert!(err.contains("sik show recovers"), "{err}");
+    // no recovery bytes were sent: nothing but +++ reached the AT parser, nothing went on the air
+    assert!(sik.with(|r| r[0].aired.is_empty()));
+}
+
+#[test]
+fn a_failed_save_reboots_without_the_changes() {
+    let sik = SimSikPair::matched(4242);
+    sik.with(|r| r[0].fail_save = true);
+    let o = run(&[
+        "sik",
+        "set",
+        "--device",
+        &sik.path_a.display().to_string(),
+        "--txpower",
+        "11",
+    ]);
+    assert!(!o.status.success());
+    assert!(
+        text(&o.stderr).contains("nothing was saved"),
+        "{}",
+        text(&o.stderr)
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    sik.with(|r| {
+        assert_eq!(r[0].reboots, 1);
+        assert_eq!(
+            r[0].params[reg("TXPOWER")],
+            20,
+            "the unsaved change must be gone"
+        );
+        assert!(!r[0].at_mode);
+    });
 }

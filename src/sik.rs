@@ -80,6 +80,20 @@ pub const SERIAL_SPEEDS: &[(u32, u32)] = &[
 /// Air speeds in kbps that SiK radios support (the ArduPilot SiK page).
 pub const AIR_SPEEDS: &[u32] = &[2, 4, 8, 16, 19, 24, 32, 48, 64, 96, 128, 192, 250];
 
+/// TX power steps of the 100 mW SiK radios (Holybro V3, 3DR): an other value
+/// is rounded up to the next step (ArduPilot SiK page). Long-range boards differ.
+pub const TXPOWER_STEPS: &[u32] = &[1, 2, 5, 8, 11, 14, 17, 20];
+
+/// Bands (kHz) `MIN_FREQ` and `MAX_FREQ` must stay in unless `--any-band`:
+/// 433 MHz radios (SiK's 414 to 454 MHz model), 868 MHz (EU 863 to 870) and
+/// 915 MHz (US 902 to 928). The rules where you are are your responsibility.
+pub const BANDS_KHZ: &[(u32, u32)] = &[(414_000, 454_000), (863_000, 870_000), (902_000, 928_000)];
+
+/// Is this a band edge inside one of [`BANDS_KHZ`]?
+pub fn in_band(khz: u32) -> bool {
+    BANDS_KHZ.iter().any(|(lo, hi)| (*lo..=*hi).contains(&khz))
+}
+
 /// Check one value for `sik set` and `--sik-expect`. `name` is the SiK name.
 pub fn check_value(name: &str, v: u32) -> Result<(), String> {
     let ok = match name {
@@ -94,6 +108,7 @@ pub fn check_value(name: &str, v: u32) -> Result<(), String> {
         "LBT_RSSI" => v == 0 || (25..=220).contains(&v),
         "MAX_WINDOW" => (20..=131).contains(&v),
         "NUM_CHANNELS" => (1..=50).contains(&v),
+        "MIN_FREQ" | "MAX_FREQ" => in_band(v),
         _ => true,
     };
     if ok {
@@ -313,14 +328,22 @@ fn parse_param(l: &str) -> Option<Param> {
     })
 }
 
-/// The `ATI` banner: the first printable line after the echo, at most 64 characters.
+/// The `ATI` banner, `SiK <version> on <board>` (`main.c` `g_banner_string`;
+/// RFDesign's builds put `RFD ` in front), at most 64 characters. Other lines
+/// (a linked radio can inject command replies) are ignored.
 pub fn parse_ati(reply: &[u8]) -> Result<String, String> {
     after_echo(reply, "ATI")
         .into_iter()
         .flatten()
-        .find(|l| !l.is_empty() && l != "OK")
-        .filter(|l| l.len() <= 64)
-        .ok_or_else(|| "ATI gave no version line".to_string())
+        .find(|l| l.len() <= 64 && (l.starts_with("SiK ") || l.starts_with("RFD SiK ")))
+        .ok_or_else(|| "ATI gave no SiK version line (not a SiK radio?)".to_string())
+}
+
+/// Did the radio say `OK` after `+++`? Packets from the air may come just
+/// before it with no line break, so look for the bytes `OK` CR LF (or `OK` LF)
+/// anywhere, not for a whole line.
+fn ok_after_escape(reply: &[u8]) -> bool {
+    reply.windows(3).any(|w| w == b"OK\n") || reply.windows(4).any(|w| w == b"OK\r\n")
 }
 
 /// Does the reply hold a line that is exactly `word`?
@@ -407,13 +430,23 @@ impl AtPort {
 
     /// Enter command mode. Waits out the guard time on both sides of `+++`.
     /// Anything the radio sends meanwhile (packets from the air) is thrown away.
-    pub fn enter(&mut self) -> Result<(), String> {
+    /// With `recover`, a radio left in command mode is recovered with `\r` and
+    /// `AT\r`; in data mode those three bytes go out on the air (the other
+    /// bridge drops them as a bad frame). The bridge's check does not recover:
+    /// it fails, and `oasa-radio sik show` recovers.
+    pub fn enter(&mut self, recover: bool) -> Result<(), String> {
         let _ = termios::tcflush(&self.file, FlushArg::TCIFLUSH);
         self.read_until(GUARD, None, &|_| false)?;
         self.write(b"+++")?;
-        let r = self.read_until(GUARD + ENTER_WAIT, None, &|b| has_line(b, "OK"))?;
-        if has_line(&r, "OK") {
+        let r = self.read_until(GUARD + ENTER_WAIT, None, &ok_after_escape)?;
+        if ok_after_escape(&r) {
             return Ok(());
+        }
+        if !recover {
+            return Err(format!(
+                "{}: no reply to +++ (not a SiK radio, wrong --baud, the port in use, or the radio left in command mode: oasa-radio sik show recovers that)",
+                self.device
+            ));
         }
         // Maybe it was in command mode already: then "+++" sits in its line buffer.
         self.write(b"\r")?;
@@ -467,26 +500,45 @@ impl AtPort {
         Ok(Report { version, params })
     }
 
-    /// Back to data mode (`ATO` prints nothing but its echo).
+    /// Back to data mode. `ATO` prints nothing but its echo, so the echo is the
+    /// proof the radio got it (it echoes before it runs a line). Tries twice;
+    /// without an echo the radio may still be in command mode, and the bridge
+    /// must not start (its packets would go to the AT parser).
     pub fn leave(&mut self) -> Result<(), String> {
-        self.write(b"ATO\r")?;
-        self.read_until(Duration::from_millis(200), None, &|_| false)?;
-        Ok(())
+        for _ in 0..2 {
+            let _ = termios::tcflush(&self.file, FlushArg::TCIFLUSH);
+            self.write(b"ATO\r")?;
+            let r = self.read_until(Duration::from_millis(500), None, &|b| has_line(b, "ATO"))?;
+            if has_line(&r, "ATO") {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "{}: the radio did not confirm ATO; it may still be in command mode (power-cycle it, or run oasa-radio sik show)",
+            self.device
+        ))
     }
 
     /// Save and reboot. The radio comes back in data mode after about a second.
+    /// If saving fails, reboot anyway: the unsaved changes (some apply at once,
+    /// such as TXPOWER and MAVLINK) are dropped and the radio leaves command mode.
     pub fn save_and_reboot(&mut self) -> Result<(), String> {
-        self.command_ok("AT&W")?;
+        if let Err(e) = self.command_ok("AT&W") {
+            let _ = self.write(b"ATZ\r");
+            return Err(format!(
+                "{e}; nothing was saved, the radio is rebooting with its old settings"
+            ));
+        }
         self.write(b"ATZ\r")?;
         Ok(())
     }
 }
 
 /// Enter command mode, read everything, leave. Leaves the radio in data mode
-/// even when reading fails.
-pub fn read_report(device: &str, baud: u32) -> Result<Report, String> {
+/// even when reading fails. `recover`: see [`AtPort::enter`].
+pub fn read_report(device: &str, baud: u32, recover: bool) -> Result<Report, String> {
     let mut p = AtPort::open(device, baud)?;
-    p.enter()?;
+    p.enter(recover)?;
     let r = p.report();
     let left = p.leave();
     let r = r?;
@@ -503,7 +555,7 @@ pub fn set(
     baud_after: u32,
 ) -> Result<(Report, Report), String> {
     let mut p = AtPort::open(device, baud)?;
-    p.enter()?;
+    p.enter(true)?;
     let before = match p.report() {
         Ok(r) => r,
         Err(e) => {
@@ -536,7 +588,7 @@ pub fn set(
     p.save_and_reboot()?;
     drop(p);
     std::thread::sleep(BOOT);
-    let after = read_report(device, baud_after)
+    let after = read_report(device, baud_after, true)
         .map_err(|e| format!("saved, but reading back failed: {e}"))?;
     Ok((before, after))
 }
@@ -627,12 +679,26 @@ S13:MANCHESTER=0\r\nS14:RTSCTS=0\r\nS15:MAX_WINDOW=131\r\n";
     }
 
     #[test]
+    fn ok_after_air_bytes_counts() {
+        assert!(ok_after_escape(b"\x01\x9fjunk-from-the-airOK\r\n"));
+        assert!(ok_after_escape(b"OK\n"));
+        assert!(!ok_after_escape(b"OK"));
+        assert!(!ok_after_escape(b"+++"));
+    }
+
+    #[test]
     fn ati_banner() {
         assert_eq!(
             parse_ati(b"ATI\r\nSiK 2.2 on HM-TRP\r\n").unwrap(),
             "SiK 2.2 on HM-TRP"
         );
         assert!(parse_ati(b"ATI\r\n").is_err());
+        // a line injected before the banner is skipped; no banner at all is an error
+        assert_eq!(
+            parse_ati(b"ATI\r\nOK\r\nhello\r\nRFD SiK 2.65 on RFD900X\r\n").unwrap(),
+            "RFD SiK 2.65 on RFD900X"
+        );
+        assert!(parse_ati(b"ATI\r\nNot a radio 1.0\r\n").is_err());
     }
 
     #[test]
@@ -677,6 +743,10 @@ S13:MANCHESTER=0\r\nS14:RTSCTS=0\r\nS15:MAX_WINDOW=131\r\n";
         assert!(check_value("LBT_RSSI", 10).is_err());
         assert!(check_value("MAX_WINDOW", 131).is_ok());
         assert!(check_value("MAX_WINDOW", 132).is_err());
+        assert!(check_value("MIN_FREQ", 902_000).is_ok());
+        assert!(check_value("MAX_FREQ", 928_000).is_ok());
+        assert!(check_value("MAX_FREQ", 950_000).is_err());
+        assert!(check_value("MIN_FREQ", 0).is_err());
         for (_, b) in SERIAL_SPEEDS {
             assert!(baud_rate(*b).is_some());
         }
