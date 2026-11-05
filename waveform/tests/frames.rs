@@ -728,6 +728,30 @@ const GOLDEN: [(Modulation, usize, u64); 3] = [
 
 // ---- frame format v1: protected header ----
 
+#[test]
+fn v1_uncoded_waveform_does_not_drift() {
+    // Frame v1 with payload_code 0 must not change when the error-correction tiers are added:
+    // pinned from `main` before the light code, same payload as above.
+    let payload: Vec<u8> = (0..48u8).collect();
+    for (m, len, fp) in GOLDEN_V1 {
+        let md = modem_v1(m);
+        let x = md.modulate(&payload).unwrap();
+        assert_eq!(x.len(), len, "{m:?} length");
+        assert_eq!(
+            fingerprint(&x),
+            fp,
+            "{m:?} fingerprint {:#x}",
+            fingerprint(&x)
+        );
+    }
+}
+
+const GOLDEN_V1: [(Modulation, usize, u64); 3] = [
+    (Modulation::Fsk2, 5048, 0x2e47_8002_ba15_2d8c),
+    (Modulation::Bpsk, 5169, 0x47ae_047c_f1a1_f38b),
+    (Modulation::Qpsk, 3569, 0x423c_471f_6926_6bd1),
+];
+
 fn modem_v1(m: Modulation) -> Modem {
     Modem::new(ModemConfig {
         frame: FrameFormat::V1,
