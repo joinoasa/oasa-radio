@@ -41,7 +41,7 @@ Packets from `oasa-link` arrive on `--udp-listen` and go out the radio. Packets 
 | `udp` | Simulation (put the lab's simulated channel between two bridges), Wi-Fi, Ethernet | Works |
 | `serial` | SiK, mLRS, RFD900x, any transparent UART modem | Works. Framing: [docs/serial-framing.md](docs/serial-framing.md) |
 | `lora` | Our LoRa modem firmware for the Heltec WiFi LoRa 32 V3. It speaks the serial framing: use `--radio serial --baud 115200 --mtu 255`, and `oasa-radio lora` for settings and counters | Works in simulation; real board untested. [firmware/heltec-v3](firmware/heltec-v3/README.md) |
-| `sdr` | OASA's own waveforms on SDRs | Planned. The modem (W0) runs in simulation: `oasa-radio waveform`, [docs/waveform-w0.md](docs/waveform-w0.md). Frame format v1 (protected header): [docs/frame-v1.md](docs/frame-v1.md). Two-channel direction finding: [docs/direction-finding.md](docs/direction-finding.md) |
+| `sdr` | OASA's own waveforms on SDRs | Planned. The modem (W0) runs in simulation: `oasa-radio waveform`, [docs/waveform-w0.md](docs/waveform-w0.md). Frame format v1 (protected header): [docs/frame-v1.md](docs/frame-v1.md). Light error correction for v1 (`--code light`): [docs/fec-light.md](docs/fec-light.md). Two-channel direction finding: [docs/direction-finding.md](docs/direction-finding.md) |
 
 ## Quick start
 
@@ -104,7 +104,7 @@ CI runs both, plus `cargo fmt`, `clippy -D warnings`, `cargo deny` and `cargo au
 |---|---|---|---|
 | [nix](https://crates.io/crates/nix) | 0.31 | MIT | Safe terminal setup, `poll` and pseudo-terminals, so we need no `unsafe` for them |
 | libc, bitflags, cfg-if, cfg_aliases | via nix | MIT or Apache-2.0 | nix's own dependencies |
-| `oasa-waveform` (ours, in `waveform/`) | 0.1 | Apache-2.0 | OASA's own modem for milestone W0: 2-FSK, BPSK, QPSK, framing, channel model and theory curves. Pure Rust, no dependencies; erfc, the random generator and the CRC are written here with known-answer tests |
+| `oasa-waveform` (ours, in `waveform/`) | 0.1 | Apache-2.0 | OASA's own modem for milestone W0: 2-FSK, BPSK, QPSK, framing, a convolutional code with soft Viterbi decoding, channel model and theory curves. Pure Rust, no dependencies; erfc, the random generator and the CRC are written here with known-answer tests |
 | [embedded-hal](https://crates.io/crates/embedded-hal) | 1.0 | MIT or Apache-2.0 | SPI and pin traits for the `no_std` modem core |
 | esp-hal, esp-rtos, esp-bootloader-esp-idf, embassy-executor, embassy-time, embassy-futures, embassy-sync | see `firmware/heltec-v3/Cargo.toml` | MIT or Apache-2.0 | Heltec V3 firmware only (not in the host build) |
 
