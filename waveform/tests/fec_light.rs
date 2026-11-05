@@ -474,3 +474,51 @@ fn loss_table() {
         println!();
     }
 }
+
+/// Deep fades for the docs: 64-byte light frames at 6 dB Eb/N0 with the body faded 20 dB (amplitude
+/// 0.1) over `L` symbols at a random place, 200 frames per length. `cargo test --release -p
+/// oasa-waveform --test fec_light fade_table -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn fade_table() {
+    let lens = [0usize, 16, 32, 48, 64, 96, 128, 192, 256];
+    println!("frames delivered of 200, 6 dB Eb/N0, body faded 20 dB over L symbols");
+    print!("{:12}", "L");
+    for l in lens {
+        print!(" {l:>4}");
+    }
+    println!();
+    for m in [Modulation::Bpsk, Modulation::Qpsk] {
+        let md = light(m);
+        let sps = md.sps();
+        let body_start = (63 + 16 + 152) * sps;
+        let body_syms = md.frame_symbols(64) - 63 - 16 - 152;
+        let n0 = n0_for_ebn0(6.0, md.energy_per_bit());
+        print!("{:12}", m.name());
+        for l in lens {
+            let mut ch = Channel::new(50 + l as u64);
+            let mut ok = 0;
+            for _ in 0..200 {
+                let payload = ch.rng().bytes(64);
+                let mut tx = md.modulate(&payload).unwrap();
+                let at = ch.rng().below((body_syms - l) as u64 + 1) as usize;
+                for s in &mut tx[body_start + at * sps..body_start + (at + l) * sps] {
+                    *s = *s * 0.1;
+                }
+                let imp = Impairments {
+                    n0,
+                    phase_rad: ch.rng().uniform() * 2.0 * PI,
+                    lead: 40,
+                    tail: 40,
+                    ..Default::default()
+                };
+                ok += md
+                    .demodulate(&ch.apply(&tx, &imp))
+                    .iter()
+                    .any(|f| f.crc_ok && f.payload == payload) as usize;
+            }
+            print!(" {ok:>4}");
+        }
+        println!();
+    }
+}
