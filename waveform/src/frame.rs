@@ -25,6 +25,10 @@
 //! ```
 //!
 //! The CRC-16 of v1 covers the three header field bytes and the payload.
+//!
+//! **Light error correction** (`payload_code` 1, see `docs/fec-light.md`): the v1 body (payload and
+//! CRC-16, whitened) is coded with the same K=7 rate 1/2 code as the header (6 tail bits), then
+//! interleaved ([`interleaver`]), then sent at the payload modulation.
 
 use crate::fec::{coded_len, conv_encode, viterbi_decode};
 
@@ -51,6 +55,59 @@ impl FrameFormat {
             "w0" => Some(FrameFormat::W0),
             "v1" => Some(FrameFormat::V1),
             _ => None,
+        }
+    }
+}
+
+/// Error correction on the v1 body: the header's `payload_code` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PayloadCode {
+    /// 0: none.
+    #[default]
+    None,
+    /// 1: K=7 (171, 133) rate 1/2, terminated, block interleaver over the coded body.
+    Light,
+}
+
+impl PayloadCode {
+    /// The 3-bit `payload_code` field.
+    pub fn code(self) -> u8 {
+        match self {
+            PayloadCode::None => 0,
+            PayloadCode::Light => 1,
+        }
+    }
+
+    /// `None` for the reserved values 2 to 7.
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(PayloadCode::None),
+            1 => Some(PayloadCode::Light),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            PayloadCode::None => "none",
+            PayloadCode::Light => "light",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(PayloadCode::None),
+            "light" => Some(PayloadCode::Light),
+            _ => None,
+        }
+    }
+
+    /// Code rate, information bits per coded bit, not counting the tail. Eb/N0 counts energy per
+    /// information bit, so a coded symbol carries `rate` times the energy of an uncoded one.
+    pub fn rate(self) -> f64 {
+        match self {
+            PayloadCode::None => 1.0,
+            PayloadCode::Light => 0.5,
         }
     }
 }
@@ -201,7 +258,8 @@ pub struct HeaderFields {
     pub extension: u8,
     /// 0 BPSK, 1 QPSK, 2 2-FSK, 3 reserved: the modulation of the body.
     pub modulation: u8,
-    /// 0: none. 1 to 7 are reserved for error-correction tiers; v1 receivers reject them.
+    /// 0: none. 1: light ([`PayloadCode::Light`]). 2 to 7 are reserved (heavy tier); receivers
+    /// reject them.
     pub payload_code: u8,
     /// Not defined yet; v1 receivers reject 1.
     pub pilots: u8,
@@ -250,13 +308,13 @@ impl HeaderFields {
         }
     }
 
-    /// The rules a v1 receiver applies: version 0, no extension, no pilots, no payload code, and
-    /// the modulation it is set up for (`modulation_code`).
+    /// The rules a v1 receiver applies: version 0, no extension, no pilots, a payload code it knows
+    /// (0 or 1), and the modulation it is set up for (`modulation_code`).
     pub fn acceptable(&self, modulation_code: u8) -> bool {
         self.version == 0
             && self.extension == 0
             && self.pilots == 0
-            && self.payload_code == 0
+            && PayloadCode::from_code(self.payload_code).is_some()
             && self.modulation == modulation_code
     }
 }
@@ -340,6 +398,77 @@ pub fn parse_body_v1(bits: &[u8], h: &HeaderFields, n: usize) -> (Vec<u8>, bool)
     let mut crc_in = h.to_bytes().to_vec();
     crc_in.extend_from_slice(&payload);
     (payload, crc16(&crc_in) == got)
+}
+
+/// Coded bits within this distance on air are never neighbours in the code: see [`interleaver`].
+pub const INTERLEAVE_MIN_SPREAD: usize = 32;
+
+/// Columns of the block interleaver for `len` coded bits:
+/// `min(floor(sqrt(len)), floor((len - 1) / 32))`, at least 1.
+pub fn interleave_columns(len: usize) -> usize {
+    let sq = (1..=len).take_while(|c| c * c <= len).last().unwrap_or(1);
+    sq.min(len.saturating_sub(1) / INTERLEAVE_MIN_SPREAD).max(1)
+}
+
+/// The block interleaver for `len` coded bits: entry `t` is the coded bit sent `t`-th.
+///
+/// Row-column: the coded bits are written row by row into `C` columns
+/// ([`interleave_columns`]; the last row may be short) and read column by column. Two coded bits that
+/// are neighbours in the code (same row, next column) go out one column length apart: at least
+/// `ceil(len / C) - 1 >= 32` bits (32 symbols in BPSK and 2-FSK, 16 in QPSK). A burst of up to one
+/// column length on air lands on coded bits `C` apart. Square-ish (`C` about `sqrt(len)`) so both
+/// distances grow with the frame. The permutation follows from the length alone: nothing is sent
+/// for it. Frames under 2 payload bytes (`len` < 65) get `C = 1`, which is no interleaving.
+pub fn interleaver(len: usize) -> Vec<usize> {
+    let c = interleave_columns(len);
+    let rows = len.div_ceil(c);
+    let mut order = Vec::with_capacity(len);
+    for col in 0..c {
+        for row in 0..rows {
+            let i = row * c + col;
+            if i < len {
+                order.push(i);
+            }
+        }
+    }
+    order
+}
+
+/// Coded bits in the order they are sent.
+pub fn interleave<T: Copy>(coded: &[T]) -> Vec<T> {
+    interleaver(coded.len()).iter().map(|&i| coded[i]).collect()
+}
+
+/// Values in the order they were received, back in code order: the inverse of [`interleave`].
+pub fn deinterleave<T: Copy + Default>(received: &[T]) -> Vec<T> {
+    let mut out = vec![T::default(); received.len()];
+    for (&i, &v) in interleaver(received.len()).iter().zip(received) {
+        out[i] = v;
+    }
+    out
+}
+
+/// Number of bits sent for the body of a v1 frame of `n` payload bytes with code `code`.
+pub fn body_len_bits_coded(n: usize, code: PayloadCode) -> usize {
+    match code {
+        PayloadCode::None => body_len_bits_v1(n),
+        PayloadCode::Light => coded_len(body_len_bits_v1(n)),
+    }
+}
+
+/// The body bits of a v1 frame with the light code: [`body_bits_v1`] (payload and CRC-16,
+/// whitened), convolutionally coded with 6 tail bits, then interleaved.
+pub fn body_bits_light(h: &HeaderFields, payload: &[u8]) -> Vec<u8> {
+    interleave(&conv_encode(&body_bits_v1(h, payload)))
+}
+
+/// Decode a light-coded v1 body from one soft value per sent bit (positive: bit 0, see
+/// [`crate::fec`]; `body_len_bits_coded(n, Light)` of them): de-interleave, soft Viterbi, then
+/// [`parse_body_v1`]. Returns the payload and whether the CRC-16 matched.
+pub fn parse_body_light(soft: &[f32], h: &HeaderFields, n: usize) -> (Vec<u8>, bool) {
+    let info = body_len_bits_v1(n);
+    let bits = viterbi_decode(&deinterleave(&soft[..coded_len(info)]), info);
+    parse_body_v1(&bits, h, n)
 }
 
 #[cfg(test)]
@@ -498,12 +627,21 @@ mod tests {
             HeaderFields { extension: 1, ..ok },
             HeaderFields { pilots: 1, ..ok },
             HeaderFields {
-                payload_code: 3,
+                payload_code: 2,
+                ..ok
+            },
+            HeaderFields {
+                payload_code: 7,
                 ..ok
             },
         ] {
             assert!(!bad.acceptable(0), "{bad:?}");
         }
+        assert!(HeaderFields {
+            payload_code: 1,
+            ..ok
+        }
+        .acceptable(0));
         let reserved = HeaderFields {
             channel_plan: 15,
             coexistence: 7,
@@ -535,5 +673,86 @@ mod tests {
             bad[i] ^= 1;
             assert!(!parse_body_v1(&bad, &h, 20).1, "flip {i}");
         }
+    }
+
+    #[test]
+    fn payload_code_names() {
+        for c in [PayloadCode::None, PayloadCode::Light] {
+            assert_eq!(PayloadCode::from_code(c.code()), Some(c));
+            assert_eq!(PayloadCode::parse(c.name()), Some(c));
+        }
+        assert_eq!(PayloadCode::Light.code(), 1);
+        assert!((2..8).all(|c| PayloadCode::from_code(c).is_none()));
+        assert_eq!(PayloadCode::parse("heavy"), None);
+    }
+
+    #[test]
+    fn interleaver_is_a_permutation_and_deinterleave_undoes_it() {
+        for n in [0usize, 1, 2, 4, 64, 100, 255] {
+            let len = body_len_bits_coded(n, PayloadCode::Light);
+            let p = interleaver(len);
+            let mut seen = vec![false; len];
+            for &i in &p {
+                assert!(!seen[i], "n {n}: {i} twice");
+                seen[i] = true;
+            }
+            assert!(seen.iter().all(|&x| x), "n {n}");
+            let v: Vec<u32> = (0..len as u32)
+                .map(|x| x.wrapping_mul(2_654_435_761))
+                .collect();
+            assert_eq!(deinterleave(&interleave(&v)), v, "n {n}");
+        }
+    }
+
+    #[test]
+    fn interleaver_spreads_neighbours_apart() {
+        // 64 bytes: 1068 coded bits, 32 columns of 34 (the last 20 columns 33)
+        assert_eq!(body_len_bits_coded(64, PayloadCode::Light), 1068);
+        assert_eq!(interleave_columns(1068), 32);
+        for n in 2..=255usize {
+            let len = body_len_bits_coded(n, PayloadCode::Light);
+            let p = interleaver(len);
+            let c = interleave_columns(len);
+            assert!(c > 1, "n {n}");
+            let mut pos = vec![0usize; len];
+            for (t, &i) in p.iter().enumerate() {
+                pos[i] = t;
+            }
+            // neighbours in the code are at least 32 apart on air
+            let worst = (1..len).map(|i| pos[i].abs_diff(pos[i - 1])).min().unwrap();
+            assert!(worst >= INTERLEAVE_MIN_SPREAD, "n {n}: {worst}");
+            // neighbours on air are C apart in the code within a column
+            let rows = len.div_ceil(c);
+            for t in 1..rows - 1 {
+                assert_eq!(p[t] - p[t - 1], c, "n {n}");
+            }
+        }
+        // tiny frames are not interleaved
+        assert_eq!(
+            interleave_columns(body_len_bits_coded(0, PayloadCode::Light)),
+            1
+        );
+    }
+
+    #[test]
+    fn light_body_round_trip_and_crc() {
+        let payload: Vec<u8> = (0..40u8).map(|i| i.wrapping_mul(29)).collect();
+        let h = HeaderFields {
+            payload_code: 1,
+            ..HeaderFields::new(0, 40)
+        };
+        let body = body_bits_light(&h, &payload);
+        assert_eq!(body.len(), body_len_bits_coded(40, PayloadCode::Light));
+        assert_eq!(body.len(), 2 * ((40 + 2) * 8 + 6));
+        let soft: Vec<f32> = body.iter().map(|&b| 1.0 - 2.0 * b as f32).collect();
+        assert_eq!(parse_body_light(&soft, &h, 40), (payload.clone(), true));
+        // a few wrong bits anywhere are corrected
+        let mut s = soft.clone();
+        for i in [0, 1, 2, 3, 300, 301, 671] {
+            s[i] = -s[i];
+        }
+        assert_eq!(parse_body_light(&s, &h, 40), (payload.clone(), true));
+        // the CRC-16 still covers the header bytes
+        assert!(!parse_body_light(&soft, &HeaderFields::new(0, 40), 40).1);
     }
 }

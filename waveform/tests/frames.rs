@@ -941,7 +941,7 @@ fn v1_header_rules_reject_and_count() {
             },
             HeaderFields { pilots: 1, ..good },
             HeaderFields {
-                payload_code: 1,
+                payload_code: 2,
                 ..good
             },
             HeaderFields {
