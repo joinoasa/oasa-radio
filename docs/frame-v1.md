@@ -26,7 +26,7 @@ Preamble and sync word are unchanged. Header fields, 24 bits, most significant b
 | `version` | 2 | 0 for this format |
 | `extension` | 1 | 1: more header follows. Not defined yet; v1 receivers reject it |
 | `modulation` | 2 | 0 BPSK, 1 QPSK, 2 2-FSK, 3 reserved. The modulation of the payload |
-| `payload_code` | 3 | 0: none. 1 to 7 are reserved for the light and heavy error-correction tiers and the interleaver they imply; v1 receivers reject them |
+| `payload_code` | 3 | 0: none. 1: light error correction, K=7 rate 1/2 and an interleaver over the body ([fec-light.md](fec-light.md)). 2 to 7 are reserved (heavy tier); receivers reject them |
 | `pilots` | 1 | Not defined yet; v1 receivers reject 1 |
 | `length` | 8 | Payload bytes, 0 to 255 |
 | `channel_plan` | 4 | Reserved. Sent as 0, ignored and reported by the receiver |
@@ -39,7 +39,7 @@ Fields go out as three bytes (`length` straddles bytes 1 and 2), then the header
 3. **Code** them: convolutional, constraint length 7, generators 171 and 133 (octal), rate 1/2, six zero tail bits: (32 + 6) x 2 = 76 coded bits. The encoder is checked against an independent Python implementation.
 4. **Send twice.** The 76 coded bits, then the same 76 bits xored with the PN9 sequence (`whiten` of 76 zeros): 152 symbols, one bit per symbol. Effective rate 1/4.
 
-The receiver turns each header symbol into a soft value (PSK: the real part of the matched filter output, positive for bit 0; 2-FSK: energy of the bit 0 tone minus the bit 1 tone), undoes the xor of the second copy, adds the two values of each coded bit, runs a soft Viterbi decoder, unscrambles, and checks the CRC-8. It rejects the frame if the CRC-8 fails, `version` is not 0, `extension` is 1, `pilots` is 1, `payload_code` is not 0, or `modulation` is not the one the modem is set up for. Rejected frames are counted as `header_rejected`. Then it decodes the body as in W0.
+The receiver turns each header symbol into a soft value (PSK: the real part of the matched filter output, positive for bit 0; 2-FSK: energy of the bit 0 tone minus the bit 1 tone), undoes the xor of the second copy, adds the two values of each coded bit, runs a soft Viterbi decoder, unscrambles, and checks the CRC-8. It rejects the frame if the CRC-8 fails, `version` is not 0, `extension` is 1, `pilots` is 1, `payload_code` is not 0 or 1, or `modulation` is not the one the modem is set up for. Rejected frames are counted as `header_rejected`. Then it decodes the body as in W0, or with the light code if `payload_code` is 1.
 
 **Body.** Payload bytes, then CRC-16/CCITT-FALSE over *the three header field bytes and the payload*, whitened with a fresh PN9 run, at the payload modulation. No length or complement bytes. Because the CRC-16 covers the header bytes, a header that decoded to the wrong length (a miscorrection that got past the CRC-8) still fails the CRC-16.
 
@@ -125,7 +125,7 @@ Fixed overhead (everything but the payload) goes from 111 symbols (BPSK) to 247.
 
 * `channel_plan` (4 bits): later the sender's hop schedule, which will come from the session key and is never sent in the clear. Until then it is 0, and receivers report whatever they see.
 * `coexistence` (3 bits): later flags for sharing the band. Same rule.
-* `extension`, `pilots`, `payload_code` 1 to 7 and `modulation` 3 are refused today so that a future sender cannot be misread by an old receiver. The error-correction tiers will use `payload_code` and reuse [`fec.rs`](../waveform/src/fec.rs) (same encoder and soft Viterbi decoder).
+* `extension`, `pilots`, `payload_code` 2 to 7 and `modulation` 3 are refused today so that a future sender cannot be misread by an old receiver. `payload_code` 1 (light) is defined in [fec-light.md](fec-light.md); it reuses [`fec.rs`](../waveform/src/fec.rs). The heavy tier will take another value.
 
 ## Security
 

@@ -3,7 +3,7 @@
 //! `oasa-radio waveform ber`.
 
 use crate::channel::{n0_for_ebn0, Channel, Impairments};
-use crate::frame::{FrameFormat, HeaderFields};
+use crate::frame::{FrameFormat, HeaderFields, PayloadCode};
 use crate::modem::{ConfigError, Modem, ModemConfig, Modulation, RxConfig, RxReport};
 use crate::theory;
 use std::f64::consts::PI;
@@ -13,6 +13,8 @@ pub struct BerOptions {
     pub sps: usize,
     /// Frame format.
     pub frame: FrameFormat,
+    /// Error correction on the body (v1 only). Eb/N0 is per information bit either way.
+    pub code: PayloadCode,
     /// Payload bytes per frame.
     pub payload_len: usize,
     /// Largest random sample delay before the frame (the delay is 0 up to this many samples, plus 2).
@@ -34,6 +36,7 @@ impl Default for BerOptions {
         Self {
             sps: 8,
             frame: FrameFormat::W0,
+            code: PayloadCode::None,
             payload_len: 64,
             max_delay: 61,
             random_frac_delay: false,
@@ -61,12 +64,13 @@ pub struct BerPoint {
     pub bits: u64,
     pub errors: u64,
     pub ber: f64,
-    /// Theory: Q(sqrt(2 Eb/N0)) for BPSK and QPSK; noncoherent 0.5 exp(-Eb/2N0) for 2-FSK.
+    /// Theory: Q(sqrt(2 Eb/N0)) for BPSK and QPSK; noncoherent 0.5 exp(-Eb/2N0) for 2-FSK. NaN
+    /// with a code (there is no closed form; compare packet loss with `docs/fec-light.md`).
     pub theory: f64,
     /// Wilson interval at 3 sigma around the measured BER.
     pub ci_lo: f64,
     pub ci_hi: f64,
-    /// Binomial z-score of the error count against the theory.
+    /// Binomial z-score of the error count against the theory (NaN with a code).
     pub z: f64,
     pub seed: u64,
 }
@@ -93,6 +97,7 @@ pub fn run_ber(
     let modem = Modem::new(ModemConfig {
         sps: opts.sps,
         frame: opts.frame,
+        code: opts.code,
         ..ModemConfig::new(modulation)
     })?;
     if opts.payload_len == 0 || opts.payload_len > 255 {
@@ -111,7 +116,10 @@ pub fn run_ber(
     };
     let (mut detected, mut crc_ok, mut header_ok, mut bits, mut errors) =
         (0u64, 0u64, 0u64, 0u64, 0u64);
-    let sent_header = HeaderFields::new(modulation.code(), opts.payload_len as u8);
+    let sent_header = HeaderFields {
+        payload_code: opts.code.code(),
+        ..HeaderFields::new(modulation.code(), opts.payload_len as u8)
+    };
     for _ in 0..frames {
         let payload = ch.rng().bytes(opts.payload_len);
         let tx = modem.modulate(&payload)?;
@@ -159,7 +167,10 @@ pub fn run_ber(
     } else {
         f64::NAN
     };
-    let th = theory_ber(modulation, ebn0_db);
+    let th = match opts.code {
+        PayloadCode::None => theory_ber(modulation, ebn0_db),
+        _ => f64::NAN,
+    };
     let (ci_lo, ci_hi) = theory::wilson(errors, bits, 3.0);
     Ok(BerPoint {
         modulation,
@@ -184,11 +195,12 @@ pub fn run_ber(
 pub struct FoundPoint {
     pub modulation: Modulation,
     pub frame: FrameFormat,
+    pub code: PayloadCode,
     pub ebn0_db: f64,
     pub frames: u64,
     /// Frames returned at the right place: the header was accepted. The payload may still be damaged.
     pub found: u64,
-    /// Of those, with a good CRC-16.
+    /// Of those, with a good CRC-16: frames delivered. Packet loss is `1 - crc_ok / frames`.
     pub crc_ok: u64,
     /// What the receiver did with the candidates, summed over all frames.
     pub report: RxReport,
@@ -207,6 +219,7 @@ pub fn run_found(
     let modem = Modem::new(ModemConfig {
         sps: opts.sps,
         frame: opts.frame,
+        code: opts.code,
         ..ModemConfig::new(modulation)
     })?;
     if opts.payload_len > 255 {
@@ -257,6 +270,7 @@ pub fn run_found(
     Ok(FoundPoint {
         modulation,
         frame: opts.frame,
+        code: opts.code,
         ebn0_db,
         frames,
         found,

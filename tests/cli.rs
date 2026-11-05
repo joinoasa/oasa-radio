@@ -541,6 +541,151 @@ fn waveform_rx_stream_gives_what_decode_gives() {
 }
 
 #[test]
+fn waveform_light_code_round_trips_through_iq_decode_and_rx_stream() {
+    let dir = std::env::temp_dir().join(format!("oasa-wf-light-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for m in ["bpsk", "qpsk", "fsk2"] {
+        let base = dir.join(format!("light-{m}")).display().to_string();
+        let o = run(&[
+            "waveform",
+            "iq",
+            "--mod",
+            m,
+            "--out",
+            &base,
+            "--ebn0-db",
+            "12",
+            "--payload-len",
+            "64",
+            "--seed",
+            "5",
+            "--frame",
+            "v1",
+            "--code",
+            "light",
+            "--phase-deg",
+            "40",
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let line = String::from_utf8_lossy(&o.stdout).to_string();
+        assert_eq!(field(&line, "code"), "light");
+        // airtime: 79 + 152 + 2 (66 * 8 + 6) / bits per symbol
+        let syms = if m == "qpsk" { "765" } else { "1299" };
+        assert_eq!(field(&line, "frame_symbols"), syms, "{m}");
+        let meta = std::fs::read_to_string(format!("{base}.sigmf-meta")).unwrap();
+        assert!(meta.contains("\"oasa:payload_code\": \"light\""), "{meta}");
+        // the receiver reads the code from the header: no --code needed
+        let d = run(&[
+            "waveform", "decode", "--mod", m, "--in", &base, "--frame", "v1",
+        ]);
+        let out = String::from_utf8_lossy(&d.stdout).to_string();
+        let frame = out
+            .lines()
+            .find(|l| l.contains("\"event\":\"frame\""))
+            .unwrap_or_else(|| panic!("{m}: {out}"));
+        assert_eq!(field(frame, "crc_ok"), "true", "{m}");
+        assert_eq!(field(frame, "payload_code"), "1", "{m}");
+        assert_eq!(field(frame, "len"), "64", "{m}");
+        // with the length given, the code is what --code says
+        for (code, ok) in [("light", "true"), ("none", "false")] {
+            let d = run(&[
+                "waveform",
+                "decode",
+                "--mod",
+                m,
+                "--in",
+                &base,
+                "--frame",
+                "v1",
+                "--code",
+                code,
+                "--payload-len",
+                "64",
+            ]);
+            let out = String::from_utf8_lossy(&d.stdout).to_string();
+            let frame = out
+                .lines()
+                .find(|l| l.contains("\"event\":\"frame\""))
+                .unwrap();
+            assert_eq!(field(frame, "crc_ok"), ok, "{m} {code}");
+        }
+        let s = run(&[
+            "waveform",
+            "rx-stream",
+            "--mod",
+            m,
+            "--in",
+            &format!("{base}.sigmf-data"),
+            "--frame",
+            "v1",
+            "--block",
+            "2048",
+        ]);
+        let out = String::from_utf8_lossy(&s.stdout).to_string();
+        let done = out.lines().last().unwrap();
+        assert_eq!(field(done, "crc_ok_frames"), "1", "{m}: {out}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn waveform_per_and_ber_with_the_light_code() {
+    let o = run(&[
+        "waveform",
+        "per",
+        "--mod",
+        "bpsk",
+        "--ebn0-db",
+        "5,9",
+        "--frames",
+        "20",
+        "--frame",
+        "v1",
+        "--code",
+        "light",
+        "--seed",
+        "3",
+    ]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let out = String::from_utf8_lossy(&o.stdout).to_string();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    for l in &lines {
+        assert_eq!(field(l, "event"), "per");
+        assert_eq!(field(l, "code"), "light");
+        assert_eq!(field(l, "frames"), "20");
+        assert_eq!(field(l, "frame_symbols"), "1299");
+        let loss: f64 = field(l, "packet_loss").parse().unwrap();
+        assert!(loss <= 0.1, "{l}");
+    }
+    let b = run(&[
+        "waveform",
+        "ber",
+        "--mod",
+        "qpsk",
+        "--ebn0-db",
+        "4",
+        "--bits",
+        "5120",
+        "--frame",
+        "v1",
+        "--code",
+        "light",
+    ]);
+    assert!(b.status.success(), "{}", String::from_utf8_lossy(&b.stderr));
+    let l = String::from_utf8_lossy(&b.stdout).to_string();
+    assert_eq!(field(&l, "code"), "light");
+    assert_eq!(field(&l, "theory"), "null");
+    assert_eq!(field(&l, "z"), "null");
+    // W0 has no payload_code
+    let w = run(&[
+        "waveform", "iq", "--mod", "bpsk", "--out", "/tmp/x", "--code", "light",
+    ]);
+    assert!(!w.status.success());
+    assert!(String::from_utf8_lossy(&w.stderr).contains("--frame v1"));
+}
+
+#[test]
 fn waveform_bad_arguments_fail_cleanly() {
     for args in [
         vec![

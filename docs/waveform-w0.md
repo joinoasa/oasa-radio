@@ -108,7 +108,7 @@ QPSK's 9 % is within its sampling error (z = +1.8; one sigma is 5 % at 380 expec
 - Fading, multipath, interference, IQ imbalance, a DC offset. (The Pluto has a DC spike; see W1 below.)
 - A continuous stream: done, see "Streaming receiver" below. `demodulate` itself still takes one buffer and searches all of it.
 - Coherent 2-FSK. The theory function exists (`ber_bfsk_coherent`) but the receiver is noncoherent.
-- No FEC on the payload. W2. The W0 header (length and complement, unprotected) loses a frame to one flipped bit: found-frame rate 27 % at 0 dB and 82 % at 4 dB. [Frame format v1](frame-v1.md) fixes that; W0 stays the default.
+- No FEC on the W0 payload. Frame v1 has light error correction on the body ([fec-light.md](fec-light.md), `--code light`). The W0 header (length and complement, unprotected) loses a frame to one flipped bit: found-frame rate 27 % at 0 dB and 82 % at 4 dB. [Frame format v1](frame-v1.md) fixes that; W0 stays the default.
 
 ## Energy and SNR conventions
 
@@ -238,7 +238,7 @@ Not done; listed so W1 starts from facts.
 4. **Transmit on cable only**, with the 60 dB rule of the lab, and gain set so the receiver does not clip. The amplitude is estimated per frame, but a clipped signal is not recoverable.
 5. **Sample rate and gain settings recorded** in the SigMF file. `oasa-radio waveform iq` already writes `core:datatype`, `core:sample_rate`, `core:frequency` and `core:datetime`; it does not write `core:sha512` (the lab's own writer adds it when a recording is registered with a device).
 6. **Measure on the bench** what the simulation cannot say: real noise figure and bandwidth, so Eb/N0 at the receiver is known from a power measurement, then repeat this BER table over cable with an attenuator.
-7. Then **W2**: FEC and OFDM. The payload has no FEC yet; whitening and CRC are in place. The header is the exception: [frame format v1](frame-v1.md) protects it with a convolutional code (`fec.rs`, reusable for the payload), because the W0 header loses frames below about 4 dB.
+7. Then **W2**: FEC and OFDM. The light FEC tier is done for frame v1 ([fec-light.md](fec-light.md)); whitening and CRC are in place. The header is the exception: [frame format v1](frame-v1.md) protects it with a convolutional code (`fec.rs`, reusable for the payload), because the W0 header loses frames below about 4 dB.
 
 ## Notes on sources and what is unverified
 

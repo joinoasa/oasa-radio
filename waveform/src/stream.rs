@@ -13,7 +13,6 @@
 //! Cost: every block is searched together with the overlap kept from before, about one longest frame.
 //! Blocks of a few frame lengths or more keep that overhead small.
 
-use crate::frame::MAX_PAYLOAD;
 use crate::iq::Complex32;
 use crate::modem::{Modem, RxConfig, RxFrame};
 
@@ -69,10 +68,10 @@ impl StreamReceiver {
         self.buf.len()
     }
 
-    /// The longest frame this receiver can be given, in samples.
+    /// The longest frame this receiver can be given, in samples (for v1 without a known length: a
+    /// 255-byte frame with the light code, since any header may announce one).
     fn longest(&self) -> usize {
-        let n = self.rx.expected_len.unwrap_or(MAX_PAYLOAD).min(MAX_PAYLOAD);
-        self.modem.frame_samples(n) + margin(&self.modem)
+        self.modem.longest_frame_samples(&self.rx) + margin(&self.modem)
     }
 
     /// Add a block of samples; returns the frames now decided, in order, with `start` and `end` counted
