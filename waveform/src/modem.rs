@@ -167,6 +167,14 @@ pub struct RxConfig {
     /// two symbol rates either way). 0 turns it off. It is capped at half the sample rate
     /// (`sps / 2` cycles per symbol). See [`Modem::coarse_metric`] for the method and its cost.
     pub cfo_search: f32,
+    /// v1 without `expected_len`: frames whose header announces more payload bytes than this are
+    /// rejected at the header, and the receiver needs (and keeps) no more of the buffer than a frame
+    /// of this length takes. A radio sets it to its MTU. `None`: 255.
+    pub max_len: Option<usize>,
+    /// v1 without `expected_len`: accept only frames with this body code; any other is rejected at
+    /// the header, and the longest frame is counted with this code. A radio that sends one code sets
+    /// it. `None`: any code a v1 header can announce.
+    pub only_code: Option<PayloadCode>,
 }
 
 impl Default for RxConfig {
@@ -179,6 +187,8 @@ impl Default for RxConfig {
             cfo_bins: 0,
             cfo_step: 0.005,
             cfo_search: 0.0,
+            max_len: None,
+            only_code: None,
         }
     }
 }
@@ -201,6 +211,9 @@ pub struct CoarseSearch {
     /// probability per position stays what it is without the search.
     pub threshold: f32,
     fft: crate::fft::Fft,
+    /// The reference, real and imaginary parts apart (for the vectorized products).
+    ref_re: Vec<f32>,
+    ref_im: Vec<f32>,
 }
 
 /// The largest offset searched, as a fraction of the sample rate.
@@ -285,17 +298,17 @@ impl RxReport {
 
 /// Counts and spans kept while scanning a buffer.
 #[derive(Default)]
-struct Tally {
-    rep: RxReport,
+pub(crate) struct Tally {
+    pub(crate) rep: RxReport,
     /// Candidates before this sample are not tried: a frame is surely there.
-    busy_until: usize,
+    pub(crate) busy_until: usize,
     /// Rejections of candidates before this sample count as `inside_frame`.
-    span_until: usize,
+    pub(crate) span_until: usize,
 }
 
 impl Tally {
     /// A candidate inside a sure frame: counted, not tried.
-    fn skipped(&mut self) {
+    pub(crate) fn skipped(&mut self) {
         self.rep.preambles += 1;
         self.rep.inside_frame += 1;
     }
@@ -303,7 +316,7 @@ impl Tally {
 
 /// Why `decode_at` gave no frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reject {
+pub(crate) enum Reject {
     Sync,
     Header,
     TooShort,
@@ -420,15 +433,23 @@ impl Modem {
     pub fn longest_frame_samples(&self, rx: &RxConfig) -> usize {
         match rx.expected_len {
             Some(n) => self.frame_samples(n.min(MAX_PAYLOAD)),
-            None => self.frame_samples_coded(MAX_PAYLOAD, self.longest_code()),
+            None => self.frame_samples_coded(self.longest_len(rx), self.longest_code(rx)),
         }
     }
 
-    /// The code of the longest frame a header can announce: light for v1, none for W0.
-    fn longest_code(&self) -> PayloadCode {
+    /// The code of the longest frame a header can announce: light for v1 (or `only_code`), none for W0.
+    fn longest_code(&self, rx: &RxConfig) -> PayloadCode {
         match self.cfg.frame {
             FrameFormat::W0 => PayloadCode::None,
-            FrameFormat::V1 => PayloadCode::Light,
+            FrameFormat::V1 => rx.only_code.unwrap_or(PayloadCode::Light),
+        }
+    }
+
+    /// The most payload bytes a header may announce: 255, or `max_len` for v1.
+    fn longest_len(&self, rx: &RxConfig) -> usize {
+        match self.cfg.frame {
+            FrameFormat::W0 => MAX_PAYLOAD,
+            FrameFormat::V1 => rx.max_len.unwrap_or(MAX_PAYLOAD).clamp(1, MAX_PAYLOAD),
         }
     }
 
@@ -629,7 +650,7 @@ impl Modem {
 
     /// Count the outcome of one candidate at absolute sample `tau`, update the spans, and return
     /// the frame if there is one.
-    fn record(
+    pub(crate) fn record(
         &self,
         res: Result<RxFrame, Reject>,
         tau: usize,
@@ -762,6 +783,8 @@ impl Modem {
             cells,
             threshold,
             fft: crate::fft::Fft::new(fft_len),
+            ref_re: self.refw.iter().map(|v| v.re).collect(),
+            ref_im: self.refw.iter().map(|v| v.im).collect(),
         })
     }
 
@@ -783,7 +806,7 @@ impl Modem {
         }
     }
 
-    fn coarse_metric_with(&self, r: &[Complex32], cs: &CoarseSearch) -> Vec<(f32, f32)> {
+    pub(crate) fn coarse_metric_with(&self, r: &[Complex32], cs: &CoarseSearch) -> Vec<(f32, f32)> {
         let m = self.refw.len();
         if r.len() < m {
             return Vec::new();
@@ -803,20 +826,29 @@ impl Modem {
         let one = |range: std::ops::Range<usize>| -> Vec<(f32, f32)> {
             let mut buf = vec![Complex32::ZERO; n];
             let mut out = Vec::with_capacity(range.len());
+            // window * conj(reference), every product on its own (so the loop vectorizes), then the
+            // chunk sums; one running sum per chunk would be bound by the latency of its additions
+            let (mut pr, mut pi) = (vec![0.0f32; m], vec![0.0f32; m]);
+            // this range's samples with real and imaginary parts apart: the products then vectorize
+            let lo = range.start * cs.step;
+            let hi = ((range.end.max(1) - 1) * cs.step + m).min(r.len()).max(lo);
+            let xr: Vec<f32> = r[lo..hi].iter().map(|v| v.re).collect();
+            let xi: Vec<f32> = r[lo..hi].iter().map(|v| v.im).collect();
+            let (br, bi) = (&cs.ref_re[..m], &cs.ref_im[..m]);
             for tau in range.map(|i| i * cs.step) {
                 buf.fill(Complex32::ZERO);
-                let win = &r[tau..tau + m];
-                for (slot, (w, p)) in buf
+                let (wr, wi) = (&xr[tau - lo..tau - lo + m], &xi[tau - lo..tau - lo + m]);
+                for k in 0..m {
+                    // window * conj(reference)
+                    pr[k] = wr[k] * br[k] + wi[k] * bi[k];
+                    pi[k] = wi[k] * br[k] - wr[k] * bi[k];
+                }
+                for ((slot, cr), ci) in buf
                     .iter_mut()
-                    .zip(win.chunks(cs.chunk).zip(self.refw.chunks(cs.chunk)))
+                    .zip(pr.chunks(cs.chunk))
+                    .zip(pi.chunks(cs.chunk))
                 {
-                    let (mut cr, mut ci) = (0.0f32, 0.0f32);
-                    for (a, b) in w.iter().zip(p) {
-                        // a * conj(b)
-                        cr += a.re * b.re + a.im * b.im;
-                        ci += a.im * b.re - a.re * b.im;
-                    }
-                    *slot = Complex32::new(cr, ci);
+                    *slot = Complex32::new(cr.iter().sum(), ci.iter().sum());
                 }
                 cs.fft.forward(&mut buf);
                 let (mut best, mut best_k) = (-1.0f32, 0isize);
@@ -861,9 +893,7 @@ impl Modem {
         if cm.is_empty() {
             return Vec::new();
         }
-        let sps = self.cfg.sps;
         let m = self.refw.len();
-        let last = r.len() - m;
         // A candidate must be the strongest within one reference length. Taking the best of many
         // frequencies lifts the time side peaks too (for 2-FSK the preamble one symbol off still
         // matches well), and a one-symbol window lets them through as false starts. Real frames
@@ -892,39 +922,63 @@ impl Modem {
                 tally.skipped();
                 continue;
             }
-            let lo = tau_c.saturating_sub(sps + cs.step).max(tally.busy_until);
-            let hi = (tau_c + sps + cs.step).min(last);
-            let end = (hi + frame_len + 1).min(r.len());
-            let w = f as f64 / sps as f64;
-            let d: Vec<Complex32> = r[lo..end]
-                .iter()
-                .enumerate()
-                .map(|(j, s)| {
-                    let turns = (w * (lo + j) as f64).rem_euclid(1.0);
-                    let (sn, co) = (-2.0 * PI * turns).sin_cos();
-                    *s * Complex32::new(co as f32, sn as f32)
-                })
-                .collect();
-            let fm = self.metric(&d[..hi - lo + m], &fine);
-            let Some(j) = (0..fm.len()).max_by(|&a, &b| fm[a].total_cmp(&fm[b]).then(b.cmp(&a)))
+            let Some((res, tau, _)) =
+                self.coarse_candidate(r, tau_c, f, &cs, &fine, frame_len, tally.busy_until)
             else {
                 continue;
             };
-            let mu = parabola_peak(&fm, j);
-            let res = self.decode_at(&d, j, mu, fm[j], &fine).map(|mut fr| {
-                fr.start += lo;
-                fr.end += lo;
-                fr.cfo_cycles_per_symbol += f;
-                let turns = (w * fr.start as f64).rem_euclid(1.0);
-                let ph = fr.phase_rad as f64 + 2.0 * PI * turns;
-                fr.phase_rad = ph.sin().atan2(ph.cos()) as f32;
-                fr
-            });
-            if let Some(fr) = self.record(res, lo + j, rx, tally) {
+            if let Some(fr) = self.record(res, tau, rx, tally) {
                 out.push(fr);
             }
         }
         out
+    }
+
+    /// One coarse-search candidate at `tau_c` with frequency `f` (cycles per symbol): turn a small
+    /// window of `r` back by `f`, find the fine peak and decode there. Returns the decode, the
+    /// sample the candidate counts at, and whether `r` held all the samples the longest frame
+    /// could need (if not, `TooShort` may only mean "wait for more"). `None`: no fine peak.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn coarse_candidate(
+        &self,
+        r: &[Complex32],
+        tau_c: usize,
+        f: f32,
+        cs: &CoarseSearch,
+        fine: &RxConfig,
+        frame_len: usize,
+        busy_until: usize,
+    ) -> Option<(Result<RxFrame, Reject>, usize, bool)> {
+        let sps = self.cfg.sps;
+        let m = self.refw.len();
+        let last = r.len().checked_sub(m)?;
+        let lo = tau_c.saturating_sub(sps + cs.step).max(busy_until);
+        let hi = (tau_c + sps + cs.step).min(last);
+        let full = hi + frame_len < r.len();
+        let end = (hi + frame_len + 1).min(r.len());
+        let w = f as f64 / sps as f64;
+        let d: Vec<Complex32> = r[lo..end]
+            .iter()
+            .enumerate()
+            .map(|(j, s)| {
+                let turns = (w * (lo + j) as f64).rem_euclid(1.0);
+                let (sn, co) = (-2.0 * PI * turns).sin_cos();
+                *s * Complex32::new(co as f32, sn as f32)
+            })
+            .collect();
+        let fm = self.metric(&d[..hi - lo + m], fine);
+        let j = (0..fm.len()).max_by(|&a, &b| fm[a].total_cmp(&fm[b]).then(b.cmp(&a)))?;
+        let mu = parabola_peak(&fm, j);
+        let res = self.decode_at(&d, j, mu, fm[j], fine).map(|mut fr| {
+            fr.start += lo;
+            fr.end += lo;
+            fr.cfo_cycles_per_symbol += f;
+            let turns = (w * fr.start as f64).rem_euclid(1.0);
+            let ph = fr.phase_rad as f64 + 2.0 * PI * turns;
+            fr.phase_rad = ph.sin().atan2(ph.cos()) as f32;
+            fr
+        });
+        Some((res, lo + j, full))
     }
 
     /// The known waveform of preamble, sync word and v1 header `h`, up to where the body's first
@@ -1035,7 +1089,7 @@ impl Modem {
         let body_start = n_ref + self.header_syms();
         let max_bits = match rx.expected_len {
             Some(n) => self.body_len_bits(n, self.cfg.code),
-            None => self.body_len_bits(MAX_PAYLOAD, self.longest_code()),
+            None => self.body_len_bits(self.longest_len(rx), self.longest_code(rx)),
         };
         let want_syms = body_start + max_bits / bps;
         let avail = r.len() - tau;
@@ -1099,7 +1153,11 @@ impl Modem {
                 header = parse_header_v1(&soft);
                 match (rx.expected_len, &header) {
                     (Some(n), _) => n,
-                    (None, Some(h)) if h.acceptable(self.cfg.modulation.code()) => {
+                    (None, Some(h))
+                        if h.acceptable(self.cfg.modulation.code())
+                            && h.length as usize <= self.longest_len(rx)
+                            && rx.only_code.is_none_or(|c| c.code() == h.payload_code) =>
+                    {
                         h.length as usize
                     }
                     _ => return Err(Reject::Header),

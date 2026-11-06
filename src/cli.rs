@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::adapters::{serial, udp, SerialConfig, SerialRadio, UdpRadio};
+use crate::adapters::{sdr, serial, udp, SdrConfig, SdrRadio, SerialConfig, SerialRadio, UdpRadio};
 use crate::bridge::BridgeConfig;
 use crate::framing;
 use crate::radio::{Radio, RadioError};
@@ -42,7 +42,34 @@ RADIOS:
   lora    LoRa through the OASA modem firmware (firmware/heltec-v3): use `--radio serial
           --baud 115200 --mtu 255` for packets and `oasa-radio lora` for settings.
           Other LoRa boards (RNode): planned.
-  sdr     Planned. Not built yet.
+  sdr     OASA's own waveform (frame v1) on a software-defined radio, as two continuous IQ
+          streams (cf32, little endian) that another program moves to and from the radio,
+          for example UHD's tx_samples_from_file and rx_samples_to_file through two FIFOs.
+          Between frames the TX stream carries zeros, so it never stops. Both streams sit at
+          a digital IF; the receiver shifts back, follows the clock offset, decimates and
+          decodes as samples arrive. See docs/sdr-adapter.md.
+            --tx PATH            TX stream (the radio tool reads it)
+            --rx PATH            RX stream (the radio tool writes it)
+            --rx-format cf32|ci16  default cf32
+            --mod bpsk|qpsk      default qpsk
+            --code none|light    default none (light: K=7 rate 1/2, docs/fec-light.md)
+            --sample-rate S/s    default 1000000
+            --symbol-rate BAUD   default 125000 (sample rate / symbol rate: whole, 4 or more)
+            --if-hz HZ           default 250000
+            --cfo-hz HZ          starting estimate of the received offset, default 0
+            --track-cfo on|off   follow the offset from good frames, default on
+            --cfo-search CYC     receiver frequency search, cycles per symbol, above 0, default 0.03
+            --decimate 1|2       default 2
+            --block N            samples per receiver pass after decimation, default 512 (1 ms)
+            --tx-peak A          frame peak amplitude, full scale 1, default 0.5
+            --tx-mode stream|burst  default stream. burst: one record per frame (u32 LE
+                                 sample count, then cf32), nothing between frames; the radio
+                                 tool sends each as a timed burst (lowest delay)
+            --tx-lead-ms N       stream: most the TX stream runs ahead of the clock, default 20
+            --mtu BYTES          default 200, at most 255. Give oasa-link the same --mtu.
+            --sdr-log PATH       JSON lines: frames, offsets, timings (sizes only)
+            --rx-record PATH     the received baseband after the shift (cf32), for the lab
+            --rx-record-seconds  how much of it, default 60
 
 Prints one JSON line per event: start, drop, drops_suppressed, error. At most 10 drop lines
 a second are printed; a drops_suppressed line counts the rest. On exit prints
@@ -51,7 +78,7 @@ a second are printed; a drops_suppressed line counts the rest. On exit prints
 Encryption is not done here. Run oasa-link on both ends; the bridge only moves its packets.
 ";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RadioSpec {
     Udp {
         bind: SocketAddr,
@@ -59,6 +86,7 @@ pub enum RadioSpec {
         mtu: usize,
     },
     Serial(SerialSpec),
+    Sdr(SdrConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +109,7 @@ impl RadioSpec {
                 baud: s.baud,
                 mtu: s.mtu,
             })?)),
+            RadioSpec::Sdr(c) => Ok(Box::new(SdrRadio::open(c.clone())?)),
         }
     }
 }
@@ -312,6 +341,90 @@ fn number(k: &str, v: Option<String>, default: u64, min: u64, max: u64) -> R<u64
     }
 }
 
+fn real(k: &str, v: Option<String>, default: f64) -> R<f64> {
+    match v {
+        None => Ok(default),
+        Some(v) => v
+            .parse::<f64>()
+            .ok()
+            .filter(|x| x.is_finite())
+            .ok_or(format!("--{k} must be a number")),
+    }
+}
+
+fn sdr_spec(named: &mut BTreeMap<String, String>) -> R<SdrConfig> {
+    let tx = named
+        .remove("tx")
+        .ok_or("missing --tx (the TX stream: a FIFO the radio tool reads)")?;
+    let rx = named
+        .remove("rx")
+        .ok_or("missing --rx (the RX stream: a FIFO the radio tool writes)")?;
+    let mut c = SdrConfig::new(tx.into(), rx.into());
+    if let Some(v) = named.remove("rx-format") {
+        c.rx_format = sdr::IqFormat::parse(&v).ok_or("--rx-format must be cf32 or ci16")?;
+    }
+    if let Some(v) = named.remove("mod") {
+        c.modulation = oasa_waveform::Modulation::parse(&v)
+            .filter(|m| *m != oasa_waveform::Modulation::Fsk2)
+            .ok_or("--mod must be bpsk or qpsk")?;
+    }
+    if let Some(v) = named.remove("code") {
+        c.code =
+            oasa_waveform::frame::PayloadCode::parse(&v).ok_or("--code must be none or light")?;
+    }
+    c.sample_rate = real("sample-rate", named.remove("sample-rate"), c.sample_rate)?;
+    c.symbol_rate = real("symbol-rate", named.remove("symbol-rate"), c.symbol_rate)?;
+    c.if_hz = real("if-hz", named.remove("if-hz"), c.if_hz)?;
+    c.cfo_hz = real("cfo-hz", named.remove("cfo-hz"), c.cfo_hz)?;
+    c.cfo_search = real(
+        "cfo-search",
+        named.remove("cfo-search"),
+        f64::from(c.cfo_search),
+    )? as f32;
+    c.tx_peak = real("tx-peak", named.remove("tx-peak"), f64::from(c.tx_peak))? as f32;
+    c.rx_record_seconds = real(
+        "rx-record-seconds",
+        named.remove("rx-record-seconds"),
+        c.rx_record_seconds,
+    )?;
+    if let Some(v) = named.remove("track-cfo") {
+        c.track_cfo = match v.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => return Err("--track-cfo must be on or off".into()),
+        };
+    }
+    c.decimate = number(
+        "decimate",
+        named.remove("decimate"),
+        c.decimate as u64,
+        1,
+        2,
+    )? as usize;
+    c.block = number("block", named.remove("block"), c.block as u64, 64, 1 << 20)? as usize;
+    c.mtu = number(
+        "mtu",
+        named.remove("mtu"),
+        c.mtu as u64,
+        1,
+        sdr::MAX_MTU as u64,
+    )? as usize;
+    c.tx_lead = Duration::from_millis(number(
+        "tx-lead-ms",
+        named.remove("tx-lead-ms"),
+        c.tx_lead.as_millis() as u64,
+        1,
+        1000,
+    )?);
+    if let Some(v) = named.remove("tx-mode") {
+        c.tx_mode = sdr::TxMode::parse(&v).ok_or("--tx-mode must be stream or burst")?;
+    }
+    c.log = named.remove("sdr-log").map(Into::into);
+    c.rx_record = named.remove("rx-record").map(Into::into);
+    c.check()?;
+    Ok(c)
+}
+
 /// Take this radio's options out of `named`.
 fn radio_spec(kind: &str, named: &mut BTreeMap<String, String>) -> R<RadioSpec> {
     match kind {
@@ -364,10 +477,8 @@ fn radio_spec(kind: &str, named: &mut BTreeMap<String, String>) -> R<RadioSpec> 
              --baud 115200 --mtu 255 (settings: oasa-radio lora). RNode support is planned"
                 .to_string(),
         ),
-        "sdr" => Err(format!(
-            "radio {kind:?} is planned and not built yet; see the README (Adapters)"
-        )),
-        other => Err(format!("unknown radio {other:?}; use udp or serial")),
+        "sdr" => sdr_spec(named).map(RadioSpec::Sdr),
+        other => Err(format!("unknown radio {other:?}; use udp, serial or sdr")),
     }
 }
 

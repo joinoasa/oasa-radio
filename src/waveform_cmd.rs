@@ -44,6 +44,8 @@ WAVEFORM (W0, simulation):
                              [--payload-len N] [--sync-max-errors 3]
   oasa-radio waveform rx-stream --in -|FILE --mod bpsk|qpsk|fsk2 [--block 65536]
                                 [same receiver options as decode]
+  oasa-radio waveform cable --in FILE --out FILE [--gain-db 0] [--noise-dbfs -60] [--cfo-hz 0]
+                            [--sample-rate 1000000] [--seed 1]
   oasa-radio waveform df --in1 FILE --in2 FILE [--format ci16|cf32] [--block N]
                          [--burst-db 10] [--win 256] [--min-len 4096] [--skip 0]
                          [--cal-deg 0] [--spacing-wl D]
@@ -81,6 +83,10 @@ WAVEFORM (W0, simulation):
           decode on the whole stream. Ends with stream_done (samples, frames, crc_ok_frames,
           trailing_bytes: an incomplete last sample, ignored). Memory stays about two frames.
 
+  cable   A simulated cable between two `oasa-radio bridge --radio sdr` streams: reads cf32 from
+          --in (one radio's --tx FIFO), turns it by --cfo-hz, scales it by --gain-db, adds
+          receiver noise of --noise-dbfs (power per sample, full scale 1) and writes it to --out
+          (the other radio's --rx FIFO), until --in ends. For tests and the lab's simulated bench.
   df      Two channels recorded together (one multi-channel stream; raw files, no SigMF wrapper,
           default ci16 as UHD's --type short writes). Measures r = mean(x2 conj(x1)) per burst (runs
           --burst-db over the noise floor in --win sample windows, at least --min-len long) or, with
@@ -181,6 +187,12 @@ pub enum WaveformCommand {
     /// cf32_le file).
     RxStream(DecodeArgs, usize),
     Df(DfArgs),
+    /// A simulated cable between two `sdr` radios' streams (src/cable.rs).
+    Cable {
+        input: String,
+        output: String,
+        cfg: crate::cable::CableConfig,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -205,11 +217,11 @@ type R<T> = Result<T, String>;
 pub fn parse(args: &[String]) -> R<WaveformCommand> {
     let sub = match args.first().map(String::as_str) {
         None | Some("-h" | "--help" | "help") => return Ok(WaveformCommand::Help),
-        Some(s @ ("ber" | "per" | "iq" | "decode" | "rx-stream" | "df")) => s,
+        Some(s @ ("ber" | "per" | "iq" | "decode" | "rx-stream" | "df" | "cable")) => s,
         Some(other) => {
             return Err(format!(
-                "unknown waveform command {other:?}; use ber, per, iq, decode, rx-stream or df"
-            ))
+            "unknown waveform command {other:?}; use ber, per, iq, decode, rx-stream, df or cable"
+        ))
         }
     };
     let mut named: BTreeMap<String, String> = BTreeMap::new();
@@ -234,6 +246,9 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
     }
     if sub == "df" {
         return parse_df(named);
+    }
+    if sub == "cable" {
+        return parse_cable(named);
     }
     let modulation = {
         let v = named.remove("mod").ok_or("missing --mod")?;
@@ -423,6 +438,60 @@ fn parse_df(mut named: BTreeMap<String, String>) -> R<WaveformCommand> {
     Ok(WaveformCommand::Df(a))
 }
 
+fn parse_cable(mut named: BTreeMap<String, String>) -> R<WaveformCommand> {
+    let input = named.remove("in").ok_or("missing --in")?;
+    let output = named.remove("out").ok_or("missing --out")?;
+    let d = crate::cable::CableConfig::default();
+    let cfg = crate::cable::CableConfig {
+        gain_db: opt_float("gain-db", named.remove("gain-db"), d.gain_db, -200.0, 60.0)?,
+        noise_dbfs: opt_float(
+            "noise-dbfs",
+            named.remove("noise-dbfs"),
+            d.noise_dbfs,
+            -200.0,
+            0.0,
+        )?,
+        cfo_hz: opt_float("cfo-hz", named.remove("cfo-hz"), d.cfo_hz, -1e6, 1e6)?,
+        sample_rate: opt_float(
+            "sample-rate",
+            named.remove("sample-rate"),
+            d.sample_rate,
+            1.0,
+            1e9,
+        )?,
+        seed: int("seed", named.remove("seed"), d.seed, 0, u64::MAX)?,
+    };
+    if let Some(k) = named.keys().next() {
+        return Err(format!("unknown option --{k} for cable"));
+    }
+    Ok(WaveformCommand::Cable { input, output, cfg })
+}
+
+fn run_cable(
+    input: &str,
+    output: &str,
+    cfg: &crate::cable::CableConfig,
+    out: &mut dyn Write,
+) -> R<()> {
+    let mut i = std::fs::File::open(input).map_err(|e| format!("{input}: {e}"))?;
+    let mut o = std::fs::OpenOptions::new()
+        .write(true)
+        .open(output)
+        .map_err(|e| format!("{output}: {e}"))?;
+    let n = match crate::cable::run(cfg, &mut i, &mut o) {
+        Ok(n) => n,
+        // the receiving side went away: the end of the run, not an error
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => 0,
+        Err(e) => return Err(format!("cable: {e}")),
+    };
+    writeln!(
+        out,
+        "{{\"ts\":\"{}\",\"event\":\"cable_done\",\"samples\":{n}}}",
+        now()
+    )
+    .map_err(io)
+}
+
 fn int(k: &str, v: Option<String>, default: u64, min: u64, max: u64) -> R<u64> {
     match v {
         None => Ok(default),
@@ -487,6 +556,7 @@ pub fn run(cmd: &WaveformCommand, out: &mut dyn Write) -> R<()> {
         WaveformCommand::Decode(a) => run_decode(a, out),
         WaveformCommand::RxStream(a, block) => run_rx_stream(a, *block, out),
         WaveformCommand::Df(a) => run_df(a, out),
+        WaveformCommand::Cable { input, output, cfg } => run_cable(input, output, cfg, out),
     }
 }
 

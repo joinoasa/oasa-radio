@@ -100,4 +100,10 @@ pub trait Radio {
 
     /// Counts so far.
     fn counters(&self) -> &Counters;
+
+    /// How long the bridge waits on `recv` before it looks for packets from oasa-link again: the
+    /// most a packet from oasa-link can wait before `send`. 2 ms unless the radio is faster than that.
+    fn poll_interval(&self) -> Duration {
+        Duration::from_millis(2)
+    }
 }
