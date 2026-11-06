@@ -52,6 +52,8 @@ At 250 kbaud and 1 MS/s the IF must come down to 175 kHz: at 250 kHz the signal'
 
 In the fourth row, 4.1 ms is the frame on air, 2 to 3 ms the lead, 0.7 ms the decision; the receive side of UHD adds 0.3 ms (E310) and 1.2 ms (B200). With oasa-link on both ends: handshake 38 to 54 ms, 600 of 600 messages, one-way 10 to 12 ms median, 17 ms max.
 
+**Detector step.** The coarse search tests a position every quarter symbol by default (every sample at 4 samples per symbol), about 95 % of the receiver's CPU. `--coarse-step N` tests every N samples instead; the fine search around each candidate still finds the timing to the sample. At 1 MS/s and 250 kbaud (4 samples per symbol), one symbol (`--coarse-step 4`) costs 57 % less (327 to 142 ms of CPU per second of signal on a PC) and finds the same frames: 32-byte frames at random offsets, 400 per point, steps 1, 2 and 4 within 4 frames of each other from 2 to 8 dB Eb/N0 (`cargo test --release --lib detection_vs_coarse_step -- --ignored --nocapture`). Default unchanged.
+
 The old receiver searched its whole window (one longest frame) on every block, about 1.5 ms of CPU per pass: with small blocks it fell behind and the delay grew. `LiveReceiver` costs under 1 ms per pass at 1 ms blocks.
 
 ## Bench results, first runs (2026-11-05, not yet a counted lab run)
