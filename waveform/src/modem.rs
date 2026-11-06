@@ -295,17 +295,17 @@ impl RxReport {
 
 /// Counts and spans kept while scanning a buffer.
 #[derive(Default)]
-struct Tally {
-    rep: RxReport,
+pub(crate) struct Tally {
+    pub(crate) rep: RxReport,
     /// Candidates before this sample are not tried: a frame is surely there.
-    busy_until: usize,
+    pub(crate) busy_until: usize,
     /// Rejections of candidates before this sample count as `inside_frame`.
-    span_until: usize,
+    pub(crate) span_until: usize,
 }
 
 impl Tally {
     /// A candidate inside a sure frame: counted, not tried.
-    fn skipped(&mut self) {
+    pub(crate) fn skipped(&mut self) {
         self.rep.preambles += 1;
         self.rep.inside_frame += 1;
     }
@@ -313,7 +313,7 @@ impl Tally {
 
 /// Why `decode_at` gave no frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reject {
+pub(crate) enum Reject {
     Sync,
     Header,
     TooShort,
@@ -647,7 +647,7 @@ impl Modem {
 
     /// Count the outcome of one candidate at absolute sample `tau`, update the spans, and return
     /// the frame if there is one.
-    fn record(
+    pub(crate) fn record(
         &self,
         res: Result<RxFrame, Reject>,
         tau: usize,
@@ -801,7 +801,7 @@ impl Modem {
         }
     }
 
-    fn coarse_metric_with(&self, r: &[Complex32], cs: &CoarseSearch) -> Vec<(f32, f32)> {
+    pub(crate) fn coarse_metric_with(&self, r: &[Complex32], cs: &CoarseSearch) -> Vec<(f32, f32)> {
         let m = self.refw.len();
         if r.len() < m {
             return Vec::new();
@@ -879,9 +879,7 @@ impl Modem {
         if cm.is_empty() {
             return Vec::new();
         }
-        let sps = self.cfg.sps;
         let m = self.refw.len();
-        let last = r.len() - m;
         // A candidate must be the strongest within one reference length. Taking the best of many
         // frequencies lifts the time side peaks too (for 2-FSK the preamble one symbol off still
         // matches well), and a one-symbol window lets them through as false starts. Real frames
@@ -910,39 +908,63 @@ impl Modem {
                 tally.skipped();
                 continue;
             }
-            let lo = tau_c.saturating_sub(sps + cs.step).max(tally.busy_until);
-            let hi = (tau_c + sps + cs.step).min(last);
-            let end = (hi + frame_len + 1).min(r.len());
-            let w = f as f64 / sps as f64;
-            let d: Vec<Complex32> = r[lo..end]
-                .iter()
-                .enumerate()
-                .map(|(j, s)| {
-                    let turns = (w * (lo + j) as f64).rem_euclid(1.0);
-                    let (sn, co) = (-2.0 * PI * turns).sin_cos();
-                    *s * Complex32::new(co as f32, sn as f32)
-                })
-                .collect();
-            let fm = self.metric(&d[..hi - lo + m], &fine);
-            let Some(j) = (0..fm.len()).max_by(|&a, &b| fm[a].total_cmp(&fm[b]).then(b.cmp(&a)))
+            let Some((res, tau, _)) =
+                self.coarse_candidate(r, tau_c, f, &cs, &fine, frame_len, tally.busy_until)
             else {
                 continue;
             };
-            let mu = parabola_peak(&fm, j);
-            let res = self.decode_at(&d, j, mu, fm[j], &fine).map(|mut fr| {
-                fr.start += lo;
-                fr.end += lo;
-                fr.cfo_cycles_per_symbol += f;
-                let turns = (w * fr.start as f64).rem_euclid(1.0);
-                let ph = fr.phase_rad as f64 + 2.0 * PI * turns;
-                fr.phase_rad = ph.sin().atan2(ph.cos()) as f32;
-                fr
-            });
-            if let Some(fr) = self.record(res, lo + j, rx, tally) {
+            if let Some(fr) = self.record(res, tau, rx, tally) {
                 out.push(fr);
             }
         }
         out
+    }
+
+    /// One coarse-search candidate at `tau_c` with frequency `f` (cycles per symbol): turn a small
+    /// window of `r` back by `f`, find the fine peak and decode there. Returns the decode, the
+    /// sample the candidate counts at, and whether `r` held all the samples the longest frame
+    /// could need (if not, `TooShort` may only mean "wait for more"). `None`: no fine peak.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn coarse_candidate(
+        &self,
+        r: &[Complex32],
+        tau_c: usize,
+        f: f32,
+        cs: &CoarseSearch,
+        fine: &RxConfig,
+        frame_len: usize,
+        busy_until: usize,
+    ) -> Option<(Result<RxFrame, Reject>, usize, bool)> {
+        let sps = self.cfg.sps;
+        let m = self.refw.len();
+        let last = r.len().checked_sub(m)?;
+        let lo = tau_c.saturating_sub(sps + cs.step).max(busy_until);
+        let hi = (tau_c + sps + cs.step).min(last);
+        let full = hi + frame_len < r.len();
+        let end = (hi + frame_len + 1).min(r.len());
+        let w = f as f64 / sps as f64;
+        let d: Vec<Complex32> = r[lo..end]
+            .iter()
+            .enumerate()
+            .map(|(j, s)| {
+                let turns = (w * (lo + j) as f64).rem_euclid(1.0);
+                let (sn, co) = (-2.0 * PI * turns).sin_cos();
+                *s * Complex32::new(co as f32, sn as f32)
+            })
+            .collect();
+        let fm = self.metric(&d[..hi - lo + m], fine);
+        let j = (0..fm.len()).max_by(|&a, &b| fm[a].total_cmp(&fm[b]).then(b.cmp(&a)))?;
+        let mu = parabola_peak(&fm, j);
+        let res = self.decode_at(&d, j, mu, fm[j], fine).map(|mut fr| {
+            fr.start += lo;
+            fr.end += lo;
+            fr.cfo_cycles_per_symbol += f;
+            let turns = (w * fr.start as f64).rem_euclid(1.0);
+            let ph = fr.phase_rad as f64 + 2.0 * PI * turns;
+            fr.phase_rad = ph.sin().atan2(ph.cos()) as f32;
+            fr
+        });
+        Some((res, lo + j, full))
     }
 
     /// The known waveform of preamble, sync word and v1 header `h`, up to where the body's first

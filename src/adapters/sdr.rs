@@ -5,7 +5,7 @@
 //!
 //! ```text
 //!   bridge --send--> modulate --> [TX stream, zeros between frames] --> tx FIFO --> radio --> air
-//!   bridge <--recv-- frames <-- StreamReceiver <-- decimate <-- mix <-- rx FIFO <-- radio <-- air
+//!   bridge <--recv-- frames <-- LiveReceiver   <-- decimate <-- mix <-- rx FIFO <-- radio <-- air
 //! ```
 //!
 //! The TX stream never stops: between frames it carries zeros, so the radio's transmit chain stays
@@ -18,7 +18,7 @@
 //! Both streams sit at a digital IF (`if_hz`, default 250 kHz at 1 MS/s): the DC offset and LO
 //! leakage of a direct-conversion radio then fall outside the signal (oasa-radio docs/waveform-w0.md,
 //! W1). The receive side shifts back by `if_hz` plus the tracked clock offset, low-pass filters,
-//! keeps every `decimate`-th sample and hands blocks to [`StreamReceiver`]. Every frame whose CRC
+//! keeps every `decimate`-th sample and hands blocks to [`LiveReceiver`], which releases each frame as soon as its own samples are in. Every frame whose CRC
 //! passes is one packet; a frame with a bad CRC is dropped and counted (`bad_frame`).
 //!
 //! The radio never looks inside a packet and never logs one. Its optional log (`log`) has sizes,
@@ -38,7 +38,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use oasa_waveform::frame::{FrameFormat, PayloadCode};
 use oasa_waveform::iq::{from_cf32_le, from_ci16_le};
-use oasa_waveform::stream::StreamReceiver;
+use oasa_waveform::stream::LiveReceiver;
 use oasa_waveform::{Complex32, Modem, ModemConfig, Modulation, RxConfig};
 
 use crate::log::{json_str, rfc3339};
@@ -60,6 +60,32 @@ const RX_READ: usize = 4096;
 const FIR_TAPS: usize = 31;
 /// How much of each frame's residual offset the tracker takes.
 const CFO_TRACK_GAIN: f64 = 0.3;
+
+/// How frames go to the radio tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxMode {
+    /// One continuous cf32 stream, zeros between frames, paced at most `tx_lead` ahead of the
+    /// clock. Works with any tool that plays a stream (UHD's `tx_samples_from_file`).
+    Stream,
+    /// One record per frame: a little-endian u32 sample count, then the samples (cf32). Nothing
+    /// between frames. The radio tool sends each record as one timed burst a little after its
+    /// radio's "now", so a frame never waits behind buffered zeros and an underflow cannot add
+    /// delay for good.
+    Burst,
+}
+
+impl TxMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "stream" => Some(TxMode::Stream),
+            "burst" => Some(TxMode::Burst),
+            _ => None,
+        }
+    }
+}
+
+/// Most samples in one burst record (the radio tool refuses more).
+pub const MAX_BURST_SAMPLES: usize = 1 << 20;
 
 /// Sample format of the receive stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +136,7 @@ pub struct SdrConfig {
     pub cfo_search: f32,
     /// Keep every n-th sample after the filter (1 or 2; the receiver needs 4 or more per symbol).
     pub decimate: usize,
-    /// Samples (after decimation) per receiver pass. Smaller: less delay, more work.
+    /// Samples (after decimation) per receiver pass. Smaller: less delay, a little more work.
     pub block: usize,
     /// Peak amplitude of a frame in the TX stream (full scale = 1).
     pub tx_peak: f32,
@@ -123,6 +149,7 @@ pub struct SdrConfig {
     /// The TX writer never runs further ahead of the wall clock than this. It is the most a packet
     /// waits behind zeros already written; too small and the radio runs dry (underflows).
     pub tx_lead: Duration,
+    pub tx_mode: TxMode,
 }
 
 impl SdrConfig {
@@ -141,13 +168,14 @@ impl SdrConfig {
             track_cfo: true,
             cfo_search: 0.03,
             decimate: 2,
-            block: 4096,
+            block: 512,
             tx_peak: 0.5,
             mtu: DEFAULT_MTU,
             log: None,
             rx_record: None,
             rx_record_seconds: 60.0,
             tx_lead: Duration::from_millis(20),
+            tx_mode: TxMode::Stream,
         }
     }
 
@@ -186,8 +214,11 @@ impl SdrConfig {
         if !self.cfo_hz.is_finite() || self.cfo_hz.abs() >= self.sample_rate / 8.0 {
             return Err("--cfo-hz is too large for the sample rate".into());
         }
-        if !(256..=1 << 20).contains(&self.block) {
-            return Err("--block must be 256 to 1048576".into());
+        if !(64..=1 << 20).contains(&self.block) {
+            return Err("--block must be 64 to 1048576".into());
+        }
+        if !(self.cfo_search > 0.0 && self.cfo_search.is_finite()) {
+            return Err("--cfo-search must be above 0 (the live receiver needs it)".into());
         }
         if !(Duration::from_millis(1)..=Duration::from_secs(1)).contains(&self.tx_lead) {
             return Err("--tx-lead-ms must be 1 to 1000".into());
@@ -289,11 +320,11 @@ impl SdrRadio {
             tx_underrun_ms: AtomicU64::new(0),
             log,
         });
-        let receiver = StreamReceiver::new(rx_modem, rx_cfg);
+        let receiver = LiveReceiver::new(rx_modem, rx_cfg).map_err(RadioError::Config)?;
         shared.event(
             "sdr_start",
             &format!(
-                ",\"mod\":\"{}\",\"code\":\"{}\",\"sample_rate\":{},\"symbol_rate\":{},\"if_hz\":{},\"cfo_hz\":{},\"decimate\":{},\"block\":{},\"mtu\":{},\"longest_frame_samples\":{}",
+                ",\"mod\":\"{}\",\"code\":\"{}\",\"sample_rate\":{},\"symbol_rate\":{},\"if_hz\":{},\"cfo_hz\":{},\"decimate\":{},\"block\":{},\"mtu\":{},\"tx_mode\":\"{}\",\"longest_frame_samples\":{}",
                 cfg.modulation.name(),
                 cfg.code.name(),
                 cfg.sample_rate,
@@ -303,6 +334,10 @@ impl SdrRadio {
                 cfg.decimate,
                 cfg.block,
                 cfg.mtu,
+                match cfg.tx_mode {
+                    TxMode::Stream => "stream",
+                    TxMode::Burst => "burst",
+                },
                 receiver.modem().longest_frame_samples(&RxConfig {
                     max_len: Some(cfg.mtu),
                     only_code: Some(cfg.code),
@@ -415,6 +450,7 @@ impl Radio for SdrRadio {
             v.re *= k;
             v.im *= k;
         }
+        // A short tail of zeros: room for the receiver's matched filter (and, streamed, the next preamble).
         let sps = self.cfg.sps().unwrap_or(8);
         s.extend(std::iter::repeat_n(
             Complex32 { re: 0.0, im: 0.0 },
@@ -570,6 +606,9 @@ fn tx_thread(cfg: &SdrConfig, shared: &Shared) {
     let Some(f) = open_stream(&cfg.tx, true, shared) else {
         return;
     };
+    if cfg.tx_mode == TxMode::Burst {
+        return tx_bursts(cfg, shared, f);
+    }
     let mut f = BufWriter::with_capacity(1 << 16, f);
     shared.event("tx_open", "");
     let chunk = ((cfg.sample_rate * TX_CHUNK_SECONDS) as usize).max(64);
@@ -638,10 +677,45 @@ fn tx_thread(cfg: &SdrConfig, shared: &Shared) {
     }
 }
 
+/// Burst mode: each frame as one record, as soon as it is queued.
+fn tx_bursts(cfg: &SdrConfig, shared: &Shared, f: File) {
+    let mut f = BufWriter::with_capacity(1 << 16, f);
+    shared.event("tx_open", ",\"mode\":\"burst\"");
+    let mut nco = Nco { phase: 0.0 };
+    let mut bytes = Vec::new();
+    while !shared.stop.load(Ordering::SeqCst) {
+        let next = shared.tx_queue.lock().unwrap().pop_front();
+        let Some((mut s, queued)) = next else {
+            std::thread::sleep(Duration::from_micros(200));
+            continue;
+        };
+        shared.tx_frames.fetch_add(1, Ordering::Relaxed);
+        shared.event(
+            "tx_air",
+            &format!(
+                ",\"samples\":{},\"queued_ms\":{:.1}",
+                s.len(),
+                queued.elapsed().as_secs_f64() * 1e3
+            ),
+        );
+        nco.mix(&mut s, cfg.if_hz, cfg.sample_rate);
+        bytes.clear();
+        bytes.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        for v in &s {
+            bytes.extend_from_slice(&v.re.to_le_bytes());
+            bytes.extend_from_slice(&v.im.to_le_bytes());
+        }
+        if let Err(e) = f.write_all(&bytes).and_then(|_| f.flush()) {
+            shared.fail(format!("TX stream {}: {e}", cfg.tx.display()));
+            return;
+        }
+    }
+}
+
 fn rx_thread(
     cfg: &SdrConfig,
     shared: &Shared,
-    mut receiver: StreamReceiver,
+    mut receiver: LiveReceiver,
     out: SyncSender<Vec<u8>>,
 ) {
     let Some(mut f) = open_stream(&cfg.rx, false, shared) else {

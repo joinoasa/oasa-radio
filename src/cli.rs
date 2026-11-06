@@ -58,11 +58,14 @@ RADIOS:
             --if-hz HZ           default 250000
             --cfo-hz HZ          starting estimate of the received offset, default 0
             --track-cfo on|off   follow the offset from good frames, default on
-            --cfo-search CYC     receiver frequency search, cycles per symbol, default 0.03
+            --cfo-search CYC     receiver frequency search, cycles per symbol, above 0, default 0.03
             --decimate 1|2       default 2
-            --block N            samples per receiver pass after decimation, default 4096
+            --block N            samples per receiver pass after decimation, default 512 (1 ms)
             --tx-peak A          frame peak amplitude, full scale 1, default 0.5
-            --tx-lead-ms N       most the TX stream runs ahead of the clock, default 20
+            --tx-mode stream|burst  default stream. burst: one record per frame (u32 LE
+                                 sample count, then cf32), nothing between frames; the radio
+                                 tool sends each as a timed burst (lowest delay)
+            --tx-lead-ms N       stream: most the TX stream runs ahead of the clock, default 20
             --mtu BYTES          default 200, at most 255. Give oasa-link the same --mtu.
             --sdr-log PATH       JSON lines: frames, offsets, timings (sizes only)
             --rx-record PATH     the received baseband after the shift (cf32), for the lab
@@ -398,7 +401,7 @@ fn sdr_spec(named: &mut BTreeMap<String, String>) -> R<SdrConfig> {
         1,
         2,
     )? as usize;
-    c.block = number("block", named.remove("block"), c.block as u64, 256, 1 << 20)? as usize;
+    c.block = number("block", named.remove("block"), c.block as u64, 64, 1 << 20)? as usize;
     c.mtu = number(
         "mtu",
         named.remove("mtu"),
@@ -413,6 +416,9 @@ fn sdr_spec(named: &mut BTreeMap<String, String>) -> R<SdrConfig> {
         1,
         1000,
     )?);
+    if let Some(v) = named.remove("tx-mode") {
+        c.tx_mode = sdr::TxMode::parse(&v).ok_or("--tx-mode must be stream or burst")?;
+    }
     c.log = named.remove("sdr-log").map(Into::into);
     c.rx_record = named.remove("rx-record").map(Into::into);
     c.check()?;

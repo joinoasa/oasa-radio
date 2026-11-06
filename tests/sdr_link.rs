@@ -167,3 +167,88 @@ fn a_stopped_reader_is_a_radio_error() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn burst_mode_writes_one_decodable_record_per_packet() {
+    use oasa_radio::adapters::sdr::TxMode;
+    use oasa_waveform::{Complex32, FrameFormat, Modem, ModemConfig, Modulation, RxConfig};
+    let d = tmpdir();
+    let tx = d.join("tx.bin");
+    std::fs::File::create(&tx).unwrap();
+    // an RX writer that stays open, so the radio does not fail
+    let rx = fifo(&d, "rx");
+    let stop = Arc::new(AtomicBool::new(false));
+    let (rx2, s2) = (rx.clone(), stop.clone());
+    std::thread::spawn(move || {
+        let _f = std::fs::OpenOptions::new().write(true).open(&rx2).unwrap();
+        while !s2.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let mut c = SdrConfig::new(tx.clone(), rx);
+    c.tx_mode = TxMode::Burst;
+    let fs = c.sample_rate;
+    let if_hz = c.if_hz;
+    let mut r = SdrRadio::open(c).unwrap();
+    let packets: Vec<Vec<u8>> = vec![vec![7; 119], (0..200).map(|i| i as u8).collect(), vec![1]];
+    for p in &packets {
+        r.send(p).unwrap();
+    }
+    // all three records written, and nothing else (no zeros streamed between frames)
+    let t = Instant::now();
+    let want: usize = {
+        let md = Modem::new(ModemConfig {
+            frame: FrameFormat::V1,
+            ..ModemConfig::new(Modulation::Qpsk)
+        })
+        .unwrap();
+        packets
+            .iter()
+            .map(|p| 4 + 8 * (md.modulate(p).unwrap().len() + 50 * 8))
+            .sum()
+    };
+    while std::fs::metadata(&tx).unwrap().len() < want as u64
+        && t.elapsed() < Duration::from_secs(3)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let bytes = std::fs::read(&tx).unwrap();
+    assert_eq!(bytes.len(), want, "three records, nothing between them");
+    let md = Modem::new(ModemConfig {
+        frame: FrameFormat::V1,
+        ..ModemConfig::new(Modulation::Qpsk)
+    })
+    .unwrap();
+    let rxc = RxConfig {
+        cfo_search: 0.03,
+        ..RxConfig::default()
+    };
+    let (mut at, mut phase) = (0usize, 0.0f64);
+    for p in &packets {
+        let n = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        at += 4;
+        // shift the record back from the IF and decode it alone
+        let w = 2.0 * std::f64::consts::PI * if_hz / fs;
+        let x: Vec<Complex32> = bytes[at..at + 8 * n]
+            .chunks(8)
+            .map(|b| {
+                let v = Complex32::new(
+                    f32::from_le_bytes(b[..4].try_into().unwrap()),
+                    f32::from_le_bytes(b[4..].try_into().unwrap()),
+                );
+                let (s, c) = (-phase).sin_cos();
+                phase += w;
+                v * Complex32::new(c as f32, s as f32)
+            })
+            .collect();
+        at += 8 * n;
+        let frames = md.demodulate_with(&x, &rxc);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].crc_ok);
+        assert_eq!(&frames[0].payload, p);
+    }
+    stop.store(true, Ordering::SeqCst);
+    drop(r);
+    let _ = std::fs::remove_dir_all(&d);
+}
