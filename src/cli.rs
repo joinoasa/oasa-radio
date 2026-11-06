@@ -61,6 +61,8 @@ RADIOS:
             --cfo-search CYC     receiver frequency search, cycles per symbol, above 0, default 0.03
             --decimate 1|2       default 2
             --block N            samples per receiver pass after decimation, default 512 (1 ms)
+            --coarse-step N      samples between the positions the detector tests, 0 (default)
+                                 = a quarter symbol; 2 at 4 samples per symbol halves its CPU
             --tx-peak A          frame peak amplitude, full scale 1, default 0.5
             --tx-mode stream|burst  default stream. burst: one record per frame (u32 LE
                                  sample count, then cf32), nothing between frames; the radio
@@ -402,6 +404,13 @@ fn sdr_spec(named: &mut BTreeMap<String, String>) -> R<SdrConfig> {
         2,
     )? as usize;
     c.block = number("block", named.remove("block"), c.block as u64, 64, 1 << 20)? as usize;
+    c.coarse_step = number(
+        "coarse-step",
+        named.remove("coarse-step"),
+        c.coarse_step as u64,
+        0,
+        64,
+    )? as usize;
     c.mtu = number(
         "mtu",
         named.remove("mtu"),

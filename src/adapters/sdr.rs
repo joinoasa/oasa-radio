@@ -138,6 +138,8 @@ pub struct SdrConfig {
     pub decimate: usize,
     /// Samples (after decimation) per receiver pass. Smaller: less delay, a little more work.
     pub block: usize,
+    /// Samples between the detector's test positions (0: a quarter symbol). See `RxConfig::coarse_step`.
+    pub coarse_step: usize,
     /// Peak amplitude of a frame in the TX stream (full scale = 1).
     pub tx_peak: f32,
     pub mtu: usize,
@@ -169,6 +171,7 @@ impl SdrConfig {
             cfo_search: 0.03,
             decimate: 2,
             block: 512,
+            coarse_step: 0,
             tx_peak: 0.5,
             mtu: DEFAULT_MTU,
             log: None,
@@ -340,6 +343,7 @@ impl SdrRadio {
             cfo_search: cfg.cfo_search,
             max_len: Some(cfg.mtu),
             only_code: Some(cfg.code),
+            coarse_step: cfg.coarse_step,
             ..RxConfig::default()
         };
         let log = match &cfg.log {
@@ -994,6 +998,62 @@ mod speed {
         t.elapsed().as_secs_f64()
     }
 
+    /// Frames found against Eb/N0 for each coarse step: 1 MS/s, 250 kbaud (4 samples per symbol),
+    /// 32-byte v1 frames, each at a random whole + fractional sample offset and a random carrier offset.
+    #[test]
+    #[ignore]
+    fn detection_vs_coarse_step() {
+        let md = Modem::new(ModemConfig {
+            sps: 4,
+            frame: FrameFormat::V1,
+            ..ModemConfig::new(Modulation::Qpsk)
+        })
+        .unwrap();
+        let frame = md.modulate(&[0x5au8; 32]).unwrap();
+        let trials = 400;
+        for ebn0 in [2.0, 4.0, 6.0, 8.0] {
+            let mut line = format!("Eb/N0 {ebn0:>4} dB:");
+            for step in [1usize, 2, 4] {
+                let rxc = RxConfig {
+                    cfo_search: 0.03,
+                    max_len: Some(200),
+                    only_code: Some(PayloadCode::None),
+                    coarse_step: step,
+                    ..RxConfig::default()
+                };
+                let mut ch = Channel::new(11);
+                let mut good = 0;
+                let mut rng = 12345u64;
+                for _ in 0..trials {
+                    rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let u = (rng >> 11) as f64 / (1u64 << 53) as f64;
+                    let y = ch.apply(
+                        &frame,
+                        &Impairments {
+                            n0: n0_for_ebn0(ebn0, md.energy_per_bit()),
+                            frac_delay: u,
+                            lead: 300 + (rng >> 40) as usize % 7,
+                            tail: 600,
+                            cfo_cycles_per_sample: (u - 0.5) * 0.004,
+                            phase_rad: u * 6.0,
+                        },
+                    );
+                    let mut r = LiveReceiver::new(md.clone(), rxc.clone()).unwrap();
+                    let mut fr = Vec::new();
+                    for b in y.chunks(512) {
+                        fr.extend(r.push(b));
+                    }
+                    fr.extend(r.finish());
+                    good += fr.iter().filter(|f| f.crc_ok).count();
+                }
+                line += &format!("  step {step}: {good}/{trials}");
+            }
+            println!("{line}");
+        }
+    }
+
     #[test]
     #[ignore]
     fn stage_costs() {
@@ -1079,6 +1139,23 @@ mod speed {
                 "   noise only: plain metric (one frequency, no FFT) {:.0} ms",
                 t_m * 1e3
             );
+            for step in [2usize, 4] {
+                let rs = RxConfig {
+                    coarse_step: step,
+                    ..rxc.clone()
+                };
+                let mut r = LiveReceiver::new(md.clone(), rs).unwrap();
+                let mut got = 0;
+                let t = secs(|| {
+                    for b in y.chunks(blk0) {
+                        got += r.push(b).len();
+                    }
+                });
+                println!(
+                    "   coarse step {step}: receiver {:.0} ms ({got} frames)",
+                    t * 1e3
+                );
+            }
             let mut r = LiveReceiver::new(md, rxc).unwrap();
             let mut got = 0;
             let blk = (fs / dec as f64 * 0.001) as usize; // 1 ms blocks

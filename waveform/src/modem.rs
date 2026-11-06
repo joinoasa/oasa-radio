@@ -175,6 +175,10 @@ pub struct RxConfig {
     /// the header, and the longest frame is counted with this code. A radio that sends one code sets
     /// it. `None`: any code a v1 header can announce.
     pub only_code: Option<PayloadCode>,
+    /// Distance between the time offsets the coarse search tests, in samples (at most `sps`). 0: a
+    /// quarter symbol (`sps / 4`, at least 1). Larger steps cost proportionally less; the fine search around each
+    /// candidate covers `sps + step` samples either way, so timing is still found to the sample.
+    pub coarse_step: usize,
 }
 
 impl Default for RxConfig {
@@ -189,6 +193,7 @@ impl Default for RxConfig {
             cfo_search: 0.0,
             max_len: None,
             only_code: None,
+            coarse_step: 0,
         }
     }
 }
@@ -779,7 +784,11 @@ impl Modem {
             chunk,
             fft_len,
             bins,
-            step: (self.cfg.sps / 4).max(1),
+            step: if rx.coarse_step > 0 {
+                rx.coarse_step.min(self.cfg.sps)
+            } else {
+                (self.cfg.sps / 4).max(1)
+            },
             cells,
             threshold,
             fft: crate::fft::Fft::new(fft_len),
