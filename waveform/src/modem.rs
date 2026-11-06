@@ -211,6 +211,9 @@ pub struct CoarseSearch {
     /// probability per position stays what it is without the search.
     pub threshold: f32,
     fft: crate::fft::Fft,
+    /// The reference, real and imaginary parts apart (for the vectorized products).
+    ref_re: Vec<f32>,
+    ref_im: Vec<f32>,
 }
 
 /// The largest offset searched, as a fraction of the sample rate.
@@ -780,6 +783,8 @@ impl Modem {
             cells,
             threshold,
             fft: crate::fft::Fft::new(fft_len),
+            ref_re: self.refw.iter().map(|v| v.re).collect(),
+            ref_im: self.refw.iter().map(|v| v.im).collect(),
         })
     }
 
@@ -821,20 +826,29 @@ impl Modem {
         let one = |range: std::ops::Range<usize>| -> Vec<(f32, f32)> {
             let mut buf = vec![Complex32::ZERO; n];
             let mut out = Vec::with_capacity(range.len());
+            // window * conj(reference), every product on its own (so the loop vectorizes), then the
+            // chunk sums; one running sum per chunk would be bound by the latency of its additions
+            let (mut pr, mut pi) = (vec![0.0f32; m], vec![0.0f32; m]);
+            // this range's samples with real and imaginary parts apart: the products then vectorize
+            let lo = range.start * cs.step;
+            let hi = ((range.end.max(1) - 1) * cs.step + m).min(r.len()).max(lo);
+            let xr: Vec<f32> = r[lo..hi].iter().map(|v| v.re).collect();
+            let xi: Vec<f32> = r[lo..hi].iter().map(|v| v.im).collect();
+            let (br, bi) = (&cs.ref_re[..m], &cs.ref_im[..m]);
             for tau in range.map(|i| i * cs.step) {
                 buf.fill(Complex32::ZERO);
-                let win = &r[tau..tau + m];
-                for (slot, (w, p)) in buf
+                let (wr, wi) = (&xr[tau - lo..tau - lo + m], &xi[tau - lo..tau - lo + m]);
+                for k in 0..m {
+                    // window * conj(reference)
+                    pr[k] = wr[k] * br[k] + wi[k] * bi[k];
+                    pi[k] = wi[k] * br[k] - wr[k] * bi[k];
+                }
+                for ((slot, cr), ci) in buf
                     .iter_mut()
-                    .zip(win.chunks(cs.chunk).zip(self.refw.chunks(cs.chunk)))
+                    .zip(pr.chunks(cs.chunk))
+                    .zip(pi.chunks(cs.chunk))
                 {
-                    let (mut cr, mut ci) = (0.0f32, 0.0f32);
-                    for (a, b) in w.iter().zip(p) {
-                        // a * conj(b)
-                        cr += a.re * b.re + a.im * b.im;
-                        ci += a.im * b.re - a.re * b.im;
-                    }
-                    *slot = Complex32::new(cr, ci);
+                    *slot = Complex32::new(cr.iter().sum(), ci.iter().sum());
                 }
                 cs.fft.forward(&mut buf);
                 let (mut best, mut best_k) = (-1.0f32, 0isize);

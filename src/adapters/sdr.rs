@@ -917,3 +917,116 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod speed {
+    //! Cost of each receive stage per second of signal: `cargo test --release --lib speed -- --ignored --nocapture`.
+    use super::*;
+    use oasa_waveform::channel::{n0_for_ebn0, Channel, Impairments};
+
+    fn secs(f: impl FnOnce()) -> f64 {
+        let t = Instant::now();
+        f();
+        t.elapsed().as_secs_f64()
+    }
+
+    #[test]
+    #[ignore]
+    fn stage_costs() {
+        for (fs, baud, dec) in [
+            (1e6, 125e3, 2usize),
+            (2e6, 250e3, 2),
+            (1e6, 250e3, 1),
+            (4e6, 500e3, 2),
+        ] {
+            let sps = (fs / baud) as usize;
+            let n = fs as usize; // one second
+            let mut x: Vec<Complex32> = (0..n)
+                .map(|i| Complex32 {
+                    re: (i as f32 * 0.37).sin(),
+                    im: (i as f32 * 0.11).cos(),
+                })
+                .collect();
+            let t_mix = secs(|| Nco { phase: 0.0 }.mix(&mut x, 250e3, fs));
+            let mut out = Vec::with_capacity(n);
+            let t_dec = secs(|| Decimator::new(dec).run(&x, &mut out));
+            // the receiver on frames at its own rate: 64-byte v1 frames every 10 ms, 12 dB Es/N0
+            let md = Modem::new(ModemConfig {
+                sps: sps / dec,
+                frame: FrameFormat::V1,
+                ..ModemConfig::new(Modulation::Qpsk)
+            })
+            .unwrap();
+            let per = (fs / dec as f64 * 0.01) as usize;
+            let mut tx = Vec::new();
+            while tx.len() < n / dec {
+                let mut f = md.modulate(&[7u8; 64]).unwrap();
+                f.resize(per, Complex32 { re: 0.0, im: 0.0 });
+                tx.extend(f);
+            }
+            let mut ch = Channel::new(1);
+            let y = ch.apply(
+                &tx,
+                &Impairments {
+                    n0: n0_for_ebn0(10.0, md.energy_per_bit()),
+                    ..Default::default()
+                },
+            );
+            let rxc = RxConfig {
+                cfo_search: 0.03,
+                max_len: Some(200),
+                only_code: Some(PayloadCode::None),
+                ..RxConfig::default()
+            };
+            // noise only, the same length: what detection alone costs
+            let noise = Channel::new(2).apply(
+                &vec![Complex32 { re: 0.0, im: 0.0 }; y.len()],
+                &Impairments {
+                    n0: n0_for_ebn0(10.0, md.energy_per_bit()),
+                    ..Default::default()
+                },
+            );
+            let mut rn = LiveReceiver::new(md.clone(), rxc.clone()).unwrap();
+            let blk0 = (fs / dec as f64 * 0.001) as usize;
+            let t_noise = secs(|| {
+                for b in noise.chunks(blk0) {
+                    rn.push(b);
+                }
+            });
+            println!("   noise only: receiver {:.0} ms", t_noise * 1e3);
+            let ov = 316 + 16;
+            let t_cm = secs(|| {
+                let mut i = 0;
+                while i + blk0 + ov < noise.len() {
+                    std::hint::black_box(md.coarse_metric(&noise[i..i + blk0 + ov], &rxc));
+                    i += blk0;
+                }
+            });
+            println!("   noise only: coarse_metric alone {:.0} ms", t_cm * 1e3);
+            let t_m = secs(|| {
+                let mut i = 0;
+                let plain = RxConfig::default();
+                while i + blk0 + ov < noise.len() {
+                    std::hint::black_box(md.metric(&noise[i..i + blk0 + ov], &plain));
+                    i += blk0;
+                }
+            });
+            println!(
+                "   noise only: plain metric (one frequency, no FFT) {:.0} ms",
+                t_m * 1e3
+            );
+            let mut r = LiveReceiver::new(md, rxc).unwrap();
+            let mut got = 0;
+            let blk = (fs / dec as f64 * 0.001) as usize; // 1 ms blocks
+            let t_rx = secs(|| {
+                for b in y.chunks(blk) {
+                    got += r.push(b).len();
+                }
+            });
+            println!(
+                "fs {:.0} MS/s baud {:.0}k dec {dec}: mix {:.0} ms, decimate {:.0} ms, receiver {:.0} ms ({got} frames) per second of signal",
+                fs / 1e6, baud / 1e3, t_mix * 1e3, t_dec * 1e3, t_rx * 1e3
+            );
+        }
+    }
+}
