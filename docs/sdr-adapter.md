@@ -23,12 +23,14 @@
 Two radios, frequency division (each transmits on its own frequency):
 
 ```sh
-mkfifo a.tx a.rx b.tx b.rx
+cd /dev/shm && mkfifo a.tx a.rx b.tx b.rx   # FIFOs on a RAM filesystem (below)
 # radio tool A: reads a.tx -> TX 915 MHz, RX 920 MHz -> writes a.rx (1 MS/s, cf32)
 oasa-radio bridge --radio sdr --tx a.tx --rx a.rx --cfo-hz 0 \
   --udp-listen 127.0.0.1:7001 --udp-send 127.0.0.1:7101 --sdr-log a-sdr.jsonl
 # radio tool B: the other way round, and a second bridge on 7002 / 7102
 ```
+
+**Put the FIFOs on a RAM filesystem** (`/dev/shm`, `/run/user/$UID`), not on ext4 or another journaling disk filesystem. Every write to a FIFO updates its inode times, which a journaling filesystem commits through its journal (every 5 s on ext4), and the writer can wait for that commit: on the lab VM, two bridges joined by `waveform cable` saw round trips of 10-70 ms exactly every 5 s with the FIFOs on ext4, and none above 8.6 ms with the same FIFOs on `/dev/shm` (3 minutes, 18000 pings of 32 bytes at 100/s each way, all logs still on disk). The logs can stay on disk: the adapter writes them from a separate thread.
 
 `--cfo-hz` is the starting estimate of the other radio's clock offset (the tracker follows it from there; `--cfo-search` covers the rest at the start).
 
