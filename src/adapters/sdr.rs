@@ -241,7 +241,11 @@ struct Shared {
     bad_frames: AtomicU64,
     rx_frames: AtomicU64,
     tx_underrun_ms: AtomicU64,
-    log: Option<Mutex<BufWriter<File>>>,
+    /// Lines for the log thread. The radio's threads never touch the file: a write can block for tens
+    /// of milliseconds while the filesystem flushes (measured: 50-60 ms stalls every 10 s on the bench).
+    log: Option<SyncSender<LogMsg>>,
+    /// Log lines dropped because the log thread fell behind.
+    log_dropped: AtomicU64,
 }
 
 impl Shared {
@@ -256,14 +260,50 @@ impl Shared {
 
     fn event(&self, event: &str, fields: &str) {
         if let Some(l) = &self.log {
-            let mut w = l.lock().unwrap();
-            let _ = writeln!(
-                w,
-                "{{\"ts\":\"{}\",\"event\":\"{event}\"{fields}}}",
+            let line = format!(
+                "{{\"ts\":\"{}\",\"event\":\"{event}\"{fields}}}\n",
                 rfc3339(SystemTime::now())
             );
-            let _ = w.flush();
+            if l.try_send(LogMsg::Line(line)).is_err() {
+                self.log_dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// Wait (at most `wait`) until the log thread has written everything sent so far.
+    fn flush_log(&self, wait: Duration) {
+        if let Some(l) = &self.log {
+            let (tx, rx) = mpsc::sync_channel(1);
+            if l.send(LogMsg::Flush(tx)).is_ok() {
+                let _ = rx.recv_timeout(wait);
+            }
+        }
+    }
+}
+
+enum LogMsg {
+    Line(String),
+    /// Acknowledged once everything before it is written.
+    Flush(SyncSender<()>),
+}
+
+/// Writes log lines as they come, flushing whenever the queue is empty.
+fn log_thread(mut w: BufWriter<File>, rx: Receiver<LogMsg>) {
+    while let Ok(m) = rx.recv() {
+        let mut next = Some(m);
+        while let Some(m) = next.take() {
+            match m {
+                LogMsg::Line(l) => {
+                    let _ = w.write_all(l.as_bytes());
+                }
+                LogMsg::Flush(ack) => {
+                    let _ = w.flush();
+                    let _ = ack.try_send(());
+                }
+            }
+            next = rx.try_recv().ok();
+        }
+        let _ = w.flush();
     }
 }
 
@@ -303,13 +343,18 @@ impl SdrRadio {
             ..RxConfig::default()
         };
         let log = match &cfg.log {
-            Some(p) => Some(Mutex::new(BufWriter::new(
-                OpenOptions::new()
+            Some(p) => {
+                let f = OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(p)
-                    .map_err(|e| RadioError::Config(format!("--sdr-log {}: {e}", p.display())))?,
-            ))),
+                    .map_err(|e| RadioError::Config(format!("--sdr-log {}: {e}", p.display())))?;
+                let (tx, rx) = mpsc::sync_channel(4096);
+                std::thread::Builder::new()
+                    .name("sdr-log".into())
+                    .spawn(move || log_thread(BufWriter::new(f), rx))?;
+                Some(tx)
+            }
             None => None,
         };
         let shared = Arc::new(Shared {
@@ -322,6 +367,7 @@ impl SdrRadio {
             rx_frames: AtomicU64::new(0),
             tx_underrun_ms: AtomicU64::new(0),
             log,
+            log_dropped: AtomicU64::new(0),
         });
         let receiver = LiveReceiver::new(rx_modem, rx_cfg).map_err(RadioError::Config)?;
         shared.event(
@@ -398,13 +444,15 @@ impl Drop for SdrRadio {
         s.event(
             "sdr_stats",
             &format!(
-                ",\"tx_frames\":{},\"rx_frames\":{},\"bad_frames\":{},\"tx_underrun_ms\":{}",
+                ",\"tx_frames\":{},\"rx_frames\":{},\"bad_frames\":{},\"tx_underrun_ms\":{},\"log_dropped\":{}",
                 s.tx_frames.load(Ordering::Relaxed),
                 s.rx_frames.load(Ordering::Relaxed),
                 s.bad_frames.load(Ordering::Relaxed),
-                s.tx_underrun_ms.load(Ordering::Relaxed)
+                s.tx_underrun_ms.load(Ordering::Relaxed),
+                s.log_dropped.load(Ordering::Relaxed)
             ),
         );
+        s.flush_log(Duration::from_secs(1));
         // The threads may be blocked opening a FIFO nobody opened; they are detached then.
         for t in self.threads.drain(..) {
             if t.is_finished() {

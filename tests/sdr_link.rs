@@ -187,6 +187,8 @@ fn burst_mode_writes_one_decodable_record_per_packet() {
     });
     let mut c = SdrConfig::new(tx.clone(), rx);
     c.tx_mode = TxMode::Burst;
+    let log = d.join("sdr.jsonl");
+    c.log = Some(log.clone());
     let fs = c.sample_rate;
     let if_hz = c.if_hz;
     let mut r = SdrRadio::open(c).unwrap();
@@ -250,5 +252,16 @@ fn burst_mode_writes_one_decodable_record_per_packet() {
     }
     stop.store(true, Ordering::SeqCst);
     drop(r);
+    // the log thread wrote every line, the last one included (dropping the radio waits for it)
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(text.matches("\"event\":\"tx_air\"").count(), 3, "{text}");
+    assert!(
+        text.lines()
+            .last()
+            .unwrap()
+            .contains("\"event\":\"sdr_stats\""),
+        "{text}"
+    );
+    assert!(text.contains("\"log_dropped\":0"), "{text}");
     let _ = std::fs::remove_dir_all(&d);
 }
