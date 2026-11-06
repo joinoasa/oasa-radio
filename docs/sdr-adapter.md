@@ -45,7 +45,12 @@ Radio to radio, one way, 64-byte packets, medians (both bridges on one host cloc
 | `stream`, 5 ms lead, `LiveReceiver`, 512 blocks | 18 | 19 | 41 |
 | `burst`, radio tool streams with a radio timestamp per packet, 2 to 3 ms ahead | **8** | **10** | **22 to 25** |
 
-In the last row, 4.1 ms is the frame on air, 2 to 3 ms the lead, 0.7 ms the decision; the receive side of UHD adds 0.3 ms (E310) and 1.2 ms (B200). With oasa-link on both ends: handshake 38 to 54 ms, 600 of 600 messages, one-way 10 to 12 ms median, 17 ms max.
+| same, bridge polls oasa-link every 0.2 ms (was 2 ms), 32-byte packets at up to 100/s | 7 | 8 | 16 |
+| same, 250 kbaud at 1 MS/s (`--symbol-rate 250000 --decimate 1 --if-hz 175000 --block 512`) | **6** | **7** | **12.6** (p99 15.6) |
+
+At 250 kbaud and 1 MS/s the IF must come down to 175 kHz: at 250 kHz the signal's upper edge (419 kHz) sits in the radios' own filters and frames arrived weak (metric 0.06 instead of 0.85-0.9). At 2 MS/s the E310 (over the network) needs a 6 ms lead and gives back what the shorter frame saved.
+
+In the fourth row, 4.1 ms is the frame on air, 2 to 3 ms the lead, 0.7 ms the decision; the receive side of UHD adds 0.3 ms (E310) and 1.2 ms (B200). With oasa-link on both ends: handshake 38 to 54 ms, 600 of 600 messages, one-way 10 to 12 ms median, 17 ms max.
 
 The old receiver searched its whole window (one longest frame) on every block, about 1.5 ms of CPU per pass: with small blocks it fell behind and the delay grew. `LiveReceiver` costs under 1 ms per pass at 1 ms blocks.
 

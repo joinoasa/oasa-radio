@@ -21,7 +21,6 @@ use crate::radio::{Radio, RadioError};
 
 /// How long one pass waits for the radio. This is also the most a packet
 /// from oasa-link waits before it is sent.
-const TICK: Duration = Duration::from_millis(2);
 /// Packets taken from the UDP socket per pass.
 const UDP_BATCH: usize = 64;
 
@@ -144,6 +143,7 @@ pub fn run<W: Write>(
     let mut seen_drops = 0u64;
     let mut seen: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut failure = None;
+    let tick = radio.poll_interval();
     'main: while !stop.load(Ordering::SeqCst) && deadline.is_none_or(|d| Instant::now() < d) {
         // oasa-link to the radio.
         for _ in 0..UDP_BATCH {
@@ -170,7 +170,7 @@ pub fn run<W: Write>(
             }
         }
         // The radio to oasa-link.
-        match radio.recv(TICK) {
+        match radio.recv(tick) {
             Ok(Some(p)) => match sock.send_to(&p, cfg.udp_send) {
                 Ok(_) => {}
                 // Nothing is listening yet (ICMP came back): a lost packet.

@@ -32,7 +32,7 @@ use std::io::{BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -235,6 +235,8 @@ struct Shared {
     stop: AtomicBool,
     failed: Mutex<Option<String>>,
     tx_queue: Mutex<VecDeque<(Vec<Complex32>, Instant)>>,
+    /// Signalled when a frame is queued (burst mode waits on it).
+    tx_ready: Condvar,
     tx_frames: AtomicU64,
     bad_frames: AtomicU64,
     rx_frames: AtomicU64,
@@ -314,6 +316,7 @@ impl SdrRadio {
             stop: AtomicBool::new(false),
             failed: Mutex::new(None),
             tx_queue: Mutex::new(VecDeque::new()),
+            tx_ready: Condvar::new(),
             tx_frames: AtomicU64::new(0),
             bad_frames: AtomicU64::new(0),
             rx_frames: AtomicU64::new(0),
@@ -465,6 +468,7 @@ impl Radio for SdrRadio {
         let ahead: usize = q.iter().map(|(f, _)| f.len()).sum();
         q.push_back((s, Instant::now()));
         drop(q);
+        self.shared.tx_ready.notify_one();
         self.counters.sent += 1;
         self.counters.sent_bytes += packet.len() as u64;
         self.shared.event(
@@ -497,6 +501,11 @@ impl Radio for SdrRadio {
 
     fn counters(&self) -> &Counters {
         &self.counters
+    }
+
+    /// A packet from oasa-link waits at most this long before it is queued for the air.
+    fn poll_interval(&self) -> Duration {
+        Duration::from_micros(200)
     }
 }
 
@@ -684,9 +693,16 @@ fn tx_bursts(cfg: &SdrConfig, shared: &Shared, f: File) {
     let mut nco = Nco { phase: 0.0 };
     let mut bytes = Vec::new();
     while !shared.stop.load(Ordering::SeqCst) {
-        let next = shared.tx_queue.lock().unwrap().pop_front();
+        let next = {
+            let q = shared.tx_queue.lock().unwrap();
+            // wake when a frame is queued (or every 50 ms, to see `stop`)
+            let (mut q, _) = shared
+                .tx_ready
+                .wait_timeout_while(q, Duration::from_millis(50), |q| q.is_empty())
+                .unwrap();
+            q.pop_front()
+        };
         let Some((mut s, queued)) = next else {
-            std::thread::sleep(Duration::from_micros(200));
             continue;
         };
         shared.tx_frames.fetch_add(1, Ordering::Relaxed);
