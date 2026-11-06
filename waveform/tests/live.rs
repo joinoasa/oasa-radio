@@ -127,6 +127,24 @@ fn live_matches_the_whole_buffer_as_the_radio_runs_it() {
     }
 }
 
+/// Coarser detector steps (half a symbol, one symbol): still the same frames as the whole buffer.
+#[test]
+fn live_matches_the_whole_buffer_coarse_steps() {
+    for (step, seed) in [(2, 5), (4, 6)] {
+        check(
+            v1(Modulation::Qpsk, PayloadCode::None),
+            RxConfig {
+                coarse_step: step,
+                ..radio_rx(200, PayloadCode::None)
+            },
+            200,
+            10.0,
+            0.004,
+            seed,
+        );
+    }
+}
+
 #[test]
 fn live_matches_the_whole_buffer_light_code() {
     let c = PayloadCode::Light;
