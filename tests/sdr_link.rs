@@ -124,6 +124,76 @@ fn packets_cross_both_ways_in_real_time() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The field after `"key":` in a JSON line, as a number.
+fn field(line: &str, key: &str) -> f64 {
+    line.split(&format!("\"{key}\":"))
+        .nth(1)
+        .unwrap()
+        .split([',', '}'])
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn acquisition_finds_an_offset_outside_the_narrow_search() {
+    // F20 at a tenth of the symbol rate: +-20 ppm at 915 MHz is 0.073 cycles per symbol, 1830 Hz
+    // at 25 kbaud. The narrow search (0.03) alone does not reach it; --cfo-acquire 0.15 does.
+    let d = tmpdir();
+    let (a_tx, a_rx, b_tx, b_rx) = (
+        fifo(&d, "a.tx"),
+        fifo(&d, "a.rx"),
+        fifo(&d, "b.tx"),
+        fifo(&d, "b.rx"),
+    );
+    cable_thread(a_tx.clone(), b_rx.clone(), 1830.0, 3);
+    cable_thread(b_tx.clone(), a_rx.clone(), -1830.0, 4);
+    let open = |tx, rx, log| {
+        let mut c = SdrConfig::new(tx, rx);
+        c.sample_rate = 200e3;
+        c.symbol_rate = 25e3;
+        c.if_hz = 40e3;
+        c.block = 2048;
+        c.cfo_acquire = 0.15;
+        c.log = Some(log);
+        SdrRadio::open(c).unwrap()
+    };
+    let mut a = open(a_tx, a_rx, d.join("a.jsonl"));
+    let mut b = open(b_tx, b_rx, d.join("b.jsonl"));
+    let n = 10;
+    let (mut to_a, mut to_b) = (0, 0);
+    for i in 0..n {
+        let t = Instant::now();
+        a.send(&vec![0xa0; 60 + i]).unwrap();
+        b.send(&vec![0xb0; 80 + i]).unwrap();
+        let (mut ok_a, mut ok_b) = (false, false);
+        while t.elapsed() < Duration::from_secs(3) && !(ok_a && ok_b) {
+            if b.recv(Duration::from_millis(2)).unwrap().is_some() {
+                ok_b = true;
+                to_b += 1;
+            }
+            if a.recv(Duration::from_millis(2)).unwrap().is_some() {
+                ok_a = true;
+                to_a += 1;
+            }
+        }
+    }
+    assert_eq!((to_a, to_b), (n, n));
+    drop(a);
+    drop(b);
+    for (name, want) in [("a.jsonl", -1830.0), ("b.jsonl", 1830.0)] {
+        let log = std::fs::read_to_string(d.join(name)).unwrap();
+        let locks: Vec<&str> = log.lines().filter(|l| l.contains("\"cfo_lock\"")).collect();
+        assert_eq!(locks.len(), 1, "{name}: {log}");
+        let hz = field(locks[0], "cfo_hz");
+        assert!((hz - want).abs() < 50.0, "{name}: locked at {hz} Hz");
+        assert_eq!(field(locks[0], "cfo_search"), 0.03);
+        assert!(!log.contains("\"cfo_unlock\""), "{name}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn a_stopped_reader_is_a_radio_error() {
     let d = tmpdir();

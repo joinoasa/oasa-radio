@@ -34,6 +34,30 @@ oasa-radio bridge --radio sdr --tx a.tx --rx a.rx --cfo-hz 0 \
 
 `--cfo-hz` is the starting estimate of the other radio's clock offset (the tracker follows it from there; `--cfo-search` covers the rest at the start).
 
+### Wide search until lock, then narrow (`--cfo-acquire`)
+
+Plain crystals (+-20 ppm, 18.3 kHz at 915 MHz, 0.073 cycles per symbol at 250 kbaud) are outside the default search (`--cfo-search 0.03`, about +-7.5 kHz nominal). A wide `--cfo-search` finds them but costs its wide FFT on every block for good. `--cfo-acquire CYC` searches that wide only until frames decode:
+
+- **Acquiring:** search `--cfo-acquire` around the tracked offset. Each good frame's estimate is taken whole (no smoothing), so after `--cfo-lock-frames` good frames in a row (default 2) the offset is centred.
+- **Locked:** search `--cfo-search` around it, tracking as `--track-cfo on` always does (0.3 of each good frame's residual).
+- **Lock lost** after `--cfo-unlock-bad` bad CRCs in a row (default 3) or `--cfo-unlock-ms` of stream with no good frame (default 500): back to the wide search, centred on the last tracked offset. An idle link unlocks too; its next frames are found by the wide search.
+- `--sdr-log` gets `{"event":"cfo_lock","cfo_hz":…,"cfo_search":0.03,"stream_ms":…}` and `{"event":"cfo_unlock",…,"reason":"bad_frames"|"timeout"}`. Without `--cfo-acquire` nothing changes.
+
+The estimate of each frame is taken against the shift its own samples got: after a jump of the offset, frames already read keep the old shift.
+
+Simulation at the bench's settings (1 MS/s, 250 kbaud, IF 175 kHz, `--decimate 1 --coarse-step 4`; random 40 to 200-byte frames 0.7 to 3.2 ms apart, Es/N0 about 20 dB, 2 s each; `cargo test --release --lib acquire::table -- --ignored --nocapture`; time per receiver pass of 4096 samples on the development PC):
+
+| Offset | Search | Locked at | Lost frames | FFT points per pass | us per pass |
+|---|---|---|---|---|---|
+| 0, +-18.3 kHz, +-30 kHz | `--cfo-acquire 0.15` (locked: 0.03) | 12.3 ms | 0 of 410 | 32 700 | 717-726 |
+| 0 | always 0.03 (default) | - | 0 of 410 | 32 700 | 719 |
+| +-18.3 kHz, +-30 kHz | always 0.03 | - | all | | |
+| 0, +-18.3 kHz | always 0.1 | - | 0 (0 Hz), 2 of 410 (+-18.3 kHz) | 130 800 | 1260-1267 |
+| +-30 kHz | always 0.1 | - | all (0.1 reaches about 29 kHz here) | | |
+| 0, +-18.3 kHz, +-30 kHz | always 0.15 | - | 0 (0 Hz), 2 of 410 (others) | 130 800 | 1286-1297 |
+
+Locked, the receiver does the default search's work. A ramp of 18.3 to 28.3 kHz over 2 s stays locked with no frame lost. A step from 18.3 to 40 kHz (past the narrow search, which reaches about +-13 kHz) unlocks 500 ms after its last good frame (`--cfo-unlock-ms`) and relocks 25 ms later at 40 kHz; the frames in between are lost, every one after is delivered.
+
 Without radios, `oasa-radio waveform cable` joins one bridge's TX FIFO to the other's RX FIFO with a gain, clock offset and noise. `tests/sdr_link.rs` runs two bridges through two cables at a fifth of the bench rates.
 
 ## Delay, step by step (bench, 2026-11-05/06, not counted)

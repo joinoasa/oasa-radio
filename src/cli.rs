@@ -59,6 +59,14 @@ RADIOS:
             --cfo-hz HZ          starting estimate of the received offset, default 0
             --track-cfo on|off   follow the offset from good frames, default on
             --cfo-search CYC     receiver frequency search, cycles per symbol, above 0, default 0.03
+            --cfo-acquire CYC    acquisition: search this wide (cycles per symbol, above
+                                 --cfo-search) until frames decode, then --cfo-search around
+                                 the tracked offset; back to wide on a lock loss. Default 0
+                                 (off: always --cfo-search). Needs --track-cfo on. Logs
+                                 cfo_lock and cfo_unlock. 0.15 at 250 kbaud finds +-36 kHz
+            --cfo-lock-frames N  good frames in a row that lock, default 2
+            --cfo-unlock-bad N   bad frames (CRC) in a row that drop the lock, default 3
+            --cfo-unlock-ms MS   stream time with no good frame that drops the lock, default 500
             --decimate 1|2       default 2
             --block N            samples per receiver pass after decimation, default 512 (1 ms)
             --coarse-step N      samples between the positions the detector tests, 0 (default)
@@ -384,6 +392,32 @@ fn sdr_spec(named: &mut BTreeMap<String, String>) -> R<SdrConfig> {
         named.remove("cfo-search"),
         f64::from(c.cfo_search),
     )? as f32;
+    c.cfo_acquire = real(
+        "cfo-acquire",
+        named.remove("cfo-acquire"),
+        f64::from(c.cfo_acquire),
+    )? as f32;
+    c.cfo_lock_frames = number(
+        "cfo-lock-frames",
+        named.remove("cfo-lock-frames"),
+        u64::from(c.cfo_lock_frames),
+        1,
+        1000,
+    )? as u32;
+    c.cfo_unlock_bad = number(
+        "cfo-unlock-bad",
+        named.remove("cfo-unlock-bad"),
+        u64::from(c.cfo_unlock_bad),
+        1,
+        1000,
+    )? as u32;
+    c.cfo_unlock_ms = number(
+        "cfo-unlock-ms",
+        named.remove("cfo-unlock-ms"),
+        c.cfo_unlock_ms,
+        1,
+        3_600_000,
+    )?;
     c.tx_peak = real("tx-peak", named.remove("tx-peak"), f64::from(c.tx_peak))? as f32;
     c.rx_record_seconds = real(
         "rx-record-seconds",
@@ -637,6 +671,37 @@ mod tests {
             "sik set --device d stray",
         ] {
             assert!(parse(&v(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn sdr_cfo_acquire_options() {
+        let base = format!("bridge --radio sdr --tx t --rx r {UDPS}");
+        let sdr = |extra: &str| match parse(&v(&format!("{base} {extra}"))) {
+            Ok(Command::Bridge(RadioSpec::Sdr(c), _)) => Ok(c),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e),
+        };
+        let c = sdr("").unwrap();
+        assert_eq!(
+            (c.cfo_search, c.cfo_acquire, c.cfo_lock_frames),
+            (0.03, 0.0, 2)
+        );
+        assert_eq!((c.cfo_unlock_bad, c.cfo_unlock_ms), (3, 500));
+        let c = sdr("--cfo-acquire 0.1 --cfo-lock-frames 1 --cfo-unlock-bad 5 --cfo-unlock-ms 400")
+            .unwrap();
+        assert_eq!((c.cfo_acquire, c.cfo_lock_frames), (0.1, 1));
+        assert_eq!((c.cfo_unlock_bad, c.cfo_unlock_ms), (5, 400));
+        for bad in [
+            "--cfo-acquire 0.02",
+            "--cfo-acquire 0.03",
+            "--cfo-acquire -1",
+            "--cfo-acquire 0.1 --track-cfo off",
+            "--cfo-lock-frames 0",
+            "--cfo-unlock-bad 0",
+            "--cfo-unlock-ms 0",
+        ] {
+            assert!(sdr(bad).is_err(), "{bad}");
         }
     }
 

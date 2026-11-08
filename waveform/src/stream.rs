@@ -170,6 +170,18 @@ pub struct LiveReceiver {
     pending: VecDeque<(u64, f32)>,
     /// Absolute sample positions.
     tally: Tally,
+    /// Coarse search work done so far.
+    work: SearchWork,
+}
+
+/// Work the coarse frequency search has done: positions tested, FFT points computed and frequency
+/// bins examined. Each position costs one window product (the same for any range), one FFT and the
+/// bin scan; a wider range takes a longer FFT and more bins.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchWork {
+    pub positions: u64,
+    pub fft_points: u64,
+    pub bins: u64,
 }
 
 impl LiveReceiver {
@@ -198,7 +210,44 @@ impl LiveReceiver {
             test_next: 0,
             pending: VecDeque::new(),
             tally: Tally::default(),
+            work: SearchWork::default(),
         })
+    }
+
+    /// The coarse search range now, cycles per symbol.
+    pub fn cfo_search(&self) -> f32 {
+        self.rx.cfo_search
+    }
+
+    /// The coarse search in use (FFT length, bins, threshold).
+    pub fn coarse(&self) -> &crate::modem::CoarseSearch {
+        &self.cs
+    }
+
+    /// Coarse search work done so far.
+    pub fn search_work(&self) -> SearchWork {
+        self.work
+    }
+
+    /// Change the coarse search range (cycles per symbol, above 0) from the next new position on.
+    /// Positions already searched keep their values; the time grid (`step`) does not change, so
+    /// nothing found so far moves. For acquisition: search wide until frames decode, then narrow.
+    pub fn set_cfo_search(&mut self, cfo_search: f32) -> Result<(), String> {
+        if cfo_search == self.rx.cfo_search {
+            return Ok(());
+        }
+        let rx = RxConfig {
+            cfo_search,
+            ..self.rx.clone()
+        };
+        let cs = self
+            .modem
+            .coarse_search(&rx)
+            .ok_or("the live receiver needs the coarse frequency search (cfo_search > 0)")?;
+        debug_assert_eq!(cs.step, self.cs.step);
+        self.cs = cs;
+        self.rx = rx;
+        Ok(())
     }
 
     pub fn modem(&self) -> &Modem {
@@ -251,6 +300,10 @@ impl LiveReceiver {
         }
         let from = (next * step - self.base) as usize;
         let new = self.modem.coarse_metric_with(&self.buf[from..], &self.cs);
+        let k = new.len() as u64;
+        self.work.positions += k;
+        self.work.fft_points += k * self.cs.fft_len as u64;
+        self.work.bins += k * (2 * self.cs.bins as u64 + 1);
         self.cm.extend(new);
     }
 
