@@ -22,6 +22,9 @@
 //! and amplitude are estimated again over preamble, sync word and header, since the body starts
 //! that much later. The CRC-16 covers the header bytes.
 //!
+//! With `RxConfig::phase_track` (B12, `docs/phase-tracking.md`) the header and body are decided
+//! with the channel gain tracked symbol block by symbol block (`track.rs`) instead of one phase line.
+//!
 //! With the light code (`payload_code` 1, `docs/fec-light.md`) the body symbols become soft values
 //! (log-likelihood ratios, see [`fsk_llr`] and `decode_at`), are de-interleaved and Viterbi decoded.
 //!
@@ -37,6 +40,7 @@ use crate::frame::{
 };
 use crate::iq::Complex32;
 use crate::pulse::{rrc, rrc_shifted};
+use crate::track::{self, Sym};
 use std::f64::consts::PI;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +183,13 @@ pub struct RxConfig {
     /// quarter symbol (`sps / 4`, at least 1). Larger steps cost proportionally less; the fine search around each
     /// candidate covers `sps + step` samples either way, so timing is still found to the sample.
     pub coarse_step: usize,
+    /// Track the channel (gain and phase) through the frame, block by block, for fast fading (BPSK
+    /// and QPSK v1, needs `refine_phase`): the largest Doppler to follow, in cycles per symbol
+    /// (Doppler in Hz over the symbol rate; 200 Hz at 250 kbaud is 0.0008). The v1 header and the
+    /// body are decided with the tracked gain. 0, the default: off, the body is turned back by one
+    /// phase line as before. Receiver only; nothing changes on the air. See
+    /// `docs/phase-tracking.md` and `waveform/src/track.rs`.
+    pub phase_track: f32,
 }
 
 impl Default for RxConfig {
@@ -194,6 +205,7 @@ impl Default for RxConfig {
             max_len: None,
             only_code: None,
             coarse_step: 0,
+            phase_track: 0.0,
         }
     }
 }
@@ -1125,6 +1137,9 @@ impl Modem {
                 .collect()
         };
         let mut rr = derotate(omega, psi, amp, take);
+        let tracking =
+            rx.phase_track > 0.0 && rx.refine_phase && self.cfg.modulation != Modulation::Fsk2;
+        let q_track = track::rate_noise(rx.phase_track as f64);
         let taps = if self.cfg.modulation == Modulation::Fsk2 {
             Vec::new()
         } else {
@@ -1158,7 +1173,19 @@ impl Modem {
                 }
             },
             FrameFormat::V1 => {
-                let soft: Vec<f32> = (n_ref..body_start).map(|k| dem.header_soft(k)).collect();
+                let soft: Vec<f32> = if tracking {
+                    // the channel through preamble, sync word and header (one bit per symbol each)
+                    let zh: Vec<Complex32> = (0..body_start).map(|k| dem.z(k)).collect();
+                    let g = track::track(
+                        &zh,
+                        |k| self.known_or(k, None, Sym::Bpsk),
+                        amp * amp / noise_per_sample,
+                        q_track,
+                    );
+                    (n_ref..body_start).map(|k| weigh(zh[k], g[k]).re).collect()
+                } else {
+                    (n_ref..body_start).map(|k| dem.header_soft(k)).collect()
+                };
                 header = parse_header_v1(&soft);
                 match (rx.expected_len, &header) {
                     (Some(n), _) => n,
@@ -1205,7 +1232,50 @@ impl Modem {
         let rho = amp * amp / noise_per_sample;
         // the phase line the PSK body is turned back by (none without the refinement)
         let (mut line_a, mut line_b) = (0.0f64, 0.0f64);
-        if self.cfg.modulation != Modulation::Fsk2 && rx.refine_phase {
+        // the tracked channel gain of every body symbol (then `line_a`, `line_b` stay 0)
+        let mut body_gain: Vec<Complex32> = Vec::new();
+        if tracking {
+            let body_kind = if self.cfg.modulation == Modulation::Bpsk {
+                Sym::Bpsk
+            } else {
+                Sym::Qpsk
+            };
+            let hsyms = header.as_ref().map(header_symbols);
+            let run = |dm: &SymbolDemod, z: &[Complex32]| -> Vec<Complex32> {
+                let zall: Vec<Complex32> = (0..body_start)
+                    .map(|k| dm.z(k))
+                    .chain(z.iter().copied())
+                    .collect();
+                let mut g = track::track(
+                    &zall,
+                    |k| {
+                        if k >= body_start {
+                            body_kind
+                        } else {
+                            self.known_or(k, hsyms.as_deref(), Sym::Bpsk)
+                        }
+                    },
+                    rho,
+                    q_track,
+                );
+                g.drain(..body_start);
+                g
+            };
+            body_gain = run(&dem, &z);
+            bits = decide_psk_each(self.cfg.modulation, &z, &body_gain);
+            let shift =
+                self.timing_shift(&rr, mu, body_start, &bits, |k, v| weigh(v, body_gain[k]));
+            if shift.abs() > 0.05 {
+                mu_final = mu + shift;
+                let t = rrc_shifted(sps, self.cfg.rrc_span, self.cfg.rolloff as f64, mu_final);
+                let dm = SymbolDemod::new(self, &t, &rr);
+                z.clear();
+                bits.clear();
+                dm.body_symbols(body_start, total_syms - body_start, &mut z, &mut bits);
+                body_gain = run(&dm, &z);
+                bits = decide_psk_each(self.cfg.modulation, &z, &body_gain);
+            }
+        } else if self.cfg.modulation != Modulation::Fsk2 && rx.refine_phase {
             // The preamble and sync word are known: their matched filter outputs with the data
             // taken off, at their symbol index counted from the body's first symbol (negative).
             // A light-coded body runs at half the Es/N0 and twice the length: there the decoded
@@ -1232,39 +1302,12 @@ impl Modem {
             let known = known_at(&dem);
             let (mut a, mut b) = self.track(&z, rho, &known);
             bits = decide_psk(self.cfg.modulation, &z, a, b);
-            // Timing: the preamble fixes it to a fraction of a sample at best. The frame's own
-            // symbols, compared with the decisions just made, do better: pick the shift of the
-            // matched filter (in steps of half a sample, then a parabola) that gives the largest
-            // signal. This is where a noisy parabola on the preamble metric loses 1 to 4 %.
-            let d = unit_symbols(self.cfg.modulation, &bits);
-            let grid = [-1.0f64, -0.5, 0.0, 0.5, 1.0];
-            let q: Vec<f64> = grid
-                .iter()
-                .map(|&shift| {
-                    let t =
-                        rrc_shifted(sps, self.cfg.rrc_span, self.cfg.rolloff as f64, mu + shift);
-                    let dm = SymbolDemod::new(self, &t, &rr);
-                    d.iter()
-                        .enumerate()
-                        .map(|(k, dk)| {
-                            let (s, c) = (-(a + b * k as f64)).sin_cos();
-                            let y = dm.z(body_start + k) * Complex32::new(c as f32, s as f32);
-                            (y.re * dk.re + y.im * dk.im) as f64
-                        })
-                        .sum()
-                })
-                .collect();
-            let best = (0..grid.len())
-                .max_by(|&i, &j| q[i].total_cmp(&q[j]))
-                .unwrap_or(2);
-            let mut shift = grid[best];
-            if best > 0 && best + 1 < grid.len() {
-                let (y0, y1, y2) = (q[best - 1], q[best], q[best + 1]);
-                let den = y0 - 2.0 * y1 + y2;
-                if den < 0.0 {
-                    shift += 0.5 * (y0 - y2) / den * 0.5; // the grid step is 0.5 samples
-                }
-            }
+            // Timing from the frame's own symbols: this is where a noisy parabola on the
+            // preamble metric loses 1 to 4 %.
+            let shift = self.timing_shift(&rr, mu, body_start, &bits, |k, v| {
+                let (s, c) = (-(a + b * k as f64)).sin_cos();
+                v * Complex32::new(c as f32, s as f32)
+            });
             if shift.abs() > 0.05 {
                 mu_final = mu + shift;
                 let t = rrc_shifted(sps, self.cfg.rrc_span, self.cfg.rolloff as f64, mu_final);
@@ -1290,6 +1333,14 @@ impl Modem {
                             Modulation::Fsk2 => (body_start..total_syms)
                                 .map(|k| dem.fsk_llr(k, rho))
                                 .collect(),
+                            m if tracking => {
+                                let y: Vec<Complex32> = z
+                                    .iter()
+                                    .zip(&body_gain)
+                                    .map(|(&v, &g)| weigh(v, g))
+                                    .collect();
+                                psk_llr(m, &y, 0.0, 0.0, rho)
+                            }
                             m => psk_llr(m, &z, line_a, line_b, rho),
                         };
                         parse_body_light(&soft, &h, n)
@@ -1343,6 +1394,67 @@ impl Modem {
             (ma, mb)
         } else {
             (a, b)
+        }
+    }
+
+    /// Timing: the preamble fixes it to a fraction of a sample at best. The frame's own symbols,
+    /// compared with the decisions `bits` just made, do better: the shift of the matched filter
+    /// (in steps of half a sample from `mu`, then a parabola) that gives the largest signal.
+    /// `turn(k, z)` takes the carrier off body symbol `k`'s matched filter output `z`.
+    fn timing_shift(
+        &self,
+        rr: &[Complex32],
+        mu: f64,
+        body_start: usize,
+        bits: &[u8],
+        turn: impl Fn(usize, Complex32) -> Complex32,
+    ) -> f64 {
+        let d = unit_symbols(self.cfg.modulation, bits);
+        let grid = [-1.0f64, -0.5, 0.0, 0.5, 1.0];
+        let q: Vec<f64> = grid
+            .iter()
+            .map(|&shift| {
+                let t = rrc_shifted(
+                    self.cfg.sps,
+                    self.cfg.rrc_span,
+                    self.cfg.rolloff as f64,
+                    mu + shift,
+                );
+                let dm = SymbolDemod::new(self, &t, rr);
+                d.iter()
+                    .enumerate()
+                    .map(|(k, dk)| {
+                        let y = turn(k, dm.z(body_start + k));
+                        (y.re * dk.re + y.im * dk.im) as f64
+                    })
+                    .sum()
+            })
+            .collect();
+        let best = (0..grid.len())
+            .max_by(|&i, &j| q[i].total_cmp(&q[j]))
+            .unwrap_or(2);
+        let mut shift = grid[best];
+        if best > 0 && best + 1 < grid.len() {
+            let (y0, y1, y2) = (q[best - 1], q[best], q[best + 1]);
+            let den = y0 - 2.0 * y1 + y2;
+            if den < 0.0 {
+                shift += 0.5 * (y0 - y2) / den * 0.5; // the grid step is 0.5 samples
+            }
+        }
+        shift
+    }
+
+    /// What the tracker knows about frame symbol `k`: the preamble and sync word always, the v1
+    /// header symbols when `header` holds them; otherwise `unknown`.
+    fn known_or(&self, k: usize, header: Option<&[u8]>, unknown: Sym) -> Sym {
+        let bit = if k < self.ref_bits.len() {
+            Some(self.ref_bits[k])
+        } else {
+            header.and_then(|h| h.get(k - self.ref_bits.len()).copied())
+        };
+        match bit {
+            Some(b) => Sym::Known(Complex32::new(1.0 - 2.0 * (b & 1) as f32, 0.0)),
+            None => unknown,
         }
     }
 
@@ -1452,6 +1564,21 @@ impl<'a> SymbolDemod<'a> {
 fn slice_symbol(m: Modulation, v: Complex32) -> impl Iterator<Item = u8> {
     let second = (m == Modulation::Qpsk).then_some((v.im < 0.0) as u8);
     std::iter::once((v.re < 0.0) as u8).chain(second)
+}
+
+/// `v conj(g)`: a matched filter output weighed by the tracked channel gain `g` (its phase taken
+/// off, and scaled by `|g|` so a symbol in a fade counts less).
+fn weigh(v: Complex32, g: Complex32) -> Complex32 {
+    v * g.conj()
+}
+
+/// Decisions on PSK matched-filter outputs `z` given the tracked gain of every symbol.
+fn decide_psk_each(m: Modulation, z: &[Complex32], gain: &[Complex32]) -> Vec<u8> {
+    let mut bits = Vec::with_capacity(z.len() * 2);
+    for (&v, &g) in z.iter().zip(gain) {
+        bits.extend(slice_symbol(m, weigh(v, g)));
+    }
+    bits
 }
 
 /// Decisions on PSK matched-filter outputs after turning each symbol back by `a + b * k` radians.

@@ -36,6 +36,7 @@ pub mod rng;
 pub mod sim;
 pub mod stream;
 pub mod theory;
+mod track;
 
 pub use frame::{FrameFormat, HeaderFields};
 pub use iq::Complex32;
