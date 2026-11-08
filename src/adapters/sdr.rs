@@ -263,9 +263,16 @@ impl Shared {
 
     fn event(&self, event: &str, fields: &str) {
         if let Some(l) = &self.log {
+            // t_us: microseconds since the Unix epoch, so two bridges on one host can time a frame one way
+            // (ts has only millisecond resolution)
+            let now = SystemTime::now();
+            let t_us = now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_micros())
+                .unwrap_or(0);
             let line = format!(
-                "{{\"ts\":\"{}\",\"event\":\"{event}\"{fields}}}\n",
-                rfc3339(SystemTime::now())
+                "{{\"ts\":\"{}\",\"t_us\":{t_us},\"event\":\"{event}\"{fields}}}\n",
+                rfc3339(now)
             );
             if l.try_send(LogMsg::Line(line)).is_err() {
                 self.log_dropped.fetch_add(1, Ordering::Relaxed);
