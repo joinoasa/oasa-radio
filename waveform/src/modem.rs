@@ -25,6 +25,9 @@
 //! With `RxConfig::phase_track` (B12, `docs/phase-tracking.md`) the header and body are decided
 //! with the channel gain tracked symbol block by symbol block (`track.rs`) instead of one phase line.
 //!
+//! With `RxConfig::equalizer` (B15, `docs/equalizer.md`) the v1 header and body go through a decision
+//! feedback equalizer solved from the known symbols (`equalize.rs`), for multipath.
+//!
 //! With the light code (`payload_code` 1, `docs/fec-light.md`) the body symbols become soft values
 //! (log-likelihood ratios, see [`fsk_llr`] and `decode_at`), are de-interleaved and Viterbi decoded.
 //!
@@ -32,6 +35,7 @@
 //! (see `docs/waveform-w0.md` for the range), unknown gain. Not handled: fractional timing, sample clock
 //! offset, multipath, a stream in chunks (a call takes one buffer).
 
+use crate::equalize;
 use crate::frame::{
     body_bits, body_bits_light, body_bits_v1, body_len_bits, body_len_bits_coded, header_symbols,
     parse_body, parse_body_light, parse_body_v1, parse_header, parse_header_v1, preamble_bits,
@@ -190,6 +194,12 @@ pub struct RxConfig {
     /// phase line as before. Receiver only; nothing changes on the air. See
     /// `docs/phase-tracking.md` and `waveform/src/track.rs`.
     pub phase_track: f32,
+    /// Equalize the v1 header and body (BPSK and QPSK v1, even `sps`) with a decision feedback
+    /// equalizer solved from the preamble, sync word and decoded header, for strong echoes (B15).
+    /// It replaces the phase line, the channel tracker (`phase_track` is then not used) and the
+    /// timing refinement for that frame. Off by default. Receiver only; nothing changes on the
+    /// air. See `docs/equalizer.md` and `waveform/src/equalize.rs`.
+    pub equalizer: bool,
 }
 
 impl Default for RxConfig {
@@ -206,6 +216,7 @@ impl Default for RxConfig {
             only_code: None,
             coarse_step: 0,
             phase_track: 0.0,
+            equalizer: false,
         }
     }
 }
@@ -1137,8 +1148,14 @@ impl Modem {
                 .collect()
         };
         let mut rr = derotate(omega, psi, amp, take);
-        let tracking =
-            rx.phase_track > 0.0 && rx.refine_phase && self.cfg.modulation != Modulation::Fsk2;
+        let equalizing = rx.equalizer
+            && self.cfg.frame == FrameFormat::V1
+            && self.cfg.modulation != Modulation::Fsk2
+            && sps % 2 == 0;
+        let tracking = !equalizing
+            && rx.phase_track > 0.0
+            && rx.refine_phase
+            && self.cfg.modulation != Modulation::Fsk2;
         let q_track = track::rate_noise(rx.phase_track as f64);
         let taps = if self.cfg.modulation == Modulation::Fsk2 {
             Vec::new()
@@ -1173,7 +1190,15 @@ impl Modem {
                 }
             },
             FrameFormat::V1 => {
-                let soft: Vec<f32> = if tracking {
+                let soft: Vec<f32> = if equalizing {
+                    // feed-forward taps from the preamble and sync word; the header is unknown yet
+                    let half = dem.half(body_start);
+                    let t = equalize::train(&half, &bpsk_symbols(&self.ref_bits), false, &[]);
+                    t.linear(&half, n_ref..body_start)
+                        .iter()
+                        .map(|v| v.re)
+                        .collect()
+                } else if tracking {
                     // the channel through preamble, sync word and header (one bit per symbol each)
                     let zh: Vec<Complex32> = (0..body_start).map(|k| dem.z(k)).collect();
                     let g = track::track(
@@ -1229,12 +1254,41 @@ impl Modem {
         dem.body_symbols(body_start, total_syms - body_start, &mut z, &mut bits);
         let mut mu_final = mu;
         // Es/N0 of this frame: the matched filter outputs have amplitude 1 and noise variance 1 / rho
-        let rho = amp * amp / noise_per_sample;
+        let mut rho = amp * amp / noise_per_sample;
         // the phase line the PSK body is turned back by (none without the refinement)
         let (mut line_a, mut line_b) = (0.0f64, 0.0f64);
         // the tracked channel gain of every body symbol (then `line_a`, `line_b` stay 0)
         let mut body_gain: Vec<Complex32> = Vec::new();
-        if tracking {
+        if equalizing {
+            let mut known_bits = self.ref_bits.clone();
+            if let Some(h) = &header {
+                known_bits.extend(header_symbols(h));
+            }
+            let known = bpsk_symbols(&known_bits);
+            let half = dem.half(total_syms);
+            let m = self.cfg.modulation;
+            let decide = |v: Complex32| nearest_symbol(m, v);
+            // the body runs on from the end of the known symbols (the header, or the sync word when
+            // `expected_len` let an undecoded header through)
+            let first = known.len();
+            let t = equalize::train(&half, &known, true, &[]);
+            let (z1, phase) = t.run(&half, &known, first, total_syms - first, &[], decide);
+            // Second pass: solve again over the whole frame, the body's decisions counting as
+            // known and the first pass's phase taken off (so a long frame's drift does not
+            // average the taps down). Twice the training symbols cut the loss at 12 dB for an
+            // echo one symbol late about fourfold (docs/equalizer.md).
+            let mut all = known.clone();
+            all.extend(z1.iter().map(|&v| decide(v)));
+            let t = equalize::train(&half, &all, true, &phase);
+            z = t
+                .run(&half, &known, first, total_syms - first, &phase, decide)
+                .0;
+            if first < body_start {
+                z.drain(..body_start - first);
+            }
+            bits = z.iter().flat_map(|&v| slice_symbol(m, v)).collect();
+            rho = 1.0 / t.mse;
+        } else if tracking {
             let body_kind = if self.cfg.modulation == Modulation::Bpsk {
                 Sym::Bpsk
             } else {
@@ -1498,6 +1552,31 @@ impl<'a> SymbolDemod<'a> {
         Complex32::new(re, im)
     }
 
+    /// Matched filter outputs at half-symbol spacing for symbols `0..nsym`, laid out as
+    /// [`equalize`] takes them: entry `2 k + i` is `(i - PRE)` half symbols from symbol `k`'s
+    /// instant. Samples outside the buffer count as zero. `sps` must be even.
+    fn half(&self, nsym: usize) -> Vec<Complex32> {
+        let half = self.m.cfg.sps / 2;
+        (0..2 * nsym + equalize::FFE)
+            .map(|j| {
+                let base = j as isize * half as isize - (equalize::PRE * half) as isize;
+                let skip = (-base).max(0) as usize;
+                let from = base.max(0) as usize;
+                let (mut re, mut im) = (0.0f32, 0.0f32);
+                if from < self.rr.len() {
+                    for (&t, s) in self.h[skip.min(self.h.len())..]
+                        .iter()
+                        .zip(&self.rr[from..])
+                    {
+                        re += t * s.re;
+                        im += t * s.im;
+                    }
+                }
+                Complex32::new(re, im)
+            })
+            .collect()
+    }
+
     /// Energies of the "+" tone (bit 1) and the "-" tone (bit 0) in symbol `k` (2-FSK).
     fn tones(&self, k: usize) -> (f32, f32) {
         let sps = self.m.cfg.sps;
@@ -1557,6 +1636,24 @@ impl<'a> SymbolDemod<'a> {
                 }
             }
         }
+    }
+}
+
+/// One bit per symbol as `+-1` (preamble, sync word, v1 header).
+fn bpsk_symbols(bits: &[u8]) -> Vec<Complex32> {
+    bits.iter()
+        .map(|&b| Complex32::new(1.0 - 2.0 * (b & 1) as f32, 0.0))
+        .collect()
+}
+
+/// The unit-energy PSK symbol nearest `v`.
+fn nearest_symbol(m: Modulation, v: Complex32) -> Complex32 {
+    let sign = |x: f32| if x < 0.0 { -1.0 } else { 1.0 };
+    if m == Modulation::Bpsk {
+        Complex32::new(sign(v.re), 0.0)
+    } else {
+        let k = std::f32::consts::FRAC_1_SQRT_2;
+        Complex32::new(sign(v.re) * k, sign(v.im) * k)
     }
 }
 

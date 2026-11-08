@@ -82,6 +82,10 @@ RADIOS:
                                  Doppler (receiver only, on-air format unchanged; at most
                                  0.01 of the symbol rate). Default 0: off, one phase line
                                  per frame. 200 at 250 kbaud: docs/phase-tracking.md
+            --equalizer on|off   equalize strong echoes (multipath) in each frame, taps
+                                 solved from its preamble and header (receiver only,
+                                 on-air format unchanged). Default off. Not with
+                                 --phase-track-hz. docs/equalizer.md
             --sdr-log PATH       JSON lines: frames, offsets, timings (sizes only)
             --rx-record PATH     the received baseband after the shift (cf32), for the lab
             --rx-record-seconds  how much of it, default 60
@@ -472,6 +476,13 @@ fn sdr_spec(named: &mut BTreeMap<String, String>) -> R<SdrConfig> {
         named.remove("phase-track-hz"),
         c.phase_track_hz,
     )?;
+    if let Some(v) = named.remove("equalizer") {
+        c.equalizer = match v.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => return Err("--equalizer must be on or off".into()),
+        };
+    }
     c.log = named.remove("sdr-log").map(Into::into);
     c.rx_record = named.remove("rx-record").map(Into::into);
     c.check()?;
@@ -731,6 +742,25 @@ mod tests {
             "--symbol-rate 250000 --decimate 1 --phase-track-hz 2501",
             "--phase-track-hz -1",
             "--phase-track-hz x",
+        ] {
+            assert!(sdr(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn sdr_equalizer_option() {
+        let base = format!("bridge --radio sdr --tx t --rx r {UDPS}");
+        let sdr = |extra: &str| match parse(&v(&format!("{base} {extra}"))) {
+            Ok(Command::Bridge(RadioSpec::Sdr(c), _)) => Ok(c),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e),
+        };
+        assert!(!sdr("").unwrap().equalizer);
+        assert!(sdr("--equalizer on").unwrap().equalizer);
+        assert!(!sdr("--equalizer off").unwrap().equalizer);
+        for bad in [
+            "--equalizer yes",
+            "--symbol-rate 250000 --decimate 1 --equalizer on --phase-track-hz 200",
         ] {
             assert!(sdr(bad).is_err(), "{bad}");
         }

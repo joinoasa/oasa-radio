@@ -55,3 +55,7 @@ fading costs about 17 dB at 1 % (diversity or coding and retransmission are the 
 **Since B12:** `--phase-track-hz` (receiver only, off by default) follows the channel through the frame
 instead of one line. With it, Rayleigh 50 Hz no longer has a floor and 200 Hz drops from about 26 % to about 2 %
 at 30 dB uncoded (0.4 % with `--code light`); white noise is unchanged. See [phase-tracking.md](phase-tracking.md).
+
+**Since B15:** `--equalizer on` (receiver only, off by default) equalizes each frame with a decision feedback
+equalizer solved from its preamble and header. A -3 dB echo 1, 2 or 4 us late then reaches 1 % loss at 16.7, 13.9
+and 12.1 dB (no floor); white noise costs 0.13 dB. See [equalizer.md](equalizer.md).
