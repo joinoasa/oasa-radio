@@ -33,6 +33,8 @@ WAVEFORM (W0, simulation):
                           [--sps 8] [--payload-len 64] [--cfo CYCLES_PER_SYMBOL]
                           [--cfo-random MAX] [--random-frac-delay] [--cfo-bins 0]
                           [--cfo-search MAX] [--frame w0|v1] [--code none|light] [--json]
+                          [--channel awgn|tworay|rayleigh] [--doppler-hz 0] [--ray-delay-us 1]
+                          [--ray-gain-db -3] [--symbol-rate 250000] [--frame-interval-ms 10]
   oasa-radio waveform per --mod bpsk|qpsk|fsk2 --ebn0-db 3,3.5,4 [--frames 400] [--sync-max-errors 3]
                           [same options as ber, except --bits]
   oasa-radio waveform iq --mod bpsk|qpsk|fsk2 --out BASE [--ebn0-db X] [--payload-len 32 | --payload-hex HEX]
@@ -46,6 +48,8 @@ WAVEFORM (W0, simulation):
                                 [same receiver options as decode]
   oasa-radio waveform cable --in FILE --out FILE [--gain-db 0] [--noise-dbfs -60] [--cfo-hz 0]
                             [--sample-rate 1000000] [--seed 1]
+                            [--channel awgn|tworay|rayleigh] [--doppler-hz 0] [--ray-delay-us 1]
+                            [--ray-gain-db -3]
   oasa-radio waveform df --in1 FILE --in2 FILE [--format ci16|cf32] [--block N]
                          [--burst-db 10] [--win 256] [--min-len 4096] [--skip 0]
                          [--cal-deg 0] [--spacing-wl D]
@@ -103,6 +107,14 @@ WAVEFORM (W0, simulation):
   receiver reads the code from each header, so decode and rx-stream need --code only with
   --payload-len (the length, and then the code, taken as known).
 
+  Fading (--channel, B9; waveform/src/fading.rs): tworay adds a second ray --ray-delay-us later and
+  --ray-gain-db weaker (with no --doppler-hz, a fixed ray and a random phase per frame; with Doppler,
+  each ray fades on its own: two-ray Rayleigh). rayleigh is flat Rayleigh fading with a Clarke/Jakes
+  spectrum, --doppler-hz = speed / wavelength. Mean power gain 1, so --ebn0-db is the mean. ber and
+  per take --symbol-rate (for the sample rate) and --frame-interval-ms (time between frames: the
+  fading moves on by this from frame to frame); the cable uses --sample-rate and rounds the second
+  ray's delay to whole samples. awgn (the default) leaves everything as before.
+
   Frequency offsets (--cfo, --cfo-random, --cfo-search) are in cycles per symbol: 1.0 is one symbol
   rate. --cfo-search MAX turns on the coarse frequency search (an FFT over the preamble) for offsets
   up to +-MAX (see docs/waveform-w0.md for its cost). --cfo-bins is the older narrow search; give
@@ -124,6 +136,120 @@ pub struct BerArgs {
     pub random_frac_delay: bool,
     pub cfo_bins: usize,
     pub cfo_search: f64,
+    /// Fading model and its settings (B9): see `ChannelArgs`.
+    pub channel: ChannelArgs,
+}
+
+/// `--channel awgn|tworay|rayleigh` and its options, in physical units (the sample rate comes from
+/// `--symbol-rate` times `--sps` for `ber`/`per`, from `--sample-rate` for `cable`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChannelArgs {
+    pub kind: String,
+    pub doppler_hz: f64,
+    pub ray_delay_us: f64,
+    pub ray_gain_db: f64,
+    /// Symbols per second (`ber`/`per` only; the cable has its own `--sample-rate`).
+    pub symbol_rate: f64,
+    /// Time from one frame's start to the next, ms (`ber`/`per` only).
+    pub frame_interval_ms: f64,
+}
+
+impl Default for ChannelArgs {
+    fn default() -> Self {
+        Self {
+            kind: "awgn".into(),
+            doppler_hz: 0.0,
+            ray_delay_us: 1.0,
+            ray_gain_db: -3.0,
+            symbol_rate: 250_000.0,
+            frame_interval_ms: 10.0,
+        }
+    }
+}
+
+impl ChannelArgs {
+    /// The model at `sample_rate` samples per second.
+    pub fn fading(&self, sample_rate: f64) -> oasa_waveform::fading::Fading {
+        use oasa_waveform::fading::Fading;
+        let doppler = self.doppler_hz / sample_rate;
+        match self.kind.as_str() {
+            "tworay" => Fading::TwoRay {
+                delay: self.ray_delay_us * 1e-6 * sample_rate,
+                gain_db: self.ray_gain_db,
+                doppler,
+            },
+            "rayleigh" => Fading::Rayleigh { doppler },
+            _ => Fading::None,
+        }
+    }
+
+    /// `,"channel":...` for a JSON line, or nothing for AWGN (so the default output is unchanged).
+    pub fn json(&self) -> String {
+        match self.kind.as_str() {
+            "awgn" => String::new(),
+            "tworay" => format!(
+                ",\"channel\":\"tworay\",\"ray_delay_us\":{},\"ray_gain_db\":{},\"doppler_hz\":{},\"symbol_rate\":{},\"frame_interval_ms\":{}",
+                num(self.ray_delay_us), num(self.ray_gain_db), num(self.doppler_hz), num(self.symbol_rate), num(self.frame_interval_ms)
+            ),
+            _ => format!(
+                ",\"channel\":\"rayleigh\",\"doppler_hz\":{},\"symbol_rate\":{},\"frame_interval_ms\":{}",
+                num(self.doppler_hz), num(self.symbol_rate), num(self.frame_interval_ms)
+            ),
+        }
+    }
+}
+
+/// Reads `--channel` and its options (shared by `ber`, `per` and `cable`).
+fn parse_channel(named: &mut BTreeMap<String, String>, with_rate: bool) -> R<ChannelArgs> {
+    let d = ChannelArgs::default();
+    let kind = named.remove("channel").unwrap_or_else(|| "awgn".into());
+    if !matches!(kind.as_str(), "awgn" | "tworay" | "rayleigh") {
+        return Err(format!("--channel {kind:?}: use awgn, tworay or rayleigh"));
+    }
+    let c = ChannelArgs {
+        doppler_hz: opt_float("doppler-hz", named.remove("doppler-hz"), 0.0, 0.0, 1e6)?,
+        ray_delay_us: opt_float(
+            "ray-delay-us",
+            named.remove("ray-delay-us"),
+            d.ray_delay_us,
+            0.0,
+            1e4,
+        )?,
+        ray_gain_db: opt_float(
+            "ray-gain-db",
+            named.remove("ray-gain-db"),
+            d.ray_gain_db,
+            -60.0,
+            0.0,
+        )?,
+        symbol_rate: if with_rate {
+            opt_float(
+                "symbol-rate",
+                named.remove("symbol-rate"),
+                d.symbol_rate,
+                1.0,
+                1e9,
+            )?
+        } else {
+            d.symbol_rate
+        },
+        frame_interval_ms: if with_rate {
+            opt_float(
+                "frame-interval-ms",
+                named.remove("frame-interval-ms"),
+                d.frame_interval_ms,
+                0.0,
+                1e6,
+            )?
+        } else {
+            d.frame_interval_ms
+        },
+        kind,
+    };
+    if c.kind == "rayleigh" && c.doppler_hz <= 0.0 {
+        return Err("--channel rayleigh needs --doppler-hz above 0".into());
+    }
+    Ok(c)
 }
 
 /// `per`: the options of `ber` (its `bits` unused), the number of frames and the sync tolerance.
@@ -305,6 +431,7 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
                 random_frac_delay: flags.iter().any(|f| f == "random-frac-delay"),
                 cfo_bins: int("cfo-bins", named.remove("cfo-bins"), 0, 0, 20)? as usize,
                 cfo_search: opt_float("cfo-search", named.remove("cfo-search"), 0.0, 0.0, half)?,
+                channel: parse_channel(&mut named, true)?,
             };
             if sub == "ber" {
                 WaveformCommand::Ber(a)
@@ -460,6 +587,12 @@ fn parse_cable(mut named: BTreeMap<String, String>) -> R<WaveformCommand> {
             1e9,
         )?,
         seed: int("seed", named.remove("seed"), d.seed, 0, u64::MAX)?,
+        fading: Default::default(),
+    };
+    let ch = parse_channel(&mut named, false)?;
+    let cfg = crate::cable::CableConfig {
+        fading: ch.fading(cfg.sample_rate),
+        ..cfg
     };
     if let Some(k) = named.keys().next() {
         return Err(format!("unknown option --{k} for cable"));
@@ -659,6 +792,8 @@ fn ber_options(a: &BerArgs) -> BerOptions {
             cfo_search: a.cfo_search as f32,
             ..RxConfig::default()
         },
+        fading: a.channel.fading(a.channel.symbol_rate * a.sps as f64),
+        frame_interval: a.channel.frame_interval_ms * 1e-3 * a.channel.symbol_rate * a.sps as f64,
         ..BerOptions::default()
     }
 }
@@ -674,7 +809,7 @@ fn run_ber_cmd(a: &BerArgs, out: &mut dyn Write) -> R<()> {
         let p = run_ber(a.modulation, db, a.bits, a.seed, &opts).map_err(|e| e.to_string())?;
         writeln!(
             out,
-            "{{\"ts\":\"{}\",\"event\":\"ber\",\"mod\":\"{}\",\"ebn0_db\":{},\"bits\":{},\"errors\":{},\"ber\":{},\"theory\":{},\"ci_lo\":{},\"ci_hi\":{},\"z\":{},\"frame\":\"{}\",\"code\":\"{}\",\"frames\":{},\"detected\":{},\"crc_ok\":{}{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"theory_kind\":{}}}",
+            "{{\"ts\":\"{}\",\"event\":\"ber\",\"mod\":\"{}\",\"ebn0_db\":{},\"bits\":{},\"errors\":{},\"ber\":{},\"theory\":{},\"ci_lo\":{},\"ci_hi\":{},\"z\":{},\"frame\":\"{}\",\"code\":\"{}\",\"frames\":{},\"detected\":{},\"crc_ok\":{}{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"theory_kind\":{}{}}}",
             now(),
             a.modulation.name(),
             num(db),
@@ -704,6 +839,7 @@ fn run_ber_cmd(a: &BerArgs, out: &mut dyn Write) -> R<()> {
             a.cfo_bins,
             num(a.cfo_search),
             json_str(theory),
+            a.channel.json(),
         )
         .map_err(io)?;
         out.flush().map_err(io)?;
@@ -722,7 +858,7 @@ fn run_per_cmd(p: &PerArgs, out: &mut dyn Write) -> R<()> {
         let c = &r.report;
         writeln!(
             out,
-            "{{\"ts\":\"{}\",\"event\":\"per\",\"mod\":\"{}\",\"frame\":\"{}\",\"code\":\"{}\",\"ebn0_db\":{},\"frames\":{},\"found\":{},\"delivered\":{},\"packet_loss\":{},\"ci_lo\":{},\"ci_hi\":{},\"preambles\":{},\"sync_rejected\":{},\"header_rejected\":{},\"too_short\":{},\"inside_frame\":{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"frame_symbols\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"sync_max_errors\":{}}}",
+            "{{\"ts\":\"{}\",\"event\":\"per\",\"mod\":\"{}\",\"frame\":\"{}\",\"code\":\"{}\",\"ebn0_db\":{},\"frames\":{},\"found\":{},\"delivered\":{},\"packet_loss\":{},\"ci_lo\":{},\"ci_hi\":{},\"preambles\":{},\"sync_rejected\":{},\"header_rejected\":{},\"too_short\":{},\"inside_frame\":{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"frame_symbols\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"sync_max_errors\":{}{}}}",
             now(),
             a.modulation.name(),
             a.frame.name(),
@@ -749,6 +885,7 @@ fn run_per_cmd(p: &PerArgs, out: &mut dyn Write) -> R<()> {
             a.cfo_bins,
             num(a.cfo_search),
             p.sync_max_errors,
+            a.channel.json(),
         )
         .map_err(io)?;
         out.flush().map_err(io)?;

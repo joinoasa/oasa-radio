@@ -28,6 +28,7 @@ fn cable_thread(from: PathBuf, to: PathBuf, cfo_hz: f64, seed: u64) {
             cfo_hz,
             sample_rate: 200e3,
             seed,
+            ..CableConfig::default()
         };
         let _ = cable::run(&cfg, &mut i, &mut o);
     });

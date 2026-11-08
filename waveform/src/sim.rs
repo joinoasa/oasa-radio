@@ -3,6 +3,7 @@
 //! `oasa-radio waveform ber`.
 
 use crate::channel::{n0_for_ebn0, Channel, Impairments};
+use crate::fading::{Fader, Fading};
 use crate::frame::{FrameFormat, HeaderFields, PayloadCode};
 use crate::modem::{ConfigError, Modem, ModemConfig, Modulation, RxConfig, RxReport};
 use crate::theory;
@@ -29,6 +30,10 @@ pub struct BerOptions {
     pub cfo_random: f64,
     /// Receiver settings other than the BER-measurement ones (`expected_len`, no sync rejection).
     pub rx: RxConfig,
+    /// Fading applied to each frame before the rest of the channel (see [`crate::fading`]). None by default.
+    pub fading: Fading,
+    /// Samples from one frame's start to the next, for the fading's clock (frames sent at this rate).
+    pub frame_interval: f64,
 }
 
 impl Default for BerOptions {
@@ -44,6 +49,8 @@ impl Default for BerOptions {
             cfo_cycles_per_symbol: 0.0,
             cfo_random: 0.0,
             rx: RxConfig::default(),
+            fading: Fading::None,
+            frame_interval: 10_000.0,
         }
     }
 }
@@ -107,6 +114,12 @@ pub fn run_ber(
     let frames = target_bits.div_ceil(frame_bits).max(1);
     let mixed = seed ^ ebn0_db.to_bits().rotate_left(17) ^ (modulation as u64) << 60;
     let mut ch = Channel::new(mixed);
+    // its own generator, so the AWGN-only runs stay bit-identical
+    let mut fader = Fader::new(
+        opts.fading,
+        opts.frame_interval,
+        mixed ^ 0x0FAD_E5EE_D000_0001,
+    );
     let n0 = n0_for_ebn0(ebn0_db, modem.energy_per_bit());
     // BER measurement: do not drop frames on a sync or header error, take the length as known.
     let rx = RxConfig {
@@ -123,6 +136,11 @@ pub fn run_ber(
     for _ in 0..frames {
         let payload = ch.rng().bytes(opts.payload_len);
         let tx = modem.modulate(&payload)?;
+        let tx = if fader.is_none() {
+            tx
+        } else {
+            fader.apply(&tx)
+        };
         let lead = 2 + ch.rng().below(opts.max_delay as u64 + 1) as usize;
         let cfo = if opts.cfo_random > 0.0 {
             opts.cfo_cycles_per_symbol + (2.0 * ch.rng().uniform() - 1.0) * opts.cfo_random
@@ -227,6 +245,12 @@ pub fn run_found(
     }
     let mixed = seed ^ ebn0_db.to_bits().rotate_left(17) ^ (modulation as u64) << 60;
     let mut ch = Channel::new(mixed);
+    // its own generator, so the AWGN-only runs stay bit-identical
+    let mut fader = Fader::new(
+        opts.fading,
+        opts.frame_interval,
+        mixed ^ 0x0FAD_E5EE_D000_0001,
+    );
     let n0 = n0_for_ebn0(ebn0_db, modem.energy_per_bit());
     let rx = RxConfig {
         expected_len: None,
@@ -237,6 +261,11 @@ pub fn run_found(
     for _ in 0..frames {
         let payload = ch.rng().bytes(opts.payload_len);
         let tx = modem.modulate(&payload)?;
+        let tx = if fader.is_none() {
+            tx
+        } else {
+            fader.apply(&tx)
+        };
         let lead = 2 + ch.rng().below(opts.max_delay as u64 + 1) as usize;
         let cfo = if opts.cfo_random > 0.0 {
             opts.cfo_cycles_per_symbol + (2.0 * ch.rng().uniform() - 1.0) * opts.cfo_random
