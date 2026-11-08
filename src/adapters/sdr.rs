@@ -266,7 +266,10 @@ impl Shared {
             // t_us: microseconds since the Unix epoch, so two bridges on one host can time a frame one way
             // (ts has only millisecond resolution)
             let now = SystemTime::now();
-            let t_us = now.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_micros()).unwrap_or(0);
+            let t_us = now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_micros())
+                .unwrap_or(0);
             let line = format!(
                 "{{\"ts\":\"{}\",\"t_us\":{t_us},\"event\":\"{event}\"{fields}}}\n",
                 rfc3339(now)
