@@ -188,3 +188,43 @@ fn live_needs_the_coarse_search() {
     let md = Modem::new(ModemConfig::new(Modulation::Qpsk)).unwrap();
     assert!(LiveReceiver::new(md, RxConfig::default()).is_err());
 }
+
+#[test]
+fn the_search_range_can_change_mid_stream() {
+    // as acquisition runs it: wide until frames come, then narrow; the frames are the same as with
+    // the narrow search all along (the offset is inside both), and the work per position drops
+    let md = Modem::new(v1(Modulation::Qpsk, PayloadCode::None)).unwrap();
+    let x = recording(&md, 30, 120, 10.0, 0.01, 6);
+    let narrow = radio_rx(200, PayloadCode::None);
+    let wide = RxConfig {
+        cfo_search: 0.15,
+        ..narrow.clone()
+    };
+    let (want, _, _) = live(md.clone(), &narrow, &x, &[512]);
+    let mut s = LiveReceiver::new(md, wide).unwrap();
+    let wide_fft = s.coarse().fft_len as u64;
+    let mut got = Vec::new();
+    let mut at_switch = None;
+    for b in x.chunks(512) {
+        got.extend(s.push(b));
+        if at_switch.is_none() && !got.is_empty() {
+            s.set_cfo_search(0.03).unwrap();
+            assert_eq!(s.cfo_search(), 0.03);
+            at_switch = Some(s.search_work());
+        }
+    }
+    got.extend(s.finish());
+    assert_eq!(
+        got.iter().map(key).collect::<Vec<_>>(),
+        want.iter().map(key).collect::<Vec<_>>()
+    );
+    let (a, b) = (at_switch.unwrap(), s.search_work());
+    assert_eq!(a.fft_points, a.positions * wide_fft);
+    let narrow_fft = s.coarse().fft_len as u64;
+    assert!(narrow_fft < wide_fft);
+    assert_eq!(
+        b.fft_points - a.fft_points,
+        (b.positions - a.positions) * narrow_fft
+    );
+    assert!(s.set_cfo_search(0.0).is_err());
+}

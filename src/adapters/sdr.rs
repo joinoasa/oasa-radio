@@ -39,7 +39,7 @@ use std::time::{Duration, Instant, SystemTime};
 use oasa_waveform::frame::{FrameFormat, PayloadCode};
 use oasa_waveform::iq::{from_cf32_le, from_ci16_le};
 use oasa_waveform::stream::LiveReceiver;
-use oasa_waveform::{Complex32, Modem, ModemConfig, Modulation, RxConfig};
+use oasa_waveform::{Complex32, Modem, ModemConfig, Modulation, RxConfig, RxFrame};
 
 use crate::log::{json_str, rfc3339};
 use crate::radio::{Counters, Radio, RadioError, RadioInfo};
@@ -60,6 +60,8 @@ const RX_READ: usize = 4096;
 const FIR_TAPS: usize = 31;
 /// How much of each frame's residual offset the tracker takes.
 const CFO_TRACK_GAIN: f64 = 0.3;
+/// Offset changes remembered for frames still in the receiver (one per good frame at most).
+const MAX_SHIFTS: usize = 64;
 
 /// How frames go to the radio tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,8 +134,18 @@ pub struct SdrConfig {
     pub cfo_hz: f64,
     /// Follow the offset from each good frame's estimate.
     pub track_cfo: bool,
-    /// The receiver's coarse frequency search, cycles per symbol (0 = off).
+    /// The receiver's coarse frequency search, cycles per symbol (0 = off). With `cfo_acquire` on:
+    /// the narrow search used once locked.
     pub cfo_search: f32,
+    /// Acquisition: search this wide (cycles per symbol) until frames decode, then `cfo_search`
+    /// around the tracked offset. 0: off (always `cfo_search`). Needs `track_cfo`.
+    pub cfo_acquire: f32,
+    /// Good frames in a row that count as locked.
+    pub cfo_lock_frames: u32,
+    /// Bad frames (CRC failed) in a row that drop the lock.
+    pub cfo_unlock_bad: u32,
+    /// Stream time without a good frame that drops the lock, ms.
+    pub cfo_unlock_ms: u64,
     /// Keep every n-th sample after the filter (1 or 2; the receiver needs 4 or more per symbol).
     pub decimate: usize,
     /// Samples (after decimation) per receiver pass. Smaller: less delay, a little more work.
@@ -169,6 +181,10 @@ impl SdrConfig {
             cfo_hz: 0.0,
             track_cfo: true,
             cfo_search: 0.03,
+            cfo_acquire: 0.0,
+            cfo_lock_frames: 2,
+            cfo_unlock_bad: 3,
+            cfo_unlock_ms: 500,
             decimate: 2,
             block: 512,
             coarse_step: 0,
@@ -222,6 +238,23 @@ impl SdrConfig {
         }
         if !(self.cfo_search > 0.0 && self.cfo_search.is_finite()) {
             return Err("--cfo-search must be above 0 (the live receiver needs it)".into());
+        }
+        if self.cfo_acquire != 0.0 {
+            if !(self.cfo_acquire > self.cfo_search && self.cfo_acquire.is_finite()) {
+                return Err("--cfo-acquire must be wider than --cfo-search (or 0: off)".into());
+            }
+            if !self.track_cfo {
+                return Err("--cfo-acquire needs --track-cfo on".into());
+            }
+            if !(1..=1000).contains(&self.cfo_lock_frames) {
+                return Err("--cfo-lock-frames must be 1 to 1000".into());
+            }
+            if !(1..=1000).contains(&self.cfo_unlock_bad) {
+                return Err("--cfo-unlock-bad must be 1 to 1000".into());
+            }
+            if !(1..=3_600_000).contains(&self.cfo_unlock_ms) {
+                return Err("--cfo-unlock-ms must be 1 to 3600000".into());
+            }
         }
         if !(Duration::from_millis(1)..=Duration::from_secs(1)).contains(&self.tx_lead) {
             return Err("--tx-lead-ms must be 1 to 1000".into());
@@ -347,7 +380,11 @@ impl SdrRadio {
         })
         .map_err(|e| RadioError::Config(e.to_string()))?;
         let rx_cfg = RxConfig {
-            cfo_search: cfg.cfo_search,
+            cfo_search: if cfg.cfo_acquire > 0.0 {
+                cfg.cfo_acquire
+            } else {
+                cfg.cfo_search
+            },
             max_len: Some(cfg.mtu),
             only_code: Some(cfg.code),
             coarse_step: cfg.coarse_step,
@@ -384,13 +421,15 @@ impl SdrRadio {
         shared.event(
             "sdr_start",
             &format!(
-                ",\"mod\":\"{}\",\"code\":\"{}\",\"sample_rate\":{},\"symbol_rate\":{},\"if_hz\":{},\"cfo_hz\":{},\"decimate\":{},\"block\":{},\"mtu\":{},\"tx_mode\":\"{}\",\"longest_frame_samples\":{}",
+                ",\"mod\":\"{}\",\"code\":\"{}\",\"sample_rate\":{},\"symbol_rate\":{},\"if_hz\":{},\"cfo_hz\":{},\"cfo_search\":{},\"cfo_acquire\":{},\"decimate\":{},\"block\":{},\"mtu\":{},\"tx_mode\":\"{}\",\"longest_frame_samples\":{}",
                 cfg.modulation.name(),
                 cfg.code.name(),
                 cfg.sample_rate,
                 cfg.symbol_rate,
                 cfg.if_hz,
                 cfg.cfo_hz,
+                cfg.cfo_search,
+                cfg.cfo_acquire,
                 cfg.decimate,
                 cfg.block,
                 cfg.mtu,
@@ -787,12 +826,241 @@ fn tx_bursts(cfg: &SdrConfig, shared: &Shared, f: File) {
     }
 }
 
-fn rx_thread(
-    cfg: &SdrConfig,
-    shared: &Shared,
-    mut receiver: LiveReceiver,
-    out: SyncSender<Vec<u8>>,
-) {
+/// Why the acquisition lock was dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnlockReason {
+    BadFrames,
+    Timeout,
+}
+
+impl UnlockReason {
+    fn name(self) -> &'static str {
+        match self {
+            UnlockReason::BadFrames => "bad_frames",
+            UnlockReason::Timeout => "timeout",
+        }
+    }
+}
+
+/// A change of the acquisition state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CfoChange {
+    Lock,
+    Unlock(UnlockReason),
+}
+
+/// Acquisition state (`--cfo-acquire`): wide search until `lock_frames` good frames in a row, then
+/// locked (narrow search around the tracked offset) until `unlock_bad` bad frames in a row or
+/// `timeout` samples without a good frame. Times are stream sample counts, so the state does not
+/// depend on how fast the receiver runs.
+#[derive(Debug, Clone)]
+struct CfoLock {
+    locked: bool,
+    /// Good frames in a row while acquiring.
+    good: u32,
+    /// Bad frames in a row while locked.
+    bad: u32,
+    /// Stream sample of the last good frame.
+    last_good: u64,
+    lock_frames: u32,
+    unlock_bad: u32,
+    timeout: u64,
+}
+
+impl CfoLock {
+    fn new(lock_frames: u32, unlock_bad: u32, timeout: u64) -> Self {
+        Self {
+            locked: false,
+            good: 0,
+            bad: 0,
+            last_good: 0,
+            lock_frames,
+            unlock_bad,
+            timeout,
+        }
+    }
+
+    /// A frame ending at stream sample `at`.
+    fn frame(&mut self, crc_ok: bool, at: u64) -> Option<CfoChange> {
+        if crc_ok {
+            self.last_good = self.last_good.max(at);
+            self.bad = 0;
+            if !self.locked {
+                self.good += 1;
+                if self.good >= self.lock_frames {
+                    self.locked = true;
+                    self.good = 0;
+                    return Some(CfoChange::Lock);
+                }
+            }
+            return None;
+        }
+        if !self.locked {
+            self.good = 0;
+            return None;
+        }
+        self.bad += 1;
+        if self.bad >= self.unlock_bad {
+            self.unlock();
+            return Some(CfoChange::Unlock(UnlockReason::BadFrames));
+        }
+        None
+    }
+
+    /// The stream has reached sample `at`.
+    fn tick(&mut self, at: u64) -> Option<CfoChange> {
+        if self.locked && at.saturating_sub(self.last_good) > self.timeout {
+            self.unlock();
+            return Some(CfoChange::Unlock(UnlockReason::Timeout));
+        }
+        None
+    }
+
+    fn unlock(&mut self) {
+        self.locked = false;
+        self.good = 0;
+        self.bad = 0;
+    }
+}
+
+/// What one receiver pass gave.
+#[derive(Default)]
+struct Pass {
+    /// Each frame with the tracked offset after it, Hz.
+    frames: Vec<(RxFrame, f64)>,
+    /// Acquisition changes, each with the offset (Hz) and the search range after it.
+    changes: Vec<(CfoChange, f64, f32)>,
+}
+
+/// The receive chain after the stream is read: shift back by the IF and the tracked offset,
+/// decimate, collect blocks, run the receiver, follow the offset and the acquisition state.
+struct RxChain {
+    receiver: LiveReceiver,
+    nco: Nco,
+    dec: Decimator,
+    pending: Vec<Complex32>,
+    /// The tracked offset, Hz.
+    cfo_hz: f64,
+    /// Decimated samples handed to the receiver.
+    fed: u64,
+    lock: Option<CfoLock>,
+    /// With acquisition: (first decimated sample, offset it was shifted by), for the samples the
+    /// receiver may still hold. A frame's estimate is relative to the shift its own samples got,
+    /// which is not the newest one when the offset moved after they were read.
+    shifts: VecDeque<(u64, f64)>,
+    narrow: f32,
+    wide: f32,
+    sample_rate: f64,
+    symbol_rate: f64,
+    if_hz: f64,
+    block: usize,
+    track: bool,
+}
+
+impl RxChain {
+    fn new(cfg: &SdrConfig, receiver: LiveReceiver) -> Self {
+        let fs_out = cfg.sample_rate / cfg.decimate as f64;
+        let lock = (cfg.cfo_acquire > 0.0).then(|| {
+            CfoLock::new(
+                cfg.cfo_lock_frames,
+                cfg.cfo_unlock_bad,
+                (cfg.cfo_unlock_ms as f64 * 1e-3 * fs_out) as u64,
+            )
+        });
+        Self {
+            receiver,
+            nco: Nco { phase: 0.0 },
+            dec: Decimator::new(cfg.decimate),
+            pending: Vec::with_capacity(cfg.block * 2),
+            cfo_hz: cfg.cfo_hz,
+            fed: 0,
+            lock,
+            shifts: VecDeque::new(),
+            narrow: cfg.cfo_search,
+            wide: cfg.cfo_acquire,
+            sample_rate: cfg.sample_rate,
+            symbol_rate: cfg.symbol_rate,
+            if_hz: cfg.if_hz,
+            block: cfg.block,
+            track: cfg.track_cfo,
+        }
+    }
+
+    /// Shift and decimate stream samples; returns the new decimated samples.
+    fn feed(&mut self, x: &mut [Complex32]) -> &[Complex32] {
+        if self.lock.is_some() && self.shifts.back().is_none_or(|s| s.1 != self.cfo_hz) {
+            let at = self.fed + self.pending.len() as u64;
+            self.shifts.push_back((at, self.cfo_hz));
+            if self.shifts.len() > MAX_SHIFTS {
+                self.shifts.pop_front();
+            }
+        }
+        self.nco
+            .mix(x, -(self.if_hz + self.cfo_hz), self.sample_rate);
+        let before = self.pending.len();
+        self.dec.run(x, &mut self.pending);
+        &self.pending[before..]
+    }
+
+    /// A block is waiting for the receiver.
+    fn ready(&self) -> bool {
+        self.pending.len() >= self.block
+    }
+
+    /// Run the receiver on what is waiting.
+    fn run(&mut self) -> Pass {
+        self.fed += self.pending.len() as u64;
+        let frames = self.receiver.push(&self.pending);
+        self.pending.clear();
+        let mut pass = Pass::default();
+        for fr in frames {
+            if fr.crc_ok && self.track {
+                let resid = f64::from(fr.cfo_cycles_per_symbol) * self.symbol_rate;
+                // Acquiring, a good frame's estimate is taken whole, so the narrow search is
+                // centred on it at the lock. Locked (or without acquisition), it is smoothed.
+                let gain = match &self.lock {
+                    Some(l) if !l.locked => 1.0,
+                    _ => CFO_TRACK_GAIN,
+                };
+                // the shift this frame's samples got (without acquisition: the newest, as before)
+                let shift = self
+                    .shifts
+                    .iter()
+                    .rev()
+                    .find(|s| s.0 <= fr.start as u64)
+                    .map_or(self.cfo_hz, |s| s.1);
+                self.cfo_hz += gain * (shift + resid - self.cfo_hz);
+                self.cfo_hz = self
+                    .cfo_hz
+                    .clamp(-self.sample_rate / 8.0, self.sample_rate / 8.0);
+            }
+            let change = self
+                .lock
+                .as_mut()
+                .and_then(|l| l.frame(fr.crc_ok, fr.end as u64));
+            if let Some(c) = change {
+                self.apply(c, &mut pass);
+            }
+            pass.frames.push((fr, self.cfo_hz));
+        }
+        if let Some(c) = self.lock.as_mut().and_then(|l| l.tick(self.fed)) {
+            self.apply(c, &mut pass);
+        }
+        pass
+    }
+
+    fn apply(&mut self, c: CfoChange, pass: &mut Pass) {
+        let search = match c {
+            CfoChange::Lock => self.narrow,
+            CfoChange::Unlock(_) => self.wide,
+        };
+        // both ranges are above 0 (checked with the config), so this cannot fail
+        let _ = self.receiver.set_cfo_search(search);
+        pass.changes.push((c, self.cfo_hz, search));
+    }
+}
+
+fn rx_thread(cfg: &SdrConfig, shared: &Shared, receiver: LiveReceiver, out: SyncSender<Vec<u8>>) {
     let Some(mut f) = open_stream(&cfg.rx, false, shared) else {
         return;
     };
@@ -813,14 +1081,9 @@ fn rx_thread(
     let bpsamp = cfg.rx_format.bytes();
     let mut bytes = vec![0u8; RX_READ * bpsamp];
     let mut have = 0usize;
-    let mut nco = Nco { phase: 0.0 };
-    let mut dec = Decimator::new(cfg.decimate);
-    let mut pending: Vec<Complex32> = Vec::with_capacity(cfg.block * 2);
-    let mut cfo_hz = cfg.cfo_hz;
+    let mut chain = RxChain::new(cfg, receiver);
     // (decimated sample count at the end of a read, when it was read): to time each decision
     let mut arrivals: VecDeque<(u64, Instant)> = VecDeque::new();
-    let mut fed: u64 = 0;
-    let sym_rate = cfg.symbol_rate;
     while !shared.stop.load(Ordering::SeqCst) {
         let n = match f.read(&mut bytes[have..]) {
             Ok(0) => {
@@ -845,14 +1108,11 @@ fn rx_thread(
         };
         bytes.copy_within(whole..have, 0);
         have -= whole;
-        nco.mix(&mut x, -(cfg.if_hz + cfo_hz), cfg.sample_rate);
-        let before = pending.len();
-        dec.run(&x, &mut pending);
-        let added = (pending.len() - before) as u64;
+        let new = chain.feed(&mut x);
         if let Some(w) = record.as_mut() {
             if recorded < record_max {
-                let take = (added.min(record_max - recorded)) as usize;
-                for v in &pending[before..before + take] {
+                let take = (new.len() as u64).min(record_max - recorded) as usize;
+                for v in &new[..take] {
                     let _ = w.write_all(&v.re.to_le_bytes());
                     let _ = w.write_all(&v.im.to_le_bytes());
                 }
@@ -862,16 +1122,15 @@ fn rx_thread(
                 }
             }
         }
-        if pending.len() < cfg.block {
+        if !chain.ready() {
             continue;
         }
         let now = Instant::now();
-        arrivals.push_back((fed + pending.len() as u64, now));
-        fed += pending.len() as u64;
-        let frames = receiver.push(&pending);
-        pending.clear();
+        let fed = chain.fed + chain.pending.len() as u64;
+        arrivals.push_back((fed, now));
+        let pass = chain.run();
         let decided = Instant::now();
-        for fr in frames {
+        for (fr, cfo_hz) in pass.frames {
             // when the frame's last sample arrived
             let end = fr.end as u64;
             let arrived = arrivals.iter().find(|(k, _)| *k >= end).map(|(_, t)| *t);
@@ -879,10 +1138,6 @@ fn rx_thread(
             let resid = f64::from(fr.cfo_cycles_per_symbol);
             if fr.crc_ok {
                 shared.rx_frames.fetch_add(1, Ordering::Relaxed);
-                if cfg.track_cfo {
-                    cfo_hz += CFO_TRACK_GAIN * resid * sym_rate;
-                    cfo_hz = cfo_hz.clamp(-cfg.sample_rate / 8.0, cfg.sample_rate / 8.0);
-                }
                 if out.try_send(fr.payload.clone()).is_err() {
                     shared.event("drop", ",\"reason\":\"rx_queue_full\"");
                 }
@@ -904,8 +1159,22 @@ fn rx_thread(
                 ),
             );
         }
+        for (c, cfo_hz, search) in pass.changes {
+            let (event, reason) = match c {
+                CfoChange::Lock => ("cfo_lock", String::new()),
+                CfoChange::Unlock(r) => ("cfo_unlock", format!(",\"reason\":\"{}\"", r.name())),
+            };
+            shared.event(
+                event,
+                &format!(
+                    ",\"cfo_hz\":{cfo_hz:.1},\"cfo_search\":{search}{reason},\"stream_ms\":{:.1}",
+                    fed as f64 / fs_out * 1e3
+                ),
+            );
+        }
         // forget arrivals the receiver can no longer report on
-        let keep_from = fed.saturating_sub(4 * receiver.window_len() as u64 + cfg.block as u64);
+        let keep_from =
+            fed.saturating_sub(4 * chain.receiver.window_len() as u64 + cfg.block as u64);
         while arrivals.front().is_some_and(|(k, _)| *k < keep_from) {
             arrivals.pop_front();
         }
@@ -1176,5 +1445,347 @@ mod speed {
                 fs / 1e6, baud / 1e3, t_mix * 1e3, t_dec * 1e3, t_rx * 1e3
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod acquire {
+    //! Acquisition (`--cfo-acquire`): the state machine, and the whole receive chain on a simulated
+    //! bench stream at the bench's settings (1 MS/s, 250 kbaud, IF 175 kHz, decimate 1, coarse step 4).
+    //! The table: `cargo test --release --lib acquire::table -- --ignored --nocapture`.
+    use super::*;
+    use oasa_waveform::channel::Channel;
+    use oasa_waveform::rng::Rng;
+
+    #[test]
+    fn locks_after_good_frames_in_a_row() {
+        let mut l = CfoLock::new(2, 3, 1000);
+        assert_eq!(l.frame(true, 10), None);
+        assert_eq!(l.frame(false, 20), None, "a bad frame while acquiring...");
+        assert_eq!(l.frame(true, 30), None, "...starts the count again");
+        assert_eq!(l.frame(true, 40), Some(CfoChange::Lock));
+        assert!(l.locked);
+        assert_eq!(l.frame(true, 50), None);
+        assert_eq!(l.tick(1000), None);
+    }
+
+    #[test]
+    fn bad_frames_in_a_row_unlock() {
+        let mut l = CfoLock::new(1, 3, 1_000_000);
+        assert_eq!(l.frame(true, 0), Some(CfoChange::Lock));
+        assert_eq!(l.frame(false, 1), None);
+        assert_eq!(l.frame(false, 2), None);
+        assert_eq!(l.frame(true, 3), None, "a good frame resets the run");
+        assert_eq!(l.frame(false, 4), None);
+        assert_eq!(l.frame(false, 5), None);
+        assert_eq!(
+            l.frame(false, 6),
+            Some(CfoChange::Unlock(UnlockReason::BadFrames))
+        );
+        assert!(!l.locked);
+        assert_eq!(l.frame(false, 7), None, "no second unlock");
+        assert_eq!(l.frame(true, 8), Some(CfoChange::Lock), "relocks");
+    }
+
+    #[test]
+    fn no_good_frame_for_the_timeout_unlocks() {
+        let mut l = CfoLock::new(1, 3, 100);
+        assert_eq!(l.tick(10_000), None, "acquiring: no timeout");
+        assert_eq!(l.frame(true, 10_000), Some(CfoChange::Lock));
+        assert_eq!(l.tick(10_100), None);
+        assert_eq!(l.frame(true, 10_090), None);
+        assert_eq!(l.tick(10_190), None);
+        assert_eq!(
+            l.tick(10_191),
+            Some(CfoChange::Unlock(UnlockReason::Timeout))
+        );
+        assert_eq!(l.tick(20_000), None);
+    }
+
+    /// The bench's settings.
+    fn bench(acquire: f32, search: f32, unlock_ms: u64) -> SdrConfig {
+        let mut c = SdrConfig::new("/dev/null".into(), "/dev/null".into());
+        c.sample_rate = 1e6;
+        c.symbol_rate = 250e3;
+        c.if_hz = 175e3;
+        c.decimate = 1;
+        c.coarse_step = 4;
+        c.cfo_search = search;
+        c.cfo_acquire = acquire;
+        c.cfo_unlock_ms = unlock_ms;
+        c.check().unwrap();
+        c
+    }
+
+    fn chain(c: &SdrConfig) -> RxChain {
+        let md = Modem::new(ModemConfig {
+            sps: c.sps().unwrap() / c.decimate,
+            frame: FrameFormat::V1,
+            code: c.code,
+            ..ModemConfig::new(c.modulation)
+        })
+        .unwrap();
+        let rx = RxConfig {
+            cfo_search: if c.cfo_acquire > 0.0 {
+                c.cfo_acquire
+            } else {
+                c.cfo_search
+            },
+            max_len: Some(c.mtu),
+            only_code: Some(c.code),
+            coarse_step: c.coarse_step,
+            ..RxConfig::default()
+        };
+        RxChain::new(c, LiveReceiver::new(md, rx).unwrap())
+    }
+
+    #[derive(Debug, Default)]
+    struct Run {
+        sent: usize,
+        good: usize,
+        bad: usize,
+        /// Stream ms of each lock and unlock.
+        locks: Vec<f64>,
+        unlocks: Vec<(f64, UnlockReason)>,
+        cfo_hz: f64,
+        /// Search work per block while acquiring (or always, without acquisition) and while locked:
+        /// (blocks, FFT points, bins, seconds).
+        wide: (u64, u64, u64, f64),
+        narrow: (u64, u64, u64, f64),
+        /// Frames sent after `count_from_ms` and how many of them arrived.
+        late_sent: usize,
+        late_good: usize,
+    }
+
+    /// Bursts of random 40 to 200-byte frames, 0.5 to 3 ms apart, through a cable whose offset at
+    /// time t (seconds) is `cfo(t)`, -20 dB, noise -45 dBFS (Es/N0 about 20 dB).
+    fn run(c: &SdrConfig, seconds: f64, cfo: impl Fn(f64) -> f64, count_from_ms: f64) -> Run {
+        let sps = c.sps().unwrap();
+        let tx = Modem::new(ModemConfig {
+            sps,
+            frame: FrameFormat::V1,
+            code: c.code,
+            ..ModemConfig::new(c.modulation)
+        })
+        .unwrap();
+        let mut rng = Rng::new(7);
+        let mut stream = Vec::new();
+        let mut sent = Vec::new();
+        let n = (seconds * c.sample_rate) as usize;
+        while stream.len() < n {
+            let len = 40 + rng.below(161) as usize;
+            let p = rng.bytes(len);
+            let mut s = tx.modulate(&p).unwrap();
+            let peak = s.iter().map(|v| v.re.hypot(v.im)).fold(0.0f32, f32::max);
+            let k = c.tx_peak / peak;
+            for v in &mut s {
+                v.re *= k;
+                v.im *= k;
+            }
+            let gap = GAP_SYMBOLS * sps + 500 + rng.below(2500) as usize;
+            sent.push((stream.len(), p));
+            stream.extend(s);
+            stream.extend(std::iter::repeat_n(Complex32::ZERO, gap));
+        }
+        // the cable: gain, IF and offset (phase continuous), noise
+        let g = 0.1f32;
+        let mut ph = 0.0f64;
+        for (i, v) in stream.iter_mut().enumerate() {
+            let f = c.if_hz + cfo(i as f64 / c.sample_rate);
+            let (sn, co) = ph.sin_cos();
+            *v = *v * Complex32::new(co as f32 * g, sn as f32 * g);
+            ph = (ph + 2.0 * std::f64::consts::PI * f / c.sample_rate)
+                .rem_euclid(2.0 * std::f64::consts::PI);
+        }
+        Channel::new(3).add_awgn(&mut stream, 10f64.powf(-4.5));
+
+        let mut ch = chain(c);
+        let fs_out = c.sample_rate / c.decimate as f64;
+        let mut r = Run {
+            sent: sent.len(),
+            ..Run::default()
+        };
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let mut got_at = Vec::new();
+        for chunk in stream.chunks(RX_READ) {
+            let mut x = chunk.to_vec();
+            ch.feed(&mut x);
+            if !ch.ready() {
+                continue;
+            }
+            let locked = ch.lock.as_ref().is_some_and(|l| l.locked);
+            let w0 = ch.receiver.search_work();
+            let t0 = Instant::now();
+            let pass = ch.run();
+            let dt = t0.elapsed().as_secs_f64();
+            let w1 = ch.receiver.search_work();
+            let acc = if locked { &mut r.narrow } else { &mut r.wide };
+            acc.0 += 1;
+            acc.1 += w1.fft_points - w0.fft_points;
+            acc.2 += w1.bins - w0.bins;
+            acc.3 += dt;
+            let ms = ch.fed as f64 / fs_out * 1e3;
+            for (fr, _) in pass.frames {
+                if fr.crc_ok {
+                    r.good += 1;
+                    got_at.push(fr.start);
+                    got.push(fr.payload);
+                } else {
+                    r.bad += 1;
+                }
+            }
+            for (chg, _, _) in pass.changes {
+                match chg {
+                    CfoChange::Lock => r.locks.push(ms),
+                    CfoChange::Unlock(why) => r.unlocks.push((ms, why)),
+                }
+            }
+        }
+        for (start, p) in &sent {
+            if *start as f64 / c.sample_rate * 1e3 >= count_from_ms {
+                r.late_sent += 1;
+                if got.iter().any(|g| g == p) {
+                    r.late_good += 1;
+                }
+            }
+        }
+        // nothing invented, nothing twice
+        for g in &got {
+            assert!(sent.iter().any(|(_, p)| p == g), "a frame nobody sent");
+        }
+        let mut s = got_at.clone();
+        s.dedup();
+        assert_eq!(s.len(), got_at.len(), "a frame delivered twice");
+        r.cfo_hz = ch.cfo_hz;
+        r
+    }
+
+    fn per_block(w: (u64, u64, u64, f64)) -> (f64, f64, f64) {
+        let b = w.0.max(1) as f64;
+        (w.1 as f64 / b, w.2 as f64 / b, w.3 / b * 1e6)
+    }
+
+    /// The search ranges in FFT points and bins at the bench's settings.
+    fn sizes(search: f32) -> (usize, usize) {
+        let c = chain(&bench(0.0, search, 500));
+        (c.receiver.coarse().fft_len, c.receiver.coarse().bins)
+    }
+
+    #[test]
+    fn locks_at_f20_offsets_and_then_searches_narrow() {
+        let c = bench(0.15, 0.03, 500);
+        let (narrow_fft, _) = sizes(0.03);
+        let (wide_fft, _) = sizes(0.15);
+        assert_eq!((narrow_fft, wide_fft), (32, 128));
+        // +-18.3 kHz is F20's +-20 ppm at 915 MHz; +-30 kHz is margin
+        for hz in [0.0, 18_300.0, -18_300.0, 30_000.0, -30_000.0] {
+            let r = run(&c, 0.3, |_| hz, 0.0);
+            assert_eq!(r.locks.len(), 1, "{hz} Hz: {r:?}");
+            assert!(r.unlocks.is_empty(), "{hz} Hz: {r:?}");
+            assert!(r.locks[0] < 20.0, "{hz} Hz: lock at {} ms", r.locks[0]);
+            assert_eq!((r.good, r.bad), (r.sent, 0), "{hz} Hz: {r:?}");
+            assert!(
+                (r.cfo_hz - hz).abs() < 200.0,
+                "{hz} Hz: tracked {}",
+                r.cfo_hz
+            );
+            // locked, every position costs the narrow FFT: a quarter of the wide one
+            let (pts, _, _) = per_block(r.narrow);
+            let (wpts, _, _) = per_block(r.wide);
+            assert!(r.narrow.0 > 20 * r.wide.0, "{hz} Hz: {r:?}");
+            assert!(pts > 0.0 && wpts / pts > 3.5, "{hz} Hz: {pts} {wpts}");
+        }
+        // the narrow search alone (the default without --cfo-acquire) does not find +18.3 kHz
+        let r = run(&bench(0.0, 0.03, 500), 0.1, |_| 18_300.0, 0.0);
+        assert_eq!(r.good, 0, "{r:?}");
+    }
+
+    #[test]
+    fn a_slow_ramp_is_tracked_without_dropping_the_lock() {
+        // 18.3 kHz to 28.3 kHz in one second: far faster than any crystal drifts
+        let c = bench(0.15, 0.03, 500);
+        let r = run(&c, 1.0, |t| 18_300.0 + 10_000.0 * t, 0.0);
+        assert_eq!(r.locks.len(), 1, "{r:?}");
+        assert!(r.unlocks.is_empty(), "{r:?}");
+        assert_eq!(r.good, r.sent, "{r:?}");
+        assert!((r.cfo_hz - 28_300.0).abs() < 500.0, "{}", r.cfo_hz);
+    }
+
+    #[test]
+    fn a_step_past_the_narrow_window_reacquires_wide() {
+        // locked at 18.3 kHz, then a step of 21.7 kHz at 300 ms (the narrow search reaches about
+        // +-13 kHz), unlock after 200 ms without a good frame
+        let c = bench(0.15, 0.03, 200);
+        let r = run(
+            &c,
+            0.8,
+            |t| if t < 0.3 { 18_300.0 } else { 40_000.0 },
+            550.0,
+        );
+        assert_eq!(r.locks.len(), 2, "{r:?}");
+        assert_eq!(r.unlocks.len(), 1, "{r:?}");
+        let (at, why) = r.unlocks[0];
+        assert_eq!(why, UnlockReason::Timeout);
+        assert!((490.0..530.0).contains(&at), "unlock at {at} ms");
+        assert!(r.locks[1] > at && r.locks[1] < at + 20.0, "{r:?}");
+        assert!((r.cfo_hz - 40_000.0).abs() < 200.0, "{}", r.cfo_hz);
+        assert!(r.late_sent > 50 && r.late_good == r.late_sent, "{r:?}");
+    }
+
+    #[test]
+    #[ignore]
+    fn table() {
+        for search in [0.03f32, 0.1, 0.15] {
+            let (f, b) = sizes(search);
+            println!("search {search}: FFT {f} points, bins +-{b}");
+        }
+        println!(
+            "| offset | search | lock ms | sent | good | bad | loss % | FFT points/block | bins/block | us/block |"
+        );
+        println!("|---|---|---|---|---|---|---|---|---|---|");
+        for hz in [0.0, 18_300.0, -18_300.0, 30_000.0, -30_000.0] {
+            for (name, c) in [
+                ("acquire 0.15, locked 0.03", bench(0.15, 0.03, 500)),
+                ("always 0.03", bench(0.0, 0.03, 500)),
+                ("always 0.1", bench(0.0, 0.1, 500)),
+                ("always 0.15", bench(0.0, 0.15, 500)),
+            ] {
+                let r = run(&c, 2.0, |_| hz, 0.0);
+                // locked blocks with acquisition, every block without
+                let w = if c.cfo_acquire > 0.0 {
+                    r.narrow
+                } else {
+                    r.wide
+                };
+                let (p, b, us) = per_block(w);
+                println!(
+                    "| {hz:+.0} Hz | {name} | {} | {} | {} | {} | {:.2} | {p:.0} | {b:.0} | {us:.0} |",
+                    r.locks
+                        .first()
+                        .map(|v| format!("{v:.1}"))
+                        .unwrap_or("-".into()),
+                    r.sent,
+                    r.good,
+                    r.bad,
+                    100.0 * (r.sent - r.good) as f64 / r.sent as f64
+                );
+            }
+        }
+        let c = bench(0.15, 0.03, 500);
+        let r = run(&c, 2.0, |t| 18_300.0 + 5_000.0 * t, 0.0);
+        println!(
+            "ramp 18.3 -> 28.3 kHz over 2 s: locks {:?} unlocks {:?} sent {} good {} tracked {:.0} Hz",
+            r.locks, r.unlocks, r.sent, r.good, r.cfo_hz
+        );
+        let r = run(
+            &c,
+            3.0,
+            |t| if t < 1.0 { 18_300.0 } else { 40_000.0 },
+            1600.0,
+        );
+        println!(
+            "step 18.3 -> 40 kHz at 1 s (unlock 500 ms): locks {:?} unlocks {:?} sent {} good {}; from 1.6 s {} of {}; tracked {:.0} Hz",
+            r.locks, r.unlocks, r.sent, r.good, r.late_good, r.late_sent, r.cfo_hz
+        );
     }
 }
