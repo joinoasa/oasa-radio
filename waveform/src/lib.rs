@@ -12,6 +12,7 @@
 //! - [`stream`]: [`stream::StreamReceiver`], the receiver for a continuous stream of samples in blocks, and
 //!   [`stream::LiveReceiver`], its low-delay form for a live radio.
 //! - [`df`]: two receive channels' phase difference and the direction of arrival (T-RF3).
+//! - [`diversity`]: two-antenna receive diversity (B14): frame selection, preamble-SNR selection, maximal-ratio combining.
 //! - [`fec`]: the convolutional code and its Viterbi decoder (the frame v1 header uses them).
 //! - [`frame`], [`pulse`], [`rng`], [`iq`]: frame formats (W0, v1) and CRCs, the RRC pulse, the seeded generator,
 //!   the sample type and cf32 byte conversion.
@@ -25,6 +26,7 @@
 
 pub mod channel;
 pub mod df;
+pub mod diversity;
 pub mod fading;
 pub mod fec;
 pub mod fft;

@@ -3,6 +3,7 @@
 //! `oasa-radio waveform ber`.
 
 use crate::channel::{n0_for_ebn0, Channel, Impairments};
+use crate::diversity::Combine;
 use crate::fading::{Fader, Fading};
 use crate::frame::{FrameFormat, HeaderFields, PayloadCode};
 use crate::modem::{ConfigError, Modem, ModemConfig, Modulation, RxConfig, RxReport};
@@ -34,6 +35,10 @@ pub struct BerOptions {
     pub fading: Fading,
     /// Samples from one frame's start to the next, for the fading's clock (frames sent at this rate).
     pub frame_interval: f64,
+    /// [`run_found`] only: receive on two antennas (B14), each with its own independent fading (same
+    /// model) and noise at the same mean Eb/N0, combined as given. None (default): one antenna, and the
+    /// run is exactly as without this field.
+    pub diversity: Option<Combine>,
 }
 
 impl Default for BerOptions {
@@ -51,6 +56,7 @@ impl Default for BerOptions {
             rx: RxConfig::default(),
             fading: Fading::None,
             frame_interval: 10_000.0,
+            diversity: None,
         }
     }
 }
@@ -222,6 +228,8 @@ pub struct FoundPoint {
     pub crc_ok: u64,
     /// What the receiver did with the candidates, summed over all frames.
     pub report: RxReport,
+    /// Wall time spent in the receiver (all channels), seconds.
+    pub rx_seconds: f64,
 }
 
 /// Send `frames` frames at `ebn0_db` through the channel and count the ones the receiver finds with
@@ -258,13 +266,22 @@ pub fn run_found(
     };
     let (mut found, mut crc_ok) = (0u64, 0u64);
     let mut report = RxReport::default();
+    let mut rx_seconds = 0.0f64;
+    // The second antenna: its own fading and noise, from generators of its own (the first
+    // antenna's stay what they are without diversity).
+    let mut ch2 = Channel::new(mixed ^ 0xD1FE_25E7_0000_0002);
+    let mut fader2 = Fader::new(
+        opts.fading,
+        opts.frame_interval,
+        mixed ^ 0x0FAD_E5EE_D000_0002,
+    );
     for _ in 0..frames {
         let payload = ch.rng().bytes(opts.payload_len);
-        let tx = modem.modulate(&payload)?;
+        let clean = modem.modulate(&payload)?;
         let tx = if fader.is_none() {
-            tx
+            clean.clone()
         } else {
-            fader.apply(&tx)
+            fader.apply(&clean)
         };
         let lead = 2 + ch.rng().below(opts.max_delay as u64 + 1) as usize;
         let cfo = if opts.cfo_random > 0.0 {
@@ -289,7 +306,34 @@ pub fn run_found(
             tail: 8,
         };
         let y = ch.apply(&tx, &imp);
-        let (got, rep) = modem.demodulate_report(&y, &rx);
+        let t0 = std::time::Instant::now();
+        let (got, rep) = match opts.diversity {
+            None => modem.demodulate_report(&y, &rx),
+            Some(how) => {
+                let tx2 = if fader2.is_none() {
+                    clean
+                } else {
+                    fader2.apply(&clean)
+                };
+                let imp2 = Impairments {
+                    // the antennas see the carrier at phases of their own (same offset: one LO)
+                    phase_rad: if opts.random_phase {
+                        ch2.rng().uniform() * 2.0 * PI
+                    } else {
+                        0.0
+                    },
+                    ..imp
+                };
+                let y2 = ch2.apply(&tx2, &imp2);
+                let t1 = std::time::Instant::now();
+                let r = modem.demodulate_diversity(&[&y, &y2], &rx, how);
+                rx_seconds += t1.elapsed().as_secs_f64();
+                r
+            }
+        };
+        if opts.diversity.is_none() {
+            rx_seconds += t0.elapsed().as_secs_f64();
+        }
         report.add(&rep);
         if let Some(f) = got.iter().find(|f| f.start.abs_diff(lead) <= opts.sps) {
             found += 1;
@@ -305,5 +349,6 @@ pub fn run_found(
         found,
         crc_ok,
         report,
+        rx_seconds,
     })
 }

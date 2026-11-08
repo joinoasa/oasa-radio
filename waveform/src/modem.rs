@@ -341,11 +341,11 @@ pub(crate) enum Reject {
 
 /// Carrier estimate of one frame: frequency (radians per sample), phase at the frame start, amplitude
 /// and the noise power per sample left after taking the signal out.
-struct Estimate {
-    omega: f64,
-    psi: f64,
-    amp: f64,
-    noise_per_sample: f64,
+pub(crate) struct Estimate {
+    pub(crate) omega: f64,
+    pub(crate) psi: f64,
+    pub(crate) amp: f64,
+    pub(crate) noise_per_sample: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -424,6 +424,11 @@ impl Modem {
 
     /// Length in samples of the known preamble and sync waveform the detector correlates with (the
     /// detection window, and how far apart two candidates must be to be told apart).
+    /// The known waveform of preamble and sync word.
+    pub(crate) fn reference(&self) -> &[Complex32] {
+        &self.refw
+    }
+
     pub fn reference_len(&self) -> usize {
         self.refw.len()
     }
@@ -944,7 +949,7 @@ impl Modem {
                 continue;
             }
             let Some((res, tau, _)) =
-                self.coarse_candidate(r, tau_c, f, &cs, &fine, frame_len, tally.busy_until)
+                self.coarse_candidate(r, tau_c, f, cs.step, &fine, frame_len, tally.busy_until)
             else {
                 continue;
             };
@@ -955,7 +960,7 @@ impl Modem {
         out
     }
 
-    /// One coarse-search candidate at `tau_c` with frequency `f` (cycles per symbol): turn a small
+    /// One coarse-search candidate at `tau_c` (on a grid of `step` samples) with frequency `f` (cycles per symbol): turn a small
     /// window of `r` back by `f`, find the fine peak and decode there. Returns the decode, the
     /// sample the candidate counts at, and whether `r` held all the samples the longest frame
     /// could need (if not, `TooShort` may only mean "wait for more"). `None`: no fine peak.
@@ -965,7 +970,7 @@ impl Modem {
         r: &[Complex32],
         tau_c: usize,
         f: f32,
-        cs: &CoarseSearch,
+        step: usize,
         fine: &RxConfig,
         frame_len: usize,
         busy_until: usize,
@@ -973,8 +978,8 @@ impl Modem {
         let sps = self.cfg.sps;
         let m = self.refw.len();
         let last = r.len().checked_sub(m)?;
-        let lo = tau_c.saturating_sub(sps + cs.step).max(busy_until);
-        let hi = (tau_c + sps + cs.step).min(last);
+        let lo = tau_c.saturating_sub(sps + step).max(busy_until);
+        let hi = (tau_c + sps + step).min(last);
         let full = hi + frame_len < r.len();
         let end = (hi + frame_len + 1).min(r.len());
         let w = f as f64 / sps as f64;
@@ -1015,7 +1020,7 @@ impl Modem {
     /// Carrier phase, frequency and amplitude of the frame at `tau`, from the chunk correlations of
     /// the received samples against the known waveform `refw` (it must start at the frame start and
     /// be at least `CHUNK_SYMBOLS` symbols long).
-    fn estimate(&self, r: &[Complex32], tau: usize, refw: &[Complex32]) -> Estimate {
+    pub(crate) fn estimate(&self, r: &[Complex32], tau: usize, refw: &[Complex32]) -> Estimate {
         let sps = self.cfg.sps;
         let chunk = CHUNK_SYMBOLS * sps;
         let k_chunks = refw.len() / chunk;
@@ -1088,7 +1093,7 @@ impl Modem {
         }
     }
 
-    fn decode_at(
+    pub(crate) fn decode_at(
         &self,
         r: &[Complex32],
         tau: usize,
@@ -2008,7 +2013,7 @@ fn skip_past(f: &RxFrame, rx: &RxConfig) -> bool {
     f.crc_ok || (rx.expected_len.is_some() && f.sync_errors <= SKIP_SYNC_MAX_ERRORS)
 }
 
-fn parabola_peak(y: &[f32], i: usize) -> f64 {
+pub(crate) fn parabola_peak(y: &[f32], i: usize) -> f64 {
     if i == 0 || i + 1 >= y.len() {
         return 0.0;
     }

@@ -356,7 +356,7 @@ impl LiveReceiver {
                 &self.buf,
                 (tau_c - self.base) as usize,
                 f,
-                &self.cs,
+                self.cs.step,
                 &self.fine,
                 self.frame_len,
                 busy,
