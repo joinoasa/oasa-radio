@@ -58,6 +58,16 @@ Simulation at the bench's settings (1 MS/s, 250 kbaud, IF 175 kHz, `--decimate 1
 
 Locked, the receiver does the default search's work. A ramp of 18.3 to 28.3 kHz over 2 s stays locked with no frame lost. A step from 18.3 to 40 kHz (past the narrow search, which reaches about +-13 kHz) unlocks 500 ms after its last good frame (`--cfo-unlock-ms`) and relocks 25 ms later at 40 kHz; the frames in between are lost, every one after is delivered.
 
+### Interference options (B8, opt-in, off by default)
+
+See [interference.md](interference.md) for the measurements behind them.
+
+- `--rx-filter on`: a 63-tap channel filter after the shift and decimation, cut off at 231 kHz at 250 kbaud. With `--decimate 1` nothing else stops a signal beside the band, and the detector normalizes by all the power in its window, so a carrier one channel below, 7 dB over the signal, hides the preambles. With the filter a carrier there can be 51 dB over the signal, noise 18 dB.
+- `--rx-notch-db 25`: removes the strongest carrier in each receiver block when it stands 25 dB over the block's mean FFT bin (a carrier at about the signal's power or more; noise and the signal itself stay below 16 dB). A carrier on the signal's centre can then be 29 dB over the signal (0.1 % loss, simulation); without it the limit is 7 dB under the signal.
+- `--cfo-reset-ms MS` (with `--cfo-acquire`): acquiring with no good frame for MS, put the offset back to `--cfo-hz` (logs `cfo_reset`). A frame that passes both CRCs by chance (noise under a jammer: rare, but each one is taken whole while acquiring) can move the tracked offset more than the wide search reaches from the signal, and nothing then brings it back. With the reset it comes back MS later.
+
+`sdr_start` in `--sdr-log` lists `rx_filter`, `rx_notch_db` and `cfo_reset_ms`.
+
 Without radios, `oasa-radio waveform cable` joins one bridge's TX FIFO to the other's RX FIFO with a gain, clock offset and noise. `tests/sdr_link.rs` runs two bridges through two cables at a fifth of the bench rates.
 
 ## Delay, step by step (bench, 2026-11-05/06, not counted)

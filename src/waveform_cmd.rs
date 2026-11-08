@@ -5,6 +5,7 @@
 //! * `iq`: write a modulated, noisy frame as a SigMF pair (`cf32_le`) for the lab.
 //! * `decode`: read such a file back and print the frames found and what happened to the candidates.
 //! * `df`: two receive channels' phase difference and the direction of arrival (T-RF3).
+//! * `sir`: packet loss against signal-to-interference with a tone, noise or sweep interferer (B8).
 //!
 //! `--frame w0|v1` picks the frame format (default w0; v1 has the protected header). `--code
 //! none|light` picks the error correction on the v1 body (default none; see docs/fec-light.md).
@@ -50,6 +51,11 @@ WAVEFORM (W0, simulation):
                             [--sample-rate 1000000] [--seed 1]
                             [--channel awgn|tworay|rayleigh] [--doppler-hz 0] [--ray-delay-us 1]
                             [--ray-gain-db -3]
+  oasa-radio waveform sir --interferer tone|noise|sweep --sir-db 10,5,0 [--offset-hz 0,420000]
+                          [--width-hz 420000] [--span-hz 400000] [--period-us 1000]
+                          [--ebn0-db 20] [--frames 1000] [--seed 1] [--headroom-db DB] [--ratio 0]
+                          [--notch-db DB] [--channel-filter] [--payload-len 54] [--symbol-rate 250000] [--sps 4]
+                          [--if-hz 175000] [--cfo-search 0.1] [--coarse-step 4]
   oasa-radio waveform df --in1 FILE --in2 FILE [--format ci16|cf32] [--block N]
                          [--burst-db 10] [--win 256] [--min-len 4096] [--skip 0]
                          [--cal-deg 0] [--spacing-wl D]
@@ -91,6 +97,16 @@ WAVEFORM (W0, simulation):
           --in (one radio's --tx FIFO), turns it by --cfo-hz, scales it by --gain-db, adds
           receiver noise of --noise-dbfs (power per sample, full scale 1) and writes it to --out
           (the other radio's --rx FIFO), until --in ends. For tests and the lab's simulated bench.
+  sir     B8 interference (waveform/src/interference.rs): QPSK frame v1 frames at --ebn0-db through
+          a radio front end, with an interferer --sir-db below the signal (both measured at the
+          antenna) at --offset-hz from the signal's centre: a carrier (tone), flat noise --width-hz
+          wide (noise) or a tone sweeping --span-hz every --period-us (sweep). The signal sits at
+          --if-hz in the radio's band, as on the bench; the interferer is added at --ratio times the
+          modem's rate (0: as high as the offset needs), clipped at ADC full scale when
+          --headroom-db (signal below full scale) is given, then filtered and decimated to the
+          modem's rate. --notch-db turns on the receiver's carrier canceller and --channel-filter its
+          channel filter (both opt-in, off by default). One JSON line per
+          offset and S/I: frames, delivered, packet_loss with a 3-sigma Wilson interval.
   df      Two channels recorded together (one multi-channel stream; raw files, no SigMF wrapper,
           default ci16 as UHD's --type short writes). Measures r = mean(x2 conj(x1)) per burst (runs
           --burst-db over the noise floor in --win sample windows, at least --min-len long) or, with
@@ -313,12 +329,25 @@ pub enum WaveformCommand {
     /// cf32_le file).
     RxStream(DecodeArgs, usize),
     Df(DfArgs),
+    Sir(SirArgs),
     /// A simulated cable between two `sdr` radios' streams (src/cable.rs).
     Cable {
         input: String,
         output: String,
         cfg: crate::cable::CableConfig,
     },
+}
+
+/// `sir`: the interference sweep (B8). `opts.interferer` holds the kind and width; its offset is
+/// replaced by each of `offsets_hz`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SirArgs {
+    pub opts: oasa_waveform::sim::SirOptions,
+    pub offsets_hz: Vec<f64>,
+    pub sir_db: Vec<f64>,
+    pub ebn0_db: f64,
+    pub frames: u64,
+    pub seed: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -343,10 +372,10 @@ type R<T> = Result<T, String>;
 pub fn parse(args: &[String]) -> R<WaveformCommand> {
     let sub = match args.first().map(String::as_str) {
         None | Some("-h" | "--help" | "help") => return Ok(WaveformCommand::Help),
-        Some(s @ ("ber" | "per" | "iq" | "decode" | "rx-stream" | "df" | "cable")) => s,
+        Some(s @ ("ber" | "per" | "iq" | "decode" | "rx-stream" | "df" | "cable" | "sir")) => s,
         Some(other) => {
             return Err(format!(
-            "unknown waveform command {other:?}; use ber, per, iq, decode, rx-stream, df or cable"
+            "unknown waveform command {other:?}; use ber, per, iq, decode, rx-stream, df, cable or sir"
         ))
         }
     };
@@ -359,9 +388,9 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
             .ok_or(format!("unexpected argument {a:?}"))?;
         match (sub, k) {
             (_, "help") => return Ok(WaveformCommand::Help),
-            ("ber" | "per", "json" | "random-frac-delay") | ("decode" | "rx-stream", "hex") => {
-                flags.push(k.to_string())
-            }
+            ("ber" | "per", "json" | "random-frac-delay")
+            | ("decode" | "rx-stream", "hex")
+            | ("sir", "channel-filter") => flags.push(k.to_string()),
             _ => {
                 let v = it.next().ok_or(format!("--{k} needs a value"))?;
                 if named.insert(k.to_string(), v.clone()).is_some() {
@@ -375,6 +404,9 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
     }
     if sub == "cable" {
         return parse_cable(named);
+    }
+    if sub == "sir" {
+        return parse_sir(named, flags.iter().any(|f| f == "channel-filter"));
     }
     let modulation = {
         let v = named.remove("mod").ok_or("missing --mod")?;
@@ -600,6 +632,156 @@ fn parse_cable(mut named: BTreeMap<String, String>) -> R<WaveformCommand> {
     Ok(WaveformCommand::Cable { input, output, cfg })
 }
 
+fn list(k: &str, v: &str, min: f64, max: f64) -> R<Vec<f64>> {
+    let x = v
+        .split(',')
+        .map(|x| float(k, x, min, max))
+        .collect::<R<Vec<f64>>>()?;
+    if x.is_empty() || x.len() > 64 {
+        return Err(format!("--{k} takes 1 to 64 values"));
+    }
+    Ok(x)
+}
+
+fn parse_sir(mut named: BTreeMap<String, String>, channel_filter: bool) -> R<WaveformCommand> {
+    use oasa_waveform::interference::Interferer;
+    use oasa_waveform::sim::SirOptions;
+    let kind = named.remove("interferer").ok_or("missing --interferer")?;
+    let sir_db = list(
+        "sir-db",
+        &named.remove("sir-db").ok_or("missing --sir-db")?,
+        -120.0,
+        120.0,
+    )?;
+    let offsets_hz = match named.remove("offset-hz") {
+        None => vec![0.0],
+        Some(v) => list("offset-hz", &v, -1e9, 1e9)?,
+    };
+    let width = opt_float("width-hz", named.remove("width-hz"), 420e3, 1.0, 1e9)?;
+    let span = opt_float("span-hz", named.remove("span-hz"), 400e3, 0.0, 1e9)?;
+    let period = opt_float("period-us", named.remove("period-us"), 1000.0, 1.0, 1e9)? * 1e-6;
+    let interferer = match kind.as_str() {
+        "tone" => Interferer::Tone { offset: 0.0 },
+        "noise" => Interferer::Noise { offset: 0.0, width },
+        "sweep" => Interferer::Sweep {
+            offset: 0.0,
+            span,
+            period,
+        },
+        _ => return Err(format!("--interferer {kind:?}: use tone, noise or sweep")),
+    };
+    let d = SirOptions::default();
+    let sps = int("sps", named.remove("sps"), d.sps as u64, 4, 64)? as usize;
+    let opts = SirOptions {
+        sps,
+        symbol_rate: opt_float(
+            "symbol-rate",
+            named.remove("symbol-rate"),
+            d.symbol_rate,
+            1.0,
+            1e9,
+        )?,
+        if_hz: opt_float("if-hz", named.remove("if-hz"), d.if_hz, -1e9, 1e9)?,
+        payload_len: int("payload-len", named.remove("payload-len"), 54, 1, 255)? as usize,
+        rx: RxConfig {
+            cfo_search: opt_float(
+                "cfo-search",
+                named.remove("cfo-search"),
+                0.1,
+                0.0,
+                sps as f64 / 2.0,
+            )? as f32,
+            coarse_step: int("coarse-step", named.remove("coarse-step"), 4, 0, sps as u64)?
+                as usize,
+            ..d.rx.clone()
+        },
+        interferer,
+        ratio: int("ratio", named.remove("ratio"), 0, 0, 1024)? as usize,
+        headroom_db: named
+            .remove("headroom-db")
+            .map(|v| float("headroom-db", &v, 0.0, 200.0))
+            .transpose()?,
+        notch_db: named
+            .remove("notch-db")
+            .map(|v| float("notch-db", &v, 0.0, 200.0))
+            .transpose()?,
+        channel_filter,
+        ..d
+    };
+    let a = SirArgs {
+        opts,
+        offsets_hz,
+        sir_db,
+        ebn0_db: opt_float("ebn0-db", named.remove("ebn0-db"), 20.0, -30.0, 60.0)?,
+        frames: int("frames", named.remove("frames"), 1000, 1, 100_000_000)?,
+        seed: int("seed", named.remove("seed"), 1, 0, u64::MAX)?,
+    };
+    if let Some(k) = named.keys().next() {
+        return Err(format!("unknown option --{k} for waveform sir"));
+    }
+    Ok(WaveformCommand::Sir(a))
+}
+
+fn run_sir_cmd(a: &SirArgs, out: &mut dyn Write) -> R<()> {
+    use oasa_waveform::interference::Interferer;
+    for &off in &a.offsets_hz {
+        let mut opts = a.opts.clone();
+        opts.interferer = match opts.interferer {
+            Interferer::Tone { .. } => Interferer::Tone { offset: off },
+            Interferer::Noise { width, .. } => Interferer::Noise { offset: off, width },
+            Interferer::Sweep { span, period, .. } => Interferer::Sweep {
+                offset: off,
+                span,
+                period,
+            },
+        };
+        let (width, span, period_us) = match opts.interferer {
+            Interferer::Tone { .. } => (0.0, 0.0, 0.0),
+            Interferer::Noise { width, .. } => (width, 0.0, 0.0),
+            Interferer::Sweep { span, period, .. } => (0.0, span, period * 1e6),
+        };
+        for &sir in &a.sir_db {
+            let p = oasa_waveform::sim::run_sir(a.ebn0_db, sir, a.frames, a.seed, &opts)
+                .map_err(|e| e.to_string())?;
+            let lost = p.frames - p.delivered;
+            let (lo, hi) = oasa_waveform::theory::wilson(lost, p.frames, 3.0);
+            writeln!(
+                out,
+                "{{\"ts\":\"{}\",\"event\":\"sir\",\"interferer\":\"{}\",\"offset_hz\":{},\"width_hz\":{},\"span_hz\":{},\"period_us\":{},\"sir_db\":{},\"ebn0_db\":{},\"frames\":{},\"delivered\":{},\"packet_loss\":{},\"ci_lo\":{},\"ci_hi\":{},\"clipped_frames\":{},\"notched\":{},\"ratio\":{},\"headroom_db\":{},\"notch_db\":{},\"channel_filter\":{},\"if_hz\":{},\"symbol_rate\":{},\"sps\":{},\"payload_len\":{},\"cfo_search\":{},\"coarse_step\":{},\"seed\":{}}}",
+                now(),
+                opts.interferer.name(),
+                num(off),
+                num(width),
+                num(span),
+                num(period_us),
+                num(sir),
+                num(a.ebn0_db),
+                p.frames,
+                p.delivered,
+                num(lost as f64 / p.frames as f64),
+                num(lo),
+                num(hi),
+                p.clipped_frames,
+                p.notched,
+                p.ratio,
+                opt_num(opts.headroom_db),
+                opt_num(opts.notch_db),
+                opts.channel_filter,
+                num(opts.if_hz),
+                num(opts.symbol_rate),
+                opts.sps,
+                opts.payload_len,
+                num(opts.rx.cfo_search as f64),
+                opts.rx.coarse_step,
+                a.seed,
+            )
+            .map_err(io)?;
+            out.flush().map_err(io)?;
+        }
+    }
+    Ok(())
+}
+
 fn run_cable(
     input: &str,
     output: &str,
@@ -689,6 +871,7 @@ pub fn run(cmd: &WaveformCommand, out: &mut dyn Write) -> R<()> {
         WaveformCommand::Decode(a) => run_decode(a, out),
         WaveformCommand::RxStream(a, block) => run_rx_stream(a, *block, out),
         WaveformCommand::Df(a) => run_df(a, out),
+        WaveformCommand::Sir(a) => run_sir_cmd(a, out),
         WaveformCommand::Cable { input, output, cfg } => run_cable(input, output, cfg, out),
     }
 }
@@ -1178,6 +1361,42 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn sir_parses() {
+        use oasa_waveform::interference::Interferer;
+        let c = parse(&v("sir --interferer noise --sir-db 0,-10 --offset-hz -420000,5000000 --headroom-db 54 --channel-filter --notch-db 25")).unwrap();
+        let WaveformCommand::Sir(a) = c else {
+            panic!("{c:?}")
+        };
+        assert_eq!(a.sir_db, vec![0.0, -10.0]);
+        assert_eq!(a.offsets_hz, vec![-420e3, 5e6]);
+        assert_eq!((a.ebn0_db, a.frames), (20.0, 1000));
+        assert_eq!(a.opts.headroom_db, Some(54.0));
+        assert_eq!(a.opts.notch_db, Some(25.0));
+        assert!(a.opts.channel_filter);
+        assert_eq!(
+            a.opts.interferer,
+            Interferer::Noise {
+                offset: 0.0,
+                width: 420e3
+            }
+        );
+        let WaveformCommand::Sir(b) = parse(&v("sir --interferer tone --sir-db 3")).unwrap() else {
+            panic!()
+        };
+        assert!(
+            !b.opts.channel_filter && b.opts.notch_db.is_none() && b.opts.headroom_db.is_none()
+        );
+        for bad in [
+            "sir --sir-db 3",
+            "sir --interferer buzz --sir-db 3",
+            "sir --interferer tone",
+            "sir --interferer tone --sir-db 3 --bogus 1",
+        ] {
+            assert!(parse(&v(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

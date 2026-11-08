@@ -7,6 +7,8 @@
 //! - [`channel`]: the simulated channel (AWGN at a given Eb/N0, phase, frequency and sample delay).
 //!   Kept apart from the modem on purpose.
 //! - [`fading`]: fading channel models (two-ray multipath, flat Rayleigh with Doppler) for the simulation.
+//! - [`interference`]: interferers (CW, band-limited noise, swept tone) and a radio front end (ADC clip,
+//!   decimating filter) for the simulation (B8).
 //! - [`theory`]: erfc, Q and the textbook BER curves the simulation is checked against.
 //! - [`sim`]: the Monte Carlo BER harness used by the tests and `oasa-radio waveform ber`.
 //! - [`stream`]: [`stream::StreamReceiver`], the receiver for a continuous stream of samples in blocks, and
@@ -29,6 +31,7 @@ pub mod fading;
 pub mod fec;
 pub mod fft;
 pub mod frame;
+pub mod interference;
 pub mod iq;
 pub mod modem;
 pub mod pulse;
