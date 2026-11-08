@@ -47,6 +47,7 @@ oasa-radio waveform cable --in a.tx --out b.rx --sample-rate 1000000 --channel r
 | 2-ray Rayleigh, 2 us, -3 dB, 50 Hz | | | about 17 % |
 
 Two limits of today's receiver show: there is no equalizer, so an echo near the main ray's strength at a quarter
-symbol or more closes the eye; and the carrier phase is taken from the preamble only, so when the channel turns
-during a 1.8 ms frame (Doppler of tens of Hz and up) the rest of the frame decodes with the wrong phase. Flat slow
+symbol or more closes the eye; and the body's carrier phase is fitted as one straight line over the frame (an offset
+and a constant frequency, `Modem::track`), so when the channel itself turns during a 1.8 ms frame (Doppler of tens
+of Hz and up) the phase is no longer a line and part of the frame decodes with the wrong phase. Flat slow
 fading costs about 17 dB at 1 % (diversity or coding and retransmission are the answer there).
