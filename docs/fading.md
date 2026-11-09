@@ -51,3 +51,7 @@ symbol or more closes the eye; and the body's carrier phase is fitted as one str
 and a constant frequency, `Modem::track`), so when the channel itself turns during a 1.8 ms frame (Doppler of tens
 of Hz and up) the phase is no longer a line and part of the frame decodes with the wrong phase. Flat slow
 fading costs about 17 dB at 1 % (diversity or coding and retransmission are the answer there).
+
+**Since B12:** `--phase-track-hz` (receiver only, off by default) follows the channel through the frame
+instead of one line. With it, Rayleigh 50 Hz no longer has a floor and 200 Hz drops from about 26 % to about 2 %
+at 30 dB uncoded (0.4 % with `--code light`); white noise is unchanged. See [phase-tracking.md](phase-tracking.md).

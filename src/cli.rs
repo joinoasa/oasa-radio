@@ -85,6 +85,10 @@ RADIOS:
                                  tool sends each as a timed burst (lowest delay)
             --tx-lead-ms N       stream: most the TX stream runs ahead of the clock, default 20
             --mtu BYTES          default 200, at most 255. Give oasa-link the same --mtu.
+            --phase-track-hz HZ  follow the channel through each frame for fading up to HZ
+                                 Doppler (receiver only, on-air format unchanged; at most
+                                 0.01 of the symbol rate). Default 0: off, one phase line
+                                 per frame. 200 at 250 kbaud: docs/phase-tracking.md
             --sdr-log PATH       JSON lines: frames, offsets, timings (sizes only)
             --rx-record PATH     the received baseband after the shift (cf32), for the lab
             --rx-record-seconds  how much of it, default 60
@@ -485,6 +489,11 @@ fn sdr_spec(named: &mut BTreeMap<String, String>) -> R<SdrConfig> {
     if let Some(v) = named.remove("tx-mode") {
         c.tx_mode = sdr::TxMode::parse(&v).ok_or("--tx-mode must be stream or burst")?;
     }
+    c.phase_track_hz = real(
+        "phase-track-hz",
+        named.remove("phase-track-hz"),
+        c.phase_track_hz,
+    )?;
     c.log = named.remove("sdr-log").map(Into::into);
     c.rx_record = named.remove("rx-record").map(Into::into);
     c.check()?;
@@ -731,6 +740,28 @@ mod tests {
             "--cfo-lock-frames 0",
             "--cfo-unlock-bad 0",
             "--cfo-unlock-ms 0",
+        ] {
+            assert!(sdr(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn sdr_phase_track_option() {
+        let base = format!("bridge --radio sdr --tx t --rx r {UDPS}");
+        let sdr = |extra: &str| match parse(&v(&format!("{base} {extra}"))) {
+            Ok(Command::Bridge(RadioSpec::Sdr(c), _)) => Ok(c),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e),
+        };
+        assert_eq!(sdr("").unwrap().phase_track_hz, 0.0);
+        let c = sdr("--symbol-rate 250000 --decimate 1 --phase-track-hz 200").unwrap();
+        assert_eq!(c.phase_track_hz, 200.0);
+        // 0.01 of the symbol rate at most
+        assert!(sdr("--symbol-rate 250000 --decimate 1 --phase-track-hz 2500").is_ok());
+        for bad in [
+            "--symbol-rate 250000 --decimate 1 --phase-track-hz 2501",
+            "--phase-track-hz -1",
+            "--phase-track-hz x",
         ] {
             assert!(sdr(bad).is_err(), "{bad}");
         }

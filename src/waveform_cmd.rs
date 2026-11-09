@@ -36,6 +36,7 @@ WAVEFORM (W0, simulation):
                           [--cfo-search MAX] [--frame w0|v1] [--code none|light] [--json]
                           [--channel awgn|tworay|rayleigh] [--doppler-hz 0] [--ray-delay-us 1]
                           [--ray-gain-db -3] [--symbol-rate 250000] [--frame-interval-ms 10]
+                          [--phase-track-hz 0]
   oasa-radio waveform per --mod bpsk|qpsk|fsk2 --ebn0-db 3,3.5,4 [--frames 400] [--sync-max-errors 3]
                           [same options as ber, except --bits]
   oasa-radio waveform iq --mod bpsk|qpsk|fsk2 --out BASE [--ebn0-db X] [--payload-len 32 | --payload-hex HEX]
@@ -131,6 +132,10 @@ WAVEFORM (W0, simulation):
   fading moves on by this from frame to frame); the cable uses --sample-rate and rounds the second
   ray's delay to whole samples. awgn (the default) leaves everything as before.
 
+  --phase-track-hz HZ (bpsk, qpsk; B12, docs/phase-tracking.md) turns on the receiver's channel
+  tracker for fading up to HZ Doppler at --symbol-rate: the gain is followed block by block through
+  the frame instead of one phase line. Receiver only, nothing changes on the air. 0 (default): off.
+
   Frequency offsets (--cfo, --cfo-random, --cfo-search) are in cycles per symbol: 1.0 is one symbol
   rate. --cfo-search MAX turns on the coarse frequency search (an FFT over the preamble) for offsets
   up to +-MAX (see docs/waveform-w0.md for its cost). --cfo-bins is the older narrow search; give
@@ -154,6 +159,8 @@ pub struct BerArgs {
     pub cfo_search: f64,
     /// Fading model and its settings (B9): see `ChannelArgs`.
     pub channel: ChannelArgs,
+    /// Receiver channel tracking for fading up to this Doppler, Hz (0: off; B12, docs/phase-tracking.md).
+    pub phase_track_hz: f64,
 }
 
 /// `--channel awgn|tworay|rayleigh` and its options, in physical units (the sample rate comes from
@@ -368,6 +375,9 @@ pub struct DfArgs {
 
 type R<T> = Result<T, String>;
 
+/// Largest Doppler the channel tracker is set up for, as a fraction of the symbol rate.
+pub const MAX_TRACK_CYCLES: f64 = crate::adapters::sdr::MAX_PHASE_TRACK;
+
 /// Parse the arguments after `waveform`.
 pub fn parse(args: &[String]) -> R<WaveformCommand> {
     let sub = match args.first().map(String::as_str) {
@@ -464,6 +474,13 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
                 cfo_bins: int("cfo-bins", named.remove("cfo-bins"), 0, 0, 20)? as usize,
                 cfo_search: opt_float("cfo-search", named.remove("cfo-search"), 0.0, 0.0, half)?,
                 channel: parse_channel(&mut named, true)?,
+                phase_track_hz: opt_float(
+                    "phase-track-hz",
+                    named.remove("phase-track-hz"),
+                    0.0,
+                    0.0,
+                    1e6,
+                )?,
             };
             if sub == "ber" {
                 WaveformCommand::Ber(a)
@@ -552,6 +569,14 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
             }
             if a.cfo_bins > 0 && a.cfo_search > 0.0 {
                 return Err("give --cfo-bins or --cfo-search, not both".into());
+            }
+            if a.phase_track_hz > 0.0 && a.modulation == Modulation::Fsk2 {
+                return Err("--phase-track-hz is for bpsk and qpsk".into());
+            }
+            if a.phase_track_hz > MAX_TRACK_CYCLES * a.channel.symbol_rate {
+                return Err(format!(
+                    "--phase-track-hz must stay within {MAX_TRACK_CYCLES} of --symbol-rate"
+                ));
             }
         }
         WaveformCommand::Decode(a) | WaveformCommand::RxStream(a, _)
@@ -973,11 +998,21 @@ fn ber_options(a: &BerArgs) -> BerOptions {
         rx: RxConfig {
             cfo_bins: a.cfo_bins,
             cfo_search: a.cfo_search as f32,
+            phase_track: (a.phase_track_hz / a.channel.symbol_rate) as f32,
             ..RxConfig::default()
         },
         fading: a.channel.fading(a.channel.symbol_rate * a.sps as f64),
         frame_interval: a.channel.frame_interval_ms * 1e-3 * a.channel.symbol_rate * a.sps as f64,
         ..BerOptions::default()
+    }
+}
+
+/// `,"phase_track_hz":...` when the tracker is on (so the default output is unchanged).
+fn track_json(a: &BerArgs) -> String {
+    if a.phase_track_hz > 0.0 {
+        format!(",\"phase_track_hz\":{}", num(a.phase_track_hz))
+    } else {
+        String::new()
     }
 }
 
@@ -992,7 +1027,7 @@ fn run_ber_cmd(a: &BerArgs, out: &mut dyn Write) -> R<()> {
         let p = run_ber(a.modulation, db, a.bits, a.seed, &opts).map_err(|e| e.to_string())?;
         writeln!(
             out,
-            "{{\"ts\":\"{}\",\"event\":\"ber\",\"mod\":\"{}\",\"ebn0_db\":{},\"bits\":{},\"errors\":{},\"ber\":{},\"theory\":{},\"ci_lo\":{},\"ci_hi\":{},\"z\":{},\"frame\":\"{}\",\"code\":\"{}\",\"frames\":{},\"detected\":{},\"crc_ok\":{}{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"theory_kind\":{}{}}}",
+            "{{\"ts\":\"{}\",\"event\":\"ber\",\"mod\":\"{}\",\"ebn0_db\":{},\"bits\":{},\"errors\":{},\"ber\":{},\"theory\":{},\"ci_lo\":{},\"ci_hi\":{},\"z\":{},\"frame\":\"{}\",\"code\":\"{}\",\"frames\":{},\"detected\":{},\"crc_ok\":{}{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"theory_kind\":{}{}{}}}",
             now(),
             a.modulation.name(),
             num(db),
@@ -1023,6 +1058,7 @@ fn run_ber_cmd(a: &BerArgs, out: &mut dyn Write) -> R<()> {
             num(a.cfo_search),
             json_str(theory),
             a.channel.json(),
+            track_json(a),
         )
         .map_err(io)?;
         out.flush().map_err(io)?;
@@ -1041,7 +1077,7 @@ fn run_per_cmd(p: &PerArgs, out: &mut dyn Write) -> R<()> {
         let c = &r.report;
         writeln!(
             out,
-            "{{\"ts\":\"{}\",\"event\":\"per\",\"mod\":\"{}\",\"frame\":\"{}\",\"code\":\"{}\",\"ebn0_db\":{},\"frames\":{},\"found\":{},\"delivered\":{},\"packet_loss\":{},\"ci_lo\":{},\"ci_hi\":{},\"preambles\":{},\"sync_rejected\":{},\"header_rejected\":{},\"too_short\":{},\"inside_frame\":{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"frame_symbols\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"sync_max_errors\":{}{}}}",
+            "{{\"ts\":\"{}\",\"event\":\"per\",\"mod\":\"{}\",\"frame\":\"{}\",\"code\":\"{}\",\"ebn0_db\":{},\"frames\":{},\"found\":{},\"delivered\":{},\"packet_loss\":{},\"ci_lo\":{},\"ci_hi\":{},\"preambles\":{},\"sync_rejected\":{},\"header_rejected\":{},\"too_short\":{},\"inside_frame\":{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"frame_symbols\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"sync_max_errors\":{}{}{}}}",
             now(),
             a.modulation.name(),
             a.frame.name(),
@@ -1069,6 +1105,7 @@ fn run_per_cmd(p: &PerArgs, out: &mut dyn Write) -> R<()> {
             num(a.cfo_search),
             p.sync_max_errors,
             a.channel.json(),
+            track_json(a),
         )
         .map_err(io)?;
         out.flush().map_err(io)?;
@@ -1400,6 +1437,21 @@ mod tests {
     }
 
     #[test]
+    fn phase_track_option() {
+        match parse(&v("per --mod qpsk --ebn0-db 30 --phase-track-hz 200")).unwrap() {
+            WaveformCommand::Per(p) => assert_eq!(p.ber.phase_track_hz, 200.0),
+            other => panic!("{other:?}"),
+        }
+        match parse(&v("ber --mod bpsk --ebn0-db 3")).unwrap() {
+            WaveformCommand::Ber(a) => {
+                assert_eq!(a.phase_track_hz, 0.0);
+                assert_eq!(ber_options(&a).rx.phase_track, 0.0);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn bad_arguments_are_refused() {
         for bad in [
             "ber --ebn0-db 3",
@@ -1415,6 +1467,9 @@ mod tests {
             "ber --mod bpsk --ebn0-db 3 --cfo-random -1",
             "ber --mod bpsk --ebn0-db 3 --cfo 3 --cfo-random 2",
             "ber --mod bpsk --ebn0-db 3 --cfo-bins 2 --cfo-search 1",
+            "per --mod qpsk --ebn0-db 3 --phase-track-hz -1",
+            "per --mod fsk2 --ebn0-db 3 --phase-track-hz 200",
+            "per --mod qpsk --ebn0-db 3 --symbol-rate 250000 --phase-track-hz 2501",
             "decode --mod bpsk --in x --cfo-bins 2 --cfo-search 1",
             "iq --mod bpsk",
             "iq --mod bpsk --out x --payload-hex abc",

@@ -686,6 +686,53 @@ fn waveform_per_and_ber_with_the_light_code() {
 }
 
 #[test]
+fn waveform_per_with_the_channel_tracker() {
+    let args = |track: bool| {
+        let mut a = vec![
+            "waveform",
+            "per",
+            "--mod",
+            "qpsk",
+            "--sps",
+            "4",
+            "--frame",
+            "v1",
+            "--payload-len",
+            "54",
+            "--ebn0-db",
+            "30",
+            "--frames",
+            "100",
+            "--channel",
+            "rayleigh",
+            "--doppler-hz",
+            "200",
+        ];
+        if track {
+            a.extend(["--phase-track-hz", "200"]);
+        }
+        run(&a)
+    };
+    let off = args(false);
+    let on = args(true);
+    assert!(
+        on.status.success(),
+        "{}",
+        String::from_utf8_lossy(&on.stderr)
+    );
+    let (off, on) = (
+        String::from_utf8_lossy(&off.stdout).to_string(),
+        String::from_utf8_lossy(&on.stdout).to_string(),
+    );
+    // off: the line is unchanged and the output has no tracker field
+    assert!(!off.contains("phase_track_hz"), "{off}");
+    assert_eq!(field(&on, "phase_track_hz"), "2e2");
+    let loss = |l: &str| field(l, "packet_loss").parse::<f64>().unwrap();
+    assert!(loss(&off) > 0.1, "{off}");
+    assert!(loss(&on) < 0.08, "{on}");
+}
+
+#[test]
 fn waveform_bad_arguments_fail_cleanly() {
     for args in [
         vec![

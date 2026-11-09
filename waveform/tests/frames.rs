@@ -64,7 +64,7 @@ fn noiseless_round_trip_with_random_delay_and_phase() {
                 got[0].crc_ok && got[0].payload == payload,
                 "{m:?} frame {i}"
             );
-            assert_eq!(got[0].start, lead, "{m:?} frame {i}: timing");
+            assert_eq!(got[0].start, lead as u64, "{m:?} frame {i}: timing");
             assert_eq!(got[0].sync_errors, 0);
         }
     }
@@ -462,7 +462,7 @@ fn coarse_search_decodes_across_two_symbol_rates() {
                     "{m:?} cfo {cfo}: bad frame"
                 );
                 assert!(
-                    f.start.abs_diff(lead) <= 1,
+                    f.start.abs_diff(lead as u64) <= 1,
                     "{m:?} cfo {cfo}: start {} not {lead}",
                     f.start
                 );
@@ -828,7 +828,7 @@ fn v1_round_trip_random_payloads_and_offsets() {
             let hit = got.iter().find(|f| f.crc_ok && f.payload == payload);
             if let Some(f) = hit {
                 ok += 1;
-                assert!(f.start.abs_diff(lead) <= 1, "{m:?} frame {i}");
+                assert!(f.start.abs_diff(lead as u64) <= 1, "{m:?} frame {i}");
                 assert_eq!(f.header, Some(HeaderFields::new(m.code(), len as u8)));
             }
         }
@@ -915,7 +915,7 @@ fn v1_coarse_search_decodes_across_the_range() {
                     got[0].crc_ok && got[0].payload == payload,
                     "{m:?} cfo {cfo}"
                 );
-                assert!(got[0].start.abs_diff(lead) <= 1, "{m:?} cfo {cfo}");
+                assert!(got[0].start.abs_diff(lead as u64) <= 1, "{m:?} cfo {cfo}");
             }
         }
     }

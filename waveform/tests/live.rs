@@ -35,7 +35,7 @@ fn recording(
     ch.apply(&tx, &imp)
 }
 
-fn key(f: &RxFrame) -> (usize, Vec<u8>, bool) {
+fn key(f: &RxFrame) -> (u64, Vec<u8>, bool) {
     (f.start, f.payload.clone(), f.crc_ok)
 }
 
@@ -47,7 +47,7 @@ fn live(md: Modem, rx: &RxConfig, x: &[Complex32], sizes: &[usize]) -> (Vec<RxFr
     while i < x.len() {
         let n = sizes[k % sizes.len()].min(x.len() - i);
         for f in s.push(&x[i..i + n]) {
-            wait = wait.max(s.samples_seen() - f.end as u64);
+            wait = wait.max(s.samples_seen() - f.end);
             out.push(f);
         }
         most = most.max(s.window_len());
@@ -227,4 +227,46 @@ fn the_search_range_can_change_mid_stream() {
         (b.positions - a.positions) * narrow_fft
     );
     assert!(s.set_cfo_search(0.0).is_err());
+}
+
+#[test]
+fn positions_past_two_to_the_32_samples() {
+    // A live stream passes 2^32 samples in 72 minutes at 1 MS/s (2.4 hours at the decimated
+    // 500 kS/s). Positions are u64, so on a 32-bit target (the E310's ARM) they do not wrap: the
+    // frames, their order and the skip-past-a-sure-frame logic are the same as from sample 0, only
+    // shifted. (They wrapped in a 32-bit usize before.)
+    let md = Modem::new(v1(Modulation::Qpsk, PayloadCode::None)).unwrap();
+    let rx = radio_rx(200, PayloadCode::None);
+    let x = recording(&md, 30, 120, 10.0, 0.01, 11);
+    let (want, _, _) = live(md.clone(), &rx, &x, &[512]);
+    assert!(want.len() >= 15, "only {} frames", want.len());
+    for start in [(1u64 << 32) - 3000, 5u64 << 32, (1 << 40) + 12_345] {
+        let mut s = LiveReceiver::new(md.clone(), rx.clone())
+            .unwrap()
+            .starting_at(start);
+        let at = s.samples_seen();
+        assert!(at <= start && start - at < 64, "on the grid near {start}");
+        let mut got = Vec::new();
+        for b in x.chunks(512) {
+            got.extend(s.push(b));
+        }
+        got.extend(s.finish());
+        let shifted: Vec<_> = want
+            .iter()
+            .map(|f| (f.start + at, f.end + at, f.payload.clone(), f.crc_ok))
+            .collect();
+        let got: Vec<_> = got
+            .iter()
+            .map(|f| (f.start, f.end, f.payload.clone(), f.crc_ok))
+            .collect();
+        assert_eq!(got, shifted, "from {start}");
+        assert_eq!(s.report().inside_frame, {
+            let mut z = LiveReceiver::new(md.clone(), rx.clone()).unwrap();
+            for b in x.chunks(512) {
+                z.push(b);
+            }
+            z.finish();
+            z.report().inside_frame
+        });
+    }
 }

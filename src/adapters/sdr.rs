@@ -177,7 +177,13 @@ pub struct SdrConfig {
     /// waits behind zeros already written; too small and the radio runs dry (underflows).
     pub tx_lead: Duration,
     pub tx_mode: TxMode,
+    /// Receiver channel tracking for fading up to this Doppler, Hz (0: off, the single phase line).
+    /// Receiver only; nothing changes on the air. See `docs/phase-tracking.md`.
+    pub phase_track_hz: f64,
 }
+
+/// Largest Doppler `--phase-track-hz` may give, as a fraction of the symbol rate.
+pub const MAX_PHASE_TRACK: f64 = 0.01;
 
 impl SdrConfig {
     /// Defaults of the lab's W1 bench: 1 MS/s, 125 kbaud, IF 250 kHz, QPSK, decimate 2.
@@ -211,6 +217,7 @@ impl SdrConfig {
             rx_record_seconds: 60.0,
             tx_lead: Duration::from_millis(20),
             tx_mode: TxMode::Stream,
+            phase_track_hz: 0.0,
         }
     }
 
@@ -285,6 +292,11 @@ impl SdrConfig {
         }
         if !(Duration::from_millis(1)..=Duration::from_secs(1)).contains(&self.tx_lead) {
             return Err("--tx-lead-ms must be 1 to 1000".into());
+        }
+        if !(0.0..=MAX_PHASE_TRACK * self.symbol_rate).contains(&self.phase_track_hz) {
+            return Err(format!(
+                "--phase-track-hz must be 0 (off) to {MAX_PHASE_TRACK} of the symbol rate"
+            ));
         }
         if !(0.0..=3600.0).contains(&self.rx_record_seconds) {
             return Err("--rx-record-seconds must be 0 to 3600".into());
@@ -415,6 +427,7 @@ impl SdrRadio {
             max_len: Some(cfg.mtu),
             only_code: Some(cfg.code),
             coarse_step: cfg.coarse_step,
+            phase_track: (cfg.phase_track_hz / cfg.symbol_rate) as f32,
             ..RxConfig::default()
         };
         let log = match &cfg.log {
@@ -448,7 +461,7 @@ impl SdrRadio {
         shared.event(
             "sdr_start",
             &format!(
-                ",\"mod\":\"{}\",\"code\":\"{}\",\"sample_rate\":{},\"symbol_rate\":{},\"if_hz\":{},\"cfo_hz\":{},\"cfo_search\":{},\"cfo_acquire\":{},\"decimate\":{},\"block\":{},\"mtu\":{},\"tx_mode\":\"{}\",\"longest_frame_samples\":{},\"rx_filter\":{},\"rx_notch_db\":{},\"cfo_reset_ms\":{}",
+                ",\"mod\":\"{}\",\"code\":\"{}\",\"sample_rate\":{},\"symbol_rate\":{},\"if_hz\":{},\"cfo_hz\":{},\"cfo_search\":{},\"cfo_acquire\":{},\"decimate\":{},\"block\":{},\"mtu\":{},\"tx_mode\":\"{}\",\"phase_track_hz\":{},\"longest_frame_samples\":{},\"rx_filter\":{},\"rx_notch_db\":{},\"cfo_reset_ms\":{}",
                 cfg.modulation.name(),
                 cfg.code.name(),
                 cfg.sample_rate,
@@ -464,6 +477,7 @@ impl SdrRadio {
                     TxMode::Stream => "stream",
                     TxMode::Burst => "burst",
                 },
+                cfg.phase_track_hz,
                 receiver.modem().longest_frame_samples(&RxConfig {
                     max_len: Some(cfg.mtu),
                     only_code: Some(cfg.code),
@@ -1098,17 +1112,14 @@ impl RxChain {
                     .shifts
                     .iter()
                     .rev()
-                    .find(|s| s.0 <= fr.start as u64)
+                    .find(|s| s.0 <= fr.start)
                     .map_or(self.cfo_hz, |s| s.1);
                 self.cfo_hz += gain * (shift + resid - self.cfo_hz);
                 self.cfo_hz = self
                     .cfo_hz
                     .clamp(-self.sample_rate / 8.0, self.sample_rate / 8.0);
             }
-            let change = self
-                .lock
-                .as_mut()
-                .and_then(|l| l.frame(fr.crc_ok, fr.end as u64));
+            let change = self.lock.as_mut().and_then(|l| l.frame(fr.crc_ok, fr.end));
             if let Some(c) = change {
                 self.apply(c, &mut pass);
             }
@@ -1207,7 +1218,7 @@ fn rx_thread(cfg: &SdrConfig, shared: &Shared, receiver: LiveReceiver, out: Sync
         let decided = Instant::now();
         for (fr, cfo_hz) in pass.frames {
             // when the frame's last sample arrived
-            let end = fr.end as u64;
+            let end = fr.end;
             let arrived = arrivals.iter().find(|(k, _)| *k >= end).map(|(_, t)| *t);
             let wait_ms = arrived.map(|t| decided.duration_since(t).as_secs_f64() * 1e3);
             let resid = f64::from(fr.cfo_cycles_per_symbol);
@@ -2012,14 +2023,14 @@ mod acquire {
             }
             let pass = ch.run();
             for (fr, _) in pass.frames {
-                let during = fr.end > j0 && fr.start < j1;
+                let during = fr.end > j0 as u64 && fr.start < j1 as u64;
                 match (during, fr.crc_ok) {
                     (true, true) => r.good_during += 1,
                     (true, false) => r.bad_during += 1,
                     _ => {}
                 }
                 if fr.crc_ok {
-                    got.push((fr.start, fr.end, fr.payload));
+                    got.push((fr.start as usize, fr.end as usize, fr.payload));
                 }
             }
             for (chg, _, _) in pass.changes {
