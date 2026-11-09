@@ -733,6 +733,55 @@ fn waveform_per_with_the_channel_tracker() {
 }
 
 #[test]
+fn waveform_per_with_two_antennas() {
+    let args = |div: Option<&'static str>| {
+        let mut a = vec![
+            "waveform",
+            "per",
+            "--mod",
+            "qpsk",
+            "--sps",
+            "4",
+            "--frame",
+            "v1",
+            "--payload-len",
+            "54",
+            "--cfo-search",
+            "0.1",
+            "--ebn0-db",
+            "15",
+            "--frames",
+            "300",
+            "--channel",
+            "rayleigh",
+            "--doppler-hz",
+            "5",
+            "--frame-interval-ms",
+            "50",
+        ];
+        if let Some(d) = div {
+            a.extend(["--diversity", d]);
+        }
+        let o = run(&a);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    let loss = |l: &str| field(l, "packet_loss").parse::<f64>().unwrap();
+    let plain = args(None);
+    // not given: one antenna and the line as before; off: the same frames, plus the timing
+    assert!(!plain.contains("diversity"), "{plain}");
+    let off = args(Some("off"));
+    assert_eq!(field(&off, "diversity"), "off");
+    assert_eq!(field(&off, "delivered"), field(&plain, "delivered"));
+    assert!(field(&off, "rx_us_per_frame").parse::<f64>().unwrap() > 0.0);
+    for d in ["select", "snr", "mrc"] {
+        let l = args(Some(d));
+        assert_eq!(field(&l, "diversity"), d);
+        assert!(loss(&l) < loss(&plain) / 2.0, "{d}: {l} against {plain}");
+    }
+}
+
+#[test]
 fn waveform_bad_arguments_fail_cleanly() {
     for args in [
         vec![

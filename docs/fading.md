@@ -55,3 +55,8 @@ fading costs about 17 dB at 1 % (diversity or coding and retransmission are the 
 **Since B12:** `--phase-track-hz` (receiver only, off by default) follows the channel through the frame
 instead of one line. With it, Rayleigh 50 Hz no longer has a floor and 200 Hz drops from about 26 % to about 2 %
 at 30 dB uncoded (0.4 % with `--code light`); white noise is unchanged. See [phase-tracking.md](phase-tracking.md).
+
+**Since B14:** `waveform per --diversity select|snr|mrc` (receiver only, off by default) receives on two antennas
+that fade independently. Rayleigh 5 Hz at 1 % comes down from 26.3 dB to 16.7 dB with frame selection and 14.8 dB
+with maximal-ratio combining; at 200 Hz with the tracker, from 36.7 to 19.5 dB with frame selection. See
+[diversity.md](diversity.md).
