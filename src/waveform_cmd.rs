@@ -19,6 +19,7 @@ use std::time::SystemTime;
 
 use oasa_waveform::channel::{n0_for_ebn0, snr_per_sample_db, Channel, Impairments};
 use oasa_waveform::df;
+use oasa_waveform::diversity::Combine;
 use oasa_waveform::frame::{FrameFormat, HeaderFields, PayloadCode};
 use oasa_waveform::iq::{from_cf32_le, from_ci16_le, to_cf32_le};
 use oasa_waveform::rng::Rng;
@@ -38,7 +39,7 @@ WAVEFORM (W0, simulation):
                           [--ray-gain-db -3] [--symbol-rate 250000] [--frame-interval-ms 10]
                           [--phase-track-hz 0]
   oasa-radio waveform per --mod bpsk|qpsk|fsk2 --ebn0-db 3,3.5,4 [--frames 400] [--sync-max-errors 3]
-                          [same options as ber, except --bits]
+                          [same options as ber, except --bits] [--diversity off|select|snr|mrc]
   oasa-radio waveform iq --mod bpsk|qpsk|fsk2 --out BASE [--ebn0-db X] [--payload-len 32 | --payload-hex HEX]
                          [--seed S] [--sps 8] [--symbol-rate 25000] [--center-hz 0]
                          [--phase-deg 0] [--delay 64] [--tail 64] [--cfo 0] [--frac-delay 0]
@@ -131,6 +132,13 @@ WAVEFORM (W0, simulation):
   per take --symbol-rate (for the sample rate) and --frame-interval-ms (time between frames: the
   fading moves on by this from frame to frame); the cable uses --sample-rate and rounds the second
   ray's delay to whole samples. awgn (the default) leaves everything as before.
+
+  --diversity off|select|snr|mrc (per only; B14, docs/diversity.md) receives on two antennas, each
+  with its own fading (--channel, independent) and noise at the same mean --ebn0-db, and combines
+  them: select decodes both and keeps the frame with a good CRC, snr decodes only the channel with
+  the stronger preamble, mrc adds the channels (maximal-ratio) after estimating each one's carrier
+  and phase. Not given (the default): one antenna. off: one antenna, and like the others it adds
+  rx_us_per_frame, the receiver's time per frame. Receiver only, nothing changes on the air.
 
   --phase-track-hz HZ (bpsk, qpsk; B12, docs/phase-tracking.md) turns on the receiver's channel
   tracker for fading up to HZ Doppler at --symbol-rate: the gain is followed block by block through
@@ -281,6 +289,9 @@ pub struct PerArgs {
     pub ber: BerArgs,
     pub frames: u64,
     pub sync_max_errors: u32,
+    /// `--diversity`: None, not given (one antenna, output as before); `Some(None)`, `off` (one
+    /// antenna, with the receiver's time per frame in the output); `Some(Some(c))`, two antennas.
+    pub diversity: Option<Option<Combine>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -459,6 +470,15 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
                     int("sync-max-errors", named.remove("sync-max-errors"), 3, 0, 16)? as u32,
                 )
             };
+            let diversity = match (sub, named.remove("diversity")) {
+                (_, None) => None,
+                ("per", Some(v)) if v == "off" => Some(None),
+                ("per", Some(v)) => Some(Some(
+                    Combine::parse(&v)
+                        .ok_or(format!("--diversity {v:?}: use off, select, snr or mrc"))?,
+                )),
+                (_, Some(_)) => return Err("--diversity is for per only".into()),
+            };
             let a = BerArgs {
                 modulation,
                 frame,
@@ -489,6 +509,7 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
                     ber: a,
                     frames,
                     sync_max_errors,
+                    diversity,
                 })
             }
         }
@@ -1070,6 +1091,7 @@ fn run_per_cmd(p: &PerArgs, out: &mut dyn Write) -> R<()> {
     let a = &p.ber;
     let mut opts = ber_options(a);
     opts.rx.sync_max_errors = p.sync_max_errors;
+    opts.diversity = p.diversity.flatten();
     for &db in &a.ebn0_db {
         let r = run_found(a.modulation, db, p.frames, a.seed, &opts).map_err(|e| e.to_string())?;
         let lost = r.frames - r.crc_ok;
@@ -1077,7 +1099,7 @@ fn run_per_cmd(p: &PerArgs, out: &mut dyn Write) -> R<()> {
         let c = &r.report;
         writeln!(
             out,
-            "{{\"ts\":\"{}\",\"event\":\"per\",\"mod\":\"{}\",\"frame\":\"{}\",\"code\":\"{}\",\"ebn0_db\":{},\"frames\":{},\"found\":{},\"delivered\":{},\"packet_loss\":{},\"ci_lo\":{},\"ci_hi\":{},\"preambles\":{},\"sync_rejected\":{},\"header_rejected\":{},\"too_short\":{},\"inside_frame\":{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"frame_symbols\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"sync_max_errors\":{}{}{}}}",
+            "{{\"ts\":\"{}\",\"event\":\"per\",\"mod\":\"{}\",\"frame\":\"{}\",\"code\":\"{}\",\"ebn0_db\":{},\"frames\":{},\"found\":{},\"delivered\":{},\"packet_loss\":{},\"ci_lo\":{},\"ci_hi\":{},\"preambles\":{},\"sync_rejected\":{},\"header_rejected\":{},\"too_short\":{},\"inside_frame\":{},\"seed\":{},\"sps\":{},\"payload_len\":{},\"frame_symbols\":{},\"cfo_cycles_per_symbol\":{},\"cfo_random\":{},\"random_frac_delay\":{},\"cfo_bins\":{},\"cfo_search\":{},\"sync_max_errors\":{}{}{}{}}}",
             now(),
             a.modulation.name(),
             a.frame.name(),
@@ -1106,6 +1128,14 @@ fn run_per_cmd(p: &PerArgs, out: &mut dyn Write) -> R<()> {
             p.sync_max_errors,
             a.channel.json(),
             track_json(a),
+            match p.diversity {
+                None => String::new(),
+                Some(d) => format!(
+                    ",\"diversity\":\"{}\",\"rx_us_per_frame\":{}",
+                    d.map_or("off", |c| c.name()),
+                    num(r.rx_seconds * 1e6 / r.frames as f64)
+                ),
+            },
         )
         .map_err(io)?;
         out.flush().map_err(io)?;
@@ -1448,6 +1478,34 @@ mod tests {
                 assert_eq!(ber_options(&a).rx.phase_track, 0.0);
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn diversity_option() {
+        let div = |s: &str| match parse(&v(s)).unwrap() {
+            WaveformCommand::Per(p) => p.diversity,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(div("per --mod qpsk --ebn0-db 10"), None);
+        assert_eq!(
+            div("per --mod qpsk --ebn0-db 10 --diversity off"),
+            Some(None)
+        );
+        assert_eq!(
+            div("per --mod qpsk --ebn0-db 10 --diversity mrc"),
+            Some(Some(Combine::Mrc))
+        );
+        assert_eq!(
+            div("per --mod qpsk --ebn0-db 10 --diversity snr"),
+            Some(Some(Combine::PreambleSnr))
+        );
+        for bad in [
+            "per --mod qpsk --ebn0-db 10 --diversity both",
+            "ber --mod qpsk --ebn0-db 10 --diversity mrc",
+            "decode --in x --mod qpsk --diversity mrc",
+        ] {
+            assert!(parse(&v(bad)).is_err(), "{bad}");
         }
     }
 
