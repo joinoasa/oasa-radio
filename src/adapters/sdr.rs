@@ -164,7 +164,13 @@ pub struct SdrConfig {
     /// waits behind zeros already written; too small and the radio runs dry (underflows).
     pub tx_lead: Duration,
     pub tx_mode: TxMode,
+    /// Receiver channel tracking for fading up to this Doppler, Hz (0: off, the single phase line).
+    /// Receiver only; nothing changes on the air. See `docs/phase-tracking.md`.
+    pub phase_track_hz: f64,
 }
+
+/// Largest Doppler `--phase-track-hz` may give, as a fraction of the symbol rate.
+pub const MAX_PHASE_TRACK: f64 = 0.01;
 
 impl SdrConfig {
     /// Defaults of the lab's W1 bench: 1 MS/s, 125 kbaud, IF 250 kHz, QPSK, decimate 2.
@@ -195,6 +201,7 @@ impl SdrConfig {
             rx_record_seconds: 60.0,
             tx_lead: Duration::from_millis(20),
             tx_mode: TxMode::Stream,
+            phase_track_hz: 0.0,
         }
     }
 
@@ -258,6 +265,11 @@ impl SdrConfig {
         }
         if !(Duration::from_millis(1)..=Duration::from_secs(1)).contains(&self.tx_lead) {
             return Err("--tx-lead-ms must be 1 to 1000".into());
+        }
+        if !(0.0..=MAX_PHASE_TRACK * self.symbol_rate).contains(&self.phase_track_hz) {
+            return Err(format!(
+                "--phase-track-hz must be 0 (off) to {MAX_PHASE_TRACK} of the symbol rate"
+            ));
         }
         if !(0.0..=3600.0).contains(&self.rx_record_seconds) {
             return Err("--rx-record-seconds must be 0 to 3600".into());
@@ -388,6 +400,7 @@ impl SdrRadio {
             max_len: Some(cfg.mtu),
             only_code: Some(cfg.code),
             coarse_step: cfg.coarse_step,
+            phase_track: (cfg.phase_track_hz / cfg.symbol_rate) as f32,
             ..RxConfig::default()
         };
         let log = match &cfg.log {
@@ -421,7 +434,7 @@ impl SdrRadio {
         shared.event(
             "sdr_start",
             &format!(
-                ",\"mod\":\"{}\",\"code\":\"{}\",\"sample_rate\":{},\"symbol_rate\":{},\"if_hz\":{},\"cfo_hz\":{},\"cfo_search\":{},\"cfo_acquire\":{},\"decimate\":{},\"block\":{},\"mtu\":{},\"tx_mode\":\"{}\",\"longest_frame_samples\":{}",
+                ",\"mod\":\"{}\",\"code\":\"{}\",\"sample_rate\":{},\"symbol_rate\":{},\"if_hz\":{},\"cfo_hz\":{},\"cfo_search\":{},\"cfo_acquire\":{},\"decimate\":{},\"block\":{},\"mtu\":{},\"tx_mode\":\"{}\",\"phase_track_hz\":{},\"longest_frame_samples\":{}",
                 cfg.modulation.name(),
                 cfg.code.name(),
                 cfg.sample_rate,
@@ -437,6 +450,7 @@ impl SdrRadio {
                     TxMode::Stream => "stream",
                     TxMode::Burst => "burst",
                 },
+                cfg.phase_track_hz,
                 receiver.modem().longest_frame_samples(&RxConfig {
                     max_len: Some(cfg.mtu),
                     only_code: Some(cfg.code),
