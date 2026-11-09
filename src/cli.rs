@@ -67,6 +67,13 @@ RADIOS:
             --cfo-lock-frames N  good frames in a row that lock, default 2
             --cfo-unlock-bad N   bad frames (CRC) in a row that drop the lock, default 3
             --cfo-unlock-ms MS   stream time with no good frame that drops the lock, default 500
+            --cfo-reset-ms MS    acquiring with no good frame for MS, put the offset back to
+                                 --cfo-hz (logs cfo_reset). Default 0 (off). Needs --cfo-acquire
+            --rx-filter on|off   channel filter (63-tap low-pass to the modem's band) after the
+                                 shift and decimation, default off. Use with --decimate 1, where
+                                 nothing else stops a strong signal beside the band (B8)
+            --rx-notch-db DB     cancel the strongest carrier in each receiver block when it
+                                 stands DB over the mean FFT bin (25 is safe). Default 0 (off)
             --decimate 1|2       default 2
             --block N            samples per receiver pass after decimation, default 512 (1 ms)
             --coarse-step N      samples between the positions the detector tests, 0 (default)
@@ -422,6 +429,13 @@ fn sdr_spec(named: &mut BTreeMap<String, String>) -> R<SdrConfig> {
         1,
         3_600_000,
     )?;
+    c.cfo_reset_ms = number(
+        "cfo-reset-ms",
+        named.remove("cfo-reset-ms"),
+        c.cfo_reset_ms,
+        0,
+        3_600_000,
+    )?;
     c.tx_peak = real("tx-peak", named.remove("tx-peak"), f64::from(c.tx_peak))? as f32;
     c.rx_record_seconds = real(
         "rx-record-seconds",
@@ -435,6 +449,14 @@ fn sdr_spec(named: &mut BTreeMap<String, String>) -> R<SdrConfig> {
             _ => return Err("--track-cfo must be on or off".into()),
         };
     }
+    if let Some(v) = named.remove("rx-filter") {
+        c.rx_filter = match v.as_str() {
+            "on" => true,
+            "off" => false,
+            _ => return Err("--rx-filter must be on or off".into()),
+        };
+    }
+    c.rx_notch_db = real("rx-notch-db", named.remove("rx-notch-db"), c.rx_notch_db)?;
     c.decimate = number(
         "decimate",
         named.remove("decimate"),
@@ -701,7 +723,16 @@ mod tests {
             .unwrap();
         assert_eq!((c.cfo_acquire, c.cfo_lock_frames), (0.1, 1));
         assert_eq!((c.cfo_unlock_bad, c.cfo_unlock_ms), (5, 400));
+        assert_eq!(c.cfo_reset_ms, 0);
+        assert!(!c.rx_filter && c.rx_notch_db == 0.0);
+        let c = sdr("--rx-filter on --rx-notch-db 25").unwrap();
+        assert!(c.rx_filter && c.rx_notch_db == 25.0);
+        let c = sdr("--cfo-acquire 0.15 --cfo-reset-ms 1000").unwrap();
+        assert_eq!(c.cfo_reset_ms, 1000);
         for bad in [
+            "--cfo-reset-ms 1000",
+            "--rx-filter maybe",
+            "--rx-notch-db 5",
             "--cfo-acquire 0.02",
             "--cfo-acquire 0.03",
             "--cfo-acquire -1",

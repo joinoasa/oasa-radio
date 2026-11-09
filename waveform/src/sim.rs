@@ -355,3 +355,270 @@ pub fn run_found(
         rx_seconds,
     })
 }
+
+/// Settings for [`run_sir`]: the wanted signal and one interferer through a radio's front end (B8).
+/// Frequencies in Hz; the defaults are the live link's (1 MS/s, 250 kbaud, IF 175 kHz, frame v1,
+/// 54-byte payload, coarse search +-0.1 cycles per symbol, coarse step 4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SirOptions {
+    pub modulation: Modulation,
+    pub sps: usize,
+    pub symbol_rate: f64,
+    /// The signal sits at `+if_hz` in the radio's band, as on the bench.
+    pub if_hz: f64,
+    pub code: PayloadCode,
+    pub payload_len: usize,
+    /// Receiver settings (`expected_len` is ignored: the receiver reads the header).
+    pub rx: RxConfig,
+    /// The interferer, in Hz: offsets from the signal's centre, widths, sweep spans; a sweep's
+    /// period is in seconds (`Interferer::Sweep { period }` taken as seconds here).
+    pub interferer: crate::interference::Interferer,
+    /// ADC rate over the modem's rate (0: the smallest power of two that holds the interferer).
+    pub ratio: usize,
+    /// Signal power below ADC full scale, dB (full scale: I and Q at +-1, so a full-scale carrier is
+    /// 0 dBFS). `None`: no clipping.
+    pub headroom_db: Option<f64>,
+    /// Opt-in receiver improvement: cancel the strongest carrier in each buffer before the
+    /// receiver, when it stands this many dB above the mean FFT bin (see
+    /// [`crate::interference::cancel_tone`]). `None`: off.
+    pub notch_db: Option<f64>,
+    /// Opt-in receiver improvement: a channel filter before the receiver
+    /// ([`crate::interference::ChannelFilter::for_modem`]).
+    pub channel_filter: bool,
+}
+
+impl Default for SirOptions {
+    fn default() -> Self {
+        Self {
+            modulation: Modulation::Qpsk,
+            sps: 4,
+            symbol_rate: 250e3,
+            if_hz: 175e3,
+            code: PayloadCode::None,
+            payload_len: 54,
+            rx: RxConfig {
+                cfo_search: 0.1,
+                coarse_step: 4,
+                ..RxConfig::default()
+            },
+            interferer: crate::interference::Interferer::Tone { offset: 0.0 },
+            ratio: 0,
+            headroom_db: None,
+            notch_db: None,
+            channel_filter: false,
+        }
+    }
+}
+
+impl SirOptions {
+    /// The ADC rate over the modem's rate: `ratio`, or the smallest power of two whose band (0.8 of
+    /// it) holds the interferer at its place in the radio's band.
+    pub fn ratio(&self) -> usize {
+        if self.ratio > 0 {
+            return self.ratio;
+        }
+        let fs = self.symbol_rate * self.sps as f64;
+        let reach = self.radio_interferer(1.0).reach() * fs;
+        let mut r = 1usize;
+        while reach > 0.4 * fs * r as f64 && r < 1024 {
+            r *= 2;
+        }
+        r
+    }
+
+    /// The interferer in cycles per sample at `k` times the modem's rate, at its place in the
+    /// radio's band (signal at `+if_hz`).
+    fn radio_interferer(&self, k: f64) -> crate::interference::Interferer {
+        use crate::interference::Interferer;
+        let fs = self.symbol_rate * self.sps as f64 * k;
+        match self.interferer {
+            Interferer::Tone { offset } => Interferer::Tone {
+                offset: (offset + self.if_hz) / fs,
+            },
+            Interferer::Noise { offset, width } => Interferer::Noise {
+                offset: (offset + self.if_hz) / fs,
+                width: width / fs,
+            },
+            Interferer::Sweep {
+                offset,
+                span,
+                period,
+            } => Interferer::Sweep {
+                offset: (offset + self.if_hz) / fs,
+                span: span / fs,
+                period: period * fs,
+            },
+        }
+    }
+}
+
+/// One point of [`run_sir`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SirPoint {
+    pub ebn0_db: f64,
+    /// Signal power over interferer power, both at the antenna (before the radio's filters).
+    pub sir_db: f64,
+    pub frames: u64,
+    /// Frames delivered: CRC good and the payload sent.
+    pub delivered: u64,
+    /// Frames with any clipped sample.
+    pub clipped_frames: u64,
+    /// Buffers where the notch removed a carrier.
+    pub notched: u64,
+    pub ratio: usize,
+}
+
+impl SirPoint {
+    pub fn loss(&self) -> f64 {
+        1.0 - self.delivered as f64 / self.frames as f64
+    }
+}
+
+/// Send `frames` frames through a radio front end with an interferer `sir_db` below the signal and
+/// thermal noise at `ebn0_db`, and count the frames the receiver delivers. Per frame: modulate,
+/// put the frame at `+if_hz` with a random phase and delay, raise it to the ADC rate, add the
+/// interferer (a continuous stream: its phase and noise run on between frames), clip at full scale
+/// (with `headroom_db`), filter and decimate to the modem's rate, add the thermal noise, shift back
+/// by the IF, cancel a carrier (with `notch_db`) and run the receiver as on the air.
+pub fn run_sir(
+    ebn0_db: f64,
+    sir_db: f64,
+    frames: u64,
+    seed: u64,
+    opts: &SirOptions,
+) -> Result<SirPoint, ConfigError> {
+    use crate::interference::{cancel_tone, clip, FrontEnd, InterfererGen};
+    let modem = Modem::new(ModemConfig {
+        sps: opts.sps,
+        frame: FrameFormat::V1,
+        code: opts.code,
+        ..ModemConfig::new(opts.modulation)
+    })?;
+    if opts.payload_len == 0 || opts.payload_len > 255 {
+        return Err(ConfigError("payload_len must be 1 to 255".into()));
+    }
+    let r = opts.ratio();
+    let fe = FrontEnd::new(r);
+    let mixed = seed ^ ebn0_db.to_bits().rotate_left(17) ^ sir_db.to_bits().rotate_left(41);
+    let mut ch = Channel::new(mixed);
+    let n0 = n0_for_ebn0(ebn0_db, modem.energy_per_bit());
+    let rx = RxConfig {
+        expected_len: None,
+        ..opts.rx.clone()
+    };
+    let if_cps = opts.if_hz / (opts.symbol_rate * opts.sps as f64);
+    // the signal's mean power per sample over a frame: Es / sps
+    let ps = modem.energy_per_symbol() / opts.sps as f64;
+    let pi = ps / 10f64.powf(sir_db / 10.0);
+    let mut gen = InterfererGen::new(opts.radio_interferer(r as f64), pi, mixed ^ 0x1A7E_5EED);
+    // scale to the ADC: the signal at -headroom dBFS
+    let adc = opts
+        .headroom_db
+        .map(|h| ((10f64.powf(-h / 10.0) / ps).sqrt() as f32, 1.0f32));
+    const GUARD: usize = 32;
+    let (mut delivered, mut clipped_frames, mut notched) = (0u64, 0u64, 0u64);
+    for _ in 0..frames {
+        let payload = ch.rng().bytes(opts.payload_len);
+        let tx = modem.modulate(&payload)?;
+        let lead = GUARD + 2 + ch.rng().below(62) as usize;
+        let len = lead + tx.len() + 64 + GUARD;
+        let ph0 = ch.rng().uniform() * 2.0 * PI;
+        let mut x = vec![crate::iq::Complex32::ZERO; len];
+        for (k, s) in tx.iter().enumerate() {
+            let n = lead + k;
+            let ph = ph0 + 2.0 * PI * if_cps * n as f64;
+            x[n] = *s * crate::iq::Complex32::new(ph.cos() as f32, ph.sin() as f32);
+        }
+        let mut hi = fe.upsample(&x);
+        gen.add(&mut hi);
+        if let Some((g, fs)) = adc {
+            for v in hi.iter_mut() {
+                *v = *v * g;
+            }
+            if clip(&mut hi, fs) > 0 {
+                clipped_frames += 1;
+            }
+            for v in hi.iter_mut() {
+                *v = *v * (1.0 / g);
+            }
+        }
+        let lo = fe.downsample(&hi);
+        let mut y = lo[GUARD..len - GUARD].to_vec();
+        ch.add_awgn(&mut y, n0);
+        for (k, v) in y.iter_mut().enumerate() {
+            let ph = -2.0 * PI * if_cps * (k + GUARD) as f64;
+            *v = *v * crate::iq::Complex32::new(ph.cos() as f32, ph.sin() as f32);
+        }
+        // as the radio does it: channel filter, then the notch
+        if opts.channel_filter {
+            // a fresh filter per frame: its delay only moves the frame, which is found by its payload
+            crate::interference::ChannelFilter::for_modem(opts.sps, 0.35).run(&mut y);
+        }
+        if let Some(db) = opts.notch_db {
+            notched += cancel_tone(&mut y, db).is_some() as u64;
+        }
+        let (got, _) = modem.demodulate_report(&y, &rx);
+        if got.iter().any(|f| f.crc_ok && f.payload == payload) {
+            delivered += 1;
+        }
+    }
+    Ok(SirPoint {
+        ebn0_db,
+        sir_db,
+        frames,
+        delivered,
+        clipped_frames,
+        notched,
+        ratio: r,
+    })
+}
+
+#[cfg(test)]
+mod sir_tests {
+    use super::*;
+    use crate::interference::Interferer;
+
+    fn loss(sir: f64, opts: &SirOptions) -> f64 {
+        run_sir(20.0, sir, 60, 1, opts).unwrap().loss()
+    }
+
+    #[test]
+    fn interference_costs_frames_and_the_options_win_them_back() {
+        let tone = |offset: f64| SirOptions {
+            interferer: Interferer::Tone { offset },
+            ..SirOptions::default()
+        };
+        // a weak carrier costs nothing; one as strong as the signal on its centre costs everything
+        assert_eq!(loss(30.0, &tone(0.0)), 0.0);
+        assert_eq!(loss(0.0, &tone(0.0)), 1.0);
+        // ... unless the notch takes it out
+        let notch = SirOptions {
+            notch_db: Some(25.0),
+            ..tone(0.0)
+        };
+        assert_eq!(loss(-10.0, &notch), 0.0);
+        // one channel below, 20 dB over the signal: the detector loses it; the channel filter saves it
+        assert!(loss(-20.0, &tone(-420e3)) > 0.5);
+        let filtered = SirOptions {
+            channel_filter: true,
+            ..tone(-420e3)
+        };
+        assert_eq!(loss(-20.0, &filtered), 0.0);
+        // 5 MHz away, 40 dB over: filtered out, until it clips the ADC
+        let far = SirOptions {
+            interferer: Interferer::Noise {
+                offset: 5e6,
+                width: 420e3,
+            },
+            ..SirOptions::default()
+        };
+        assert_eq!(far.ratio(), 16);
+        assert_eq!(loss(-40.0, &far), 0.0);
+        let clipped = SirOptions {
+            headroom_db: Some(20.0),
+            ..far
+        };
+        let p = run_sir(20.0, -40.0, 30, 1, &clipped).unwrap();
+        assert_eq!((p.loss(), p.clipped_frames), (1.0, 30));
+    }
+}

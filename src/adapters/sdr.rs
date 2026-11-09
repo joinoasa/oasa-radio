@@ -37,6 +37,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use oasa_waveform::frame::{FrameFormat, PayloadCode};
+use oasa_waveform::interference::{cancel_tone, ChannelFilter};
 use oasa_waveform::iq::{from_cf32_le, from_ci16_le};
 use oasa_waveform::stream::LiveReceiver;
 use oasa_waveform::{Complex32, Modem, ModemConfig, Modulation, RxConfig, RxFrame};
@@ -146,6 +147,18 @@ pub struct SdrConfig {
     pub cfo_unlock_bad: u32,
     /// Stream time without a good frame that drops the lock, ms.
     pub cfo_unlock_ms: u64,
+    /// Acquiring, with no good frame for this long (ms), return the tracked offset to `cfo_hz`
+    /// (once per such gap). 0: off. Keeps a false good frame (one that passed both CRCs by chance,
+    /// say under a jammer) from leaving the wide search centred where the signal is not. Needs
+    /// `cfo_acquire`.
+    pub cfo_reset_ms: u64,
+    /// Channel filter after the shift and decimation (opt-in, B8): a 63-tap low-pass that keeps
+    /// the modem's band. With `--decimate 1` nothing else removes a strong signal beside the band,
+    /// which hides preambles from the detector.
+    pub rx_filter: bool,
+    /// Carrier canceller (opt-in, B8): remove the strongest tone in each receiver block when it
+    /// stands this many dB over the block's mean FFT bin. 0: off.
+    pub rx_notch_db: f64,
     /// Keep every n-th sample after the filter (1 or 2; the receiver needs 4 or more per symbol).
     pub decimate: usize,
     /// Samples (after decimation) per receiver pass. Smaller: less delay, a little more work.
@@ -191,6 +204,9 @@ impl SdrConfig {
             cfo_lock_frames: 2,
             cfo_unlock_bad: 3,
             cfo_unlock_ms: 500,
+            cfo_reset_ms: 0,
+            rx_filter: false,
+            rx_notch_db: 0.0,
             decimate: 2,
             block: 512,
             coarse_step: 0,
@@ -261,6 +277,17 @@ impl SdrConfig {
             }
             if !(1..=3_600_000).contains(&self.cfo_unlock_ms) {
                 return Err("--cfo-unlock-ms must be 1 to 3600000".into());
+            }
+        }
+        if !(self.rx_notch_db == 0.0 || (10.0..=100.0).contains(&self.rx_notch_db)) {
+            return Err("--rx-notch-db must be 0 (off) or 10 to 100".into());
+        }
+        if self.cfo_reset_ms != 0 {
+            if self.cfo_acquire == 0.0 {
+                return Err("--cfo-reset-ms needs --cfo-acquire".into());
+            }
+            if self.cfo_reset_ms > 3_600_000 {
+                return Err("--cfo-reset-ms must be 0 to 3600000".into());
             }
         }
         if !(Duration::from_millis(1)..=Duration::from_secs(1)).contains(&self.tx_lead) {
@@ -434,7 +461,7 @@ impl SdrRadio {
         shared.event(
             "sdr_start",
             &format!(
-                ",\"mod\":\"{}\",\"code\":\"{}\",\"sample_rate\":{},\"symbol_rate\":{},\"if_hz\":{},\"cfo_hz\":{},\"cfo_search\":{},\"cfo_acquire\":{},\"decimate\":{},\"block\":{},\"mtu\":{},\"tx_mode\":\"{}\",\"phase_track_hz\":{},\"longest_frame_samples\":{}",
+                ",\"mod\":\"{}\",\"code\":\"{}\",\"sample_rate\":{},\"symbol_rate\":{},\"if_hz\":{},\"cfo_hz\":{},\"cfo_search\":{},\"cfo_acquire\":{},\"decimate\":{},\"block\":{},\"mtu\":{},\"tx_mode\":\"{}\",\"phase_track_hz\":{},\"longest_frame_samples\":{},\"rx_filter\":{},\"rx_notch_db\":{},\"cfo_reset_ms\":{}",
                 cfg.modulation.name(),
                 cfg.code.name(),
                 cfg.sample_rate,
@@ -455,7 +482,10 @@ impl SdrRadio {
                     max_len: Some(cfg.mtu),
                     only_code: Some(cfg.code),
                     ..RxConfig::default()
-                })
+                }),
+                cfg.rx_filter,
+                cfg.rx_notch_db,
+                cfg.cfo_reset_ms,
             ),
         );
         let (tx_pkt, rx_pkt) = mpsc::sync_channel(256);
@@ -861,6 +891,8 @@ impl UnlockReason {
 enum CfoChange {
     Lock,
     Unlock(UnlockReason),
+    /// Acquiring with no good frame for `cfo_reset_ms`: the offset goes back to its start.
+    Reset,
 }
 
 /// Acquisition state (`--cfo-acquire`): wide search until `lock_frames` good frames in a row, then
@@ -879,6 +911,10 @@ struct CfoLock {
     lock_frames: u32,
     unlock_bad: u32,
     timeout: u64,
+    /// Samples without a good frame, acquiring, before a [`CfoChange::Reset`] (0: never).
+    reset: u64,
+    /// The reset for the current gap has happened.
+    reset_done: bool,
 }
 
 impl CfoLock {
@@ -891,7 +927,14 @@ impl CfoLock {
             lock_frames,
             unlock_bad,
             timeout,
+            reset: 0,
+            reset_done: false,
         }
+    }
+
+    fn with_reset(mut self, reset: u64) -> Self {
+        self.reset = reset;
+        self
     }
 
     /// A frame ending at stream sample `at`.
@@ -899,6 +942,7 @@ impl CfoLock {
         if crc_ok {
             self.last_good = self.last_good.max(at);
             self.bad = 0;
+            self.reset_done = false;
             if !self.locked {
                 self.good += 1;
                 if self.good >= self.lock_frames {
@@ -926,6 +970,14 @@ impl CfoLock {
         if self.locked && at.saturating_sub(self.last_good) > self.timeout {
             self.unlock();
             return Some(CfoChange::Unlock(UnlockReason::Timeout));
+        }
+        if !self.locked
+            && self.reset > 0
+            && !self.reset_done
+            && at.saturating_sub(self.last_good) > self.reset
+        {
+            self.reset_done = true;
+            return Some(CfoChange::Reset);
         }
         None
     }
@@ -964,11 +1016,17 @@ struct RxChain {
     shifts: VecDeque<(u64, f64)>,
     narrow: f32,
     wide: f32,
+    /// The starting offset, Hz (where a [`CfoChange::Reset`] puts the tracker back).
+    cfo_start: f64,
     sample_rate: f64,
     symbol_rate: f64,
     if_hz: f64,
     block: usize,
     track: bool,
+    filter: Option<ChannelFilter>,
+    notch_db: Option<f64>,
+    /// Blocks where the carrier canceller removed a tone.
+    notched: u64,
 }
 
 impl RxChain {
@@ -980,6 +1038,7 @@ impl RxChain {
                 cfg.cfo_unlock_bad,
                 (cfg.cfo_unlock_ms as f64 * 1e-3 * fs_out) as u64,
             )
+            .with_reset((cfg.cfo_reset_ms as f64 * 1e-3 * fs_out) as u64)
         });
         Self {
             receiver,
@@ -992,11 +1051,17 @@ impl RxChain {
             shifts: VecDeque::new(),
             narrow: cfg.cfo_search,
             wide: cfg.cfo_acquire,
+            cfo_start: cfg.cfo_hz,
             sample_rate: cfg.sample_rate,
             symbol_rate: cfg.symbol_rate,
             if_hz: cfg.if_hz,
             block: cfg.block,
             track: cfg.track_cfo,
+            filter: cfg
+                .rx_filter
+                .then(|| ChannelFilter::for_modem(cfg.sps().unwrap_or(4) / cfg.decimate, 0.35)),
+            notch_db: (cfg.rx_notch_db > 0.0).then_some(cfg.rx_notch_db),
+            notched: 0,
         }
     }
 
@@ -1013,6 +1078,9 @@ impl RxChain {
             .mix(x, -(self.if_hz + self.cfo_hz), self.sample_rate);
         let before = self.pending.len();
         self.dec.run(x, &mut self.pending);
+        if let Some(f) = self.filter.as_mut() {
+            f.run(&mut self.pending[before..]);
+        }
         &self.pending[before..]
     }
 
@@ -1024,6 +1092,9 @@ impl RxChain {
     /// Run the receiver on what is waiting.
     fn run(&mut self) -> Pass {
         self.fed += self.pending.len() as u64;
+        if let Some(db) = self.notch_db {
+            self.notched += cancel_tone(&mut self.pending, db).is_some() as u64;
+        }
         let frames = self.receiver.push(&self.pending);
         self.pending.clear();
         let mut pass = Pass::default();
@@ -1064,6 +1135,10 @@ impl RxChain {
         let search = match c {
             CfoChange::Lock => self.narrow,
             CfoChange::Unlock(_) => self.wide,
+            CfoChange::Reset => {
+                self.cfo_hz = self.cfo_start;
+                self.wide
+            }
         };
         // both ranges are above 0 (checked with the config), so this cannot fail
         let _ = self.receiver.set_cfo_search(search);
@@ -1174,6 +1249,7 @@ fn rx_thread(cfg: &SdrConfig, shared: &Shared, receiver: LiveReceiver, out: Sync
             let (event, reason) = match c {
                 CfoChange::Lock => ("cfo_lock", String::new()),
                 CfoChange::Unlock(r) => ("cfo_unlock", format!(",\"reason\":\"{}\"", r.name())),
+                CfoChange::Reset => ("cfo_reset", String::new()),
             };
             shared.event(
                 event,
@@ -1649,6 +1725,7 @@ mod acquire {
                 match chg {
                     CfoChange::Lock => r.locks.push(ms),
                     CfoChange::Unlock(why) => r.unlocks.push((ms, why)),
+                    CfoChange::Reset => {}
                 }
             }
         }
@@ -1798,5 +1875,342 @@ mod acquire {
             "step 18.3 -> 40 kHz at 1 s (unlock 500 ms): locks {:?} unlocks {:?} sent {} good {}; from 1.6 s {} of {}; tracked {:.0} Hz",
             r.locks, r.unlocks, r.sent, r.good, r.late_good, r.late_sent, r.cfo_hz
         );
+    }
+
+    /// B8: what a run with a jammer gave.
+    #[derive(Debug, Default)]
+    struct Jam {
+        /// Frames sent wholly before the jam, during it, and wholly after it.
+        sent_before: usize,
+        good_before: usize,
+        /// Frames the receiver returned during the jam (CRC good, CRC bad).
+        good_during: usize,
+        bad_during: usize,
+        /// Frames sent overlapping the jam, and of those delivered.
+        sent_during: usize,
+        delivered_during: usize,
+        sent_after: usize,
+        good_after: usize,
+        /// Stream ms from the end of the jam to the end of the first good frame after it.
+        back_ms: Option<f64>,
+        /// The first frame sent after the jam was delivered.
+        first_after_ok: bool,
+        /// Stream ms of each lock and unlock, from the start of the jam.
+        locks: Vec<f64>,
+        unlocks: Vec<(f64, UnlockReason)>,
+        resets: Vec<f64>,
+        /// Samples clipped at full scale.
+        clipped: usize,
+        cfo_hz: f64,
+        /// Seconds of CPU the receiver took per second of stream.
+        load: f64,
+    }
+
+    /// Frames as in [`run`] (random 40 to 200 bytes, 0.5 to 3 ms apart; signal about -32 dBFS,
+    /// Es/N0 about 20 dB, offset `cfo_hz`), and noise `jam_db` above the signal's power, flat over
+    /// the signal's band (420 kHz at the IF), from `jam_at` for `jam_s` seconds, then
+    /// `after_s` seconds clear. The stream clips at full scale (I and Q at +-1) like a radio's ADC.
+    /// `false_frame`: `(s, Hz)`, at `s` seconds the receiver takes a false good frame that puts the
+    /// tracked offset at `Hz` (what one noise frame passing both CRCs by chance would do).
+    fn jam(
+        c: &SdrConfig,
+        seed: u64,
+        cfo_hz: f64,
+        (jam_at, jam_s, after_s): (f64, f64, f64),
+        jam_db: f64,
+        false_frame: Option<(f64, f64)>,
+    ) -> Jam {
+        let model = oasa_waveform::interference::Interferer::Noise {
+            offset: c.if_hz / c.sample_rate,
+            width: 420e3 / c.sample_rate,
+        };
+        interfere(
+            c,
+            seed,
+            cfo_hz,
+            (jam_at, jam_s, after_s),
+            jam_db,
+            false_frame,
+            model,
+        )
+    }
+
+    /// [`jam`] with any interferer, `model` in cycles per sample of the stream (the signal is at
+    /// `if_hz + cfo_hz`).
+    fn interfere(
+        c: &SdrConfig,
+        seed: u64,
+        cfo_hz: f64,
+        (jam_at, jam_s, after_s): (f64, f64, f64),
+        jam_db: f64,
+        false_frame: Option<(f64, f64)>,
+        model: oasa_waveform::interference::Interferer,
+    ) -> Jam {
+        use oasa_waveform::interference::{clip, InterfererGen};
+        let sps = c.sps().unwrap();
+        let tx = Modem::new(ModemConfig {
+            sps,
+            frame: FrameFormat::V1,
+            code: c.code,
+            ..ModemConfig::new(c.modulation)
+        })
+        .unwrap();
+        let fs = c.sample_rate;
+        let (j0, j1) = ((jam_at * fs) as usize, ((jam_at + jam_s) * fs) as usize);
+        let n = ((jam_at + jam_s + after_s) * fs) as usize;
+        let mut rng = Rng::new(seed);
+        let mut stream = Vec::with_capacity(n + 100_000);
+        let mut sent = Vec::new();
+        let (mut p_sig, mut n_sig) = (0.0f64, 0usize);
+        while stream.len() < n {
+            let len = 40 + rng.below(161) as usize;
+            let p = rng.bytes(len);
+            let mut s = tx.modulate(&p).unwrap();
+            let peak = s.iter().map(|v| v.re.hypot(v.im)).fold(0.0f32, f32::max);
+            let k = c.tx_peak / peak;
+            for v in &mut s {
+                *v = *v * k;
+                p_sig += f64::from(v.norm_sqr());
+            }
+            n_sig += s.len();
+            let gap = GAP_SYMBOLS * sps + 500 + rng.below(2500) as usize;
+            sent.push((stream.len(), stream.len() + s.len(), p));
+            stream.extend(s);
+            stream.extend(std::iter::repeat_n(Complex32::ZERO, gap));
+        }
+        stream.truncate(n);
+        sent.retain(|(_, e, _)| *e <= n);
+        let g = 0.1f32;
+        let p_sig = p_sig / n_sig as f64 * f64::from(g * g);
+        let mut ph = 0.0f64;
+        let mut rng_ph = Rng::new(seed ^ 0xC0FF_EE00);
+        ph += 2.0 * std::f64::consts::PI * rng_ph.uniform();
+        for v in stream.iter_mut() {
+            let (sn, co) = ph.sin_cos();
+            *v = *v * Complex32::new(co as f32 * g, sn as f32 * g);
+            ph = (ph + 2.0 * std::f64::consts::PI * (c.if_hz + cfo_hz) / fs)
+                .rem_euclid(2.0 * std::f64::consts::PI);
+        }
+        Channel::new(seed ^ 3).add_awgn(&mut stream, 10f64.powf(-4.5));
+        let mut jammer =
+            InterfererGen::new(model, p_sig * 10f64.powf(jam_db / 10.0), seed ^ 0x7A11);
+        jammer.add(&mut stream[j0..j1]);
+        let clipped = clip(&mut stream, 1.0);
+
+        let mut ch = chain(c);
+        let ms = |k: f64| (k - j0 as f64) / fs * 1e3;
+        let mut r = Jam {
+            clipped,
+            ..Jam::default()
+        };
+        let mut got: Vec<(usize, usize, Vec<u8>)> = Vec::new();
+        let t0 = Instant::now();
+        let mut false_frame = false_frame.map(|(t, hz)| ((t * fs) as u64, hz));
+        for chunk in stream.chunks(RX_READ) {
+            let mut x = chunk.to_vec();
+            if let Some((at, hz)) = false_frame {
+                if ch.fed >= at {
+                    ch.cfo_hz = hz;
+                    if let Some(l) = ch.lock.as_mut() {
+                        assert_eq!(l.frame(true, ch.fed), None);
+                    }
+                    false_frame = None;
+                }
+            }
+            ch.feed(&mut x);
+            if !ch.ready() {
+                continue;
+            }
+            let pass = ch.run();
+            for (fr, _) in pass.frames {
+                let during = fr.end > j0 as u64 && fr.start < j1 as u64;
+                match (during, fr.crc_ok) {
+                    (true, true) => r.good_during += 1,
+                    (true, false) => r.bad_during += 1,
+                    _ => {}
+                }
+                if fr.crc_ok {
+                    got.push((fr.start as usize, fr.end as usize, fr.payload));
+                }
+            }
+            for (chg, _, _) in pass.changes {
+                let at = ms(ch.fed as f64);
+                match chg {
+                    CfoChange::Lock => r.locks.push(at),
+                    CfoChange::Unlock(why) => r.unlocks.push((at, why)),
+                    CfoChange::Reset => r.resets.push(at),
+                }
+            }
+        }
+        r.load = t0.elapsed().as_secs_f64() / (n as f64 / fs);
+        // nothing invented: every delivered frame was sent
+        for (_, _, g) in &got {
+            assert!(sent.iter().any(|(_, _, p)| p == g), "a frame nobody sent");
+        }
+        let delivered = |p: &Vec<u8>| got.iter().any(|(_, _, g)| g == p);
+        let mut first_after = true;
+        for (s0, e0, p) in &sent {
+            if *e0 <= j0 {
+                r.sent_before += 1;
+                r.good_before += delivered(p) as usize;
+            } else if *s0 < j1 {
+                r.sent_during += 1;
+                r.delivered_during += delivered(p) as usize;
+            } else {
+                r.sent_after += 1;
+                let ok = delivered(p);
+                r.good_after += ok as usize;
+                if first_after {
+                    r.first_after_ok = ok;
+                    first_after = false;
+                }
+            }
+        }
+        r.back_ms = got
+            .iter()
+            .filter(|(s0, _, _)| *s0 >= j1)
+            .map(|(_, e0, _)| (*e0 - j1) as f64 / fs * 1e3)
+            .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.min(v))));
+        r.cfo_hz = ch.cfo_hz;
+        r
+    }
+
+    #[test]
+    fn a_jammer_drops_the_lock_and_the_link_comes_back_at_once() {
+        // locked at +18.3 kHz (F20's 20 ppm), noise 40 dB over the signal for 0.8 s (the stream
+        // clips), then clear. 0.8 s is past the 500 ms unlock timeout; see docs/interference.md
+        // for why a longer jam ends in the same state.
+        let c = bench(0.15, 0.03, 500);
+        let r = jam(&c, 1, 18_300.0, (0.3, 0.8, 0.4), 40.0, None);
+        assert!(r.clipped > 100_000, "{r:?}");
+        assert_eq!(r.good_before, r.sent_before, "{r:?}");
+        assert_eq!(r.good_during, 0, "{r:?}");
+        assert_eq!(r.locks.len(), 2, "{r:?}");
+        assert!(r.locks[0] < 0.0, "{r:?}");
+        // down: no good frame for the timeout
+        assert_eq!(r.unlocks.len(), 1, "{r:?}");
+        let (at, why) = r.unlocks[0];
+        assert_eq!(why, UnlockReason::Timeout, "{r:?}");
+        assert!((450.0..560.0).contains(&at), "{r:?}");
+        // back: the first frame after the jam, every frame after it, and the offset still right
+        assert!(r.first_after_ok, "{r:?}");
+        assert!(r.back_ms.unwrap() < 10.0, "{r:?}");
+        assert_eq!(r.good_after, r.sent_after, "{r:?}");
+        assert!((r.cfo_hz - 18_300.0).abs() < 200.0, "{r:?}");
+    }
+
+    #[test]
+    fn the_channel_filter_and_the_notch_work_on_the_stream() {
+        use oasa_waveform::interference::Interferer;
+        let base = bench(0.15, 0.03, 500);
+        let fs = base.sample_rate;
+        let all = (0.0, 1.0, 0.0);
+        // a carrier one channel (420 kHz) below the signal, 20 dB stronger, all the time
+        let next = Interferer::Tone {
+            offset: (base.if_hz - 420e3) / fs,
+        };
+        let r = interfere(&base, 2, 300.0, all, 20.0, None, next);
+        assert!(r.delivered_during < r.sent_during / 2, "{r:?}");
+        let mut c = base.clone();
+        c.rx_filter = true;
+        let r = interfere(&c, 2, 300.0, all, 20.0, None, next);
+        assert_eq!(r.delivered_during, r.sent_during, "{r:?}");
+        // a carrier on the signal's centre, as strong as the signal
+        let co = Interferer::Tone {
+            offset: (base.if_hz + 300.0) / fs,
+        };
+        let r = interfere(&c, 2, 300.0, all, 0.0, None, co);
+        assert_eq!(r.delivered_during, 0, "{r:?}");
+        c.rx_notch_db = 25.0;
+        let r = interfere(&c, 2, 300.0, all, 0.0, None, co);
+        assert!(r.delivered_during + 2 >= r.sent_during, "{r:?}");
+    }
+
+    fn improved(mut c: SdrConfig) -> SdrConfig {
+        c.rx_filter = true;
+        c.rx_notch_db = 25.0;
+        c.check().unwrap();
+        c
+    }
+
+    fn reset(mut c: SdrConfig, ms: u64) -> SdrConfig {
+        c.cfo_reset_ms = ms;
+        c.check().unwrap();
+        c
+    }
+
+    #[test]
+    fn a_false_frame_under_a_jammer_strands_the_search_unless_reset() {
+        // acquiring under the jammer, a false good frame moves the offset to -25 kHz: the signal at
+        // +18.3 kHz is then 43 kHz from the centre, outside the wide search (+-37.5 kHz)
+        let span = (0.3, 2.0, 1.0);
+        let wrong = Some((0.3 + 0.8, -25_000.0));
+        let c = bench(0.15, 0.03, 500);
+        let r = jam(&c, 4, 18_300.0, span, 40.0, wrong);
+        assert!(r.sent_after > 100 && r.good_after == 0, "stuck: {r:?}");
+        assert!(r.resets.is_empty());
+        // --cfo-reset-ms 600: back to the start (0 Hz, 18.3 kHz away) 600 ms after the false frame
+        let c = reset(bench(0.15, 0.03, 500), 600);
+        let r = jam(&c, 4, 18_300.0, span, 40.0, wrong);
+        assert_eq!(r.resets.len(), 2, "{r:?}");
+        assert!((r.resets[1] - 1400.0).abs() < 10.0, "{r:?}");
+        assert!(r.first_after_ok, "{r:?}");
+        // the first good frame re-centres the offset by 18.3 kHz at once, which can cost the
+        // frame already in the receiver (as at start-up)
+        assert!(r.good_after + 1 >= r.sent_after, "{r:?}");
+        assert!((r.cfo_hz - 18_300.0).abs() < 200.0, "{r:?}");
+    }
+
+    #[test]
+    fn reset_fires_once_per_gap_and_only_while_acquiring() {
+        let mut l = CfoLock::new(1, 3, 100).with_reset(50);
+        assert_eq!(l.tick(51), Some(CfoChange::Reset));
+        assert_eq!(l.tick(500), None, "once per gap");
+        assert_eq!(l.frame(true, 600), Some(CfoChange::Lock));
+        assert_eq!(l.tick(690), None, "locked: no reset");
+        assert_eq!(l.tick(701), Some(CfoChange::Unlock(UnlockReason::Timeout)));
+        assert_eq!(l.tick(702), Some(CfoChange::Reset));
+        let mut off = CfoLock::new(1, 3, 100);
+        assert_eq!(off.tick(1_000_000), None);
+    }
+
+    /// B8 table: 10 seeds, 2 s jam at +40 dB, both receiver settings.
+    /// `cargo test --release --lib acquire::jammer_table -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn jammer_table() {
+        println!("| setting | seed | jam dB | sent/good before | frames during (good/bad) | unlocks (ms from jam start) | locks | first after ok | back ms | sent/good after | tracked Hz | clipped | load |");
+        println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+        for (name, c, hz) in [
+            (
+                "acquire 0.15, locked 0.03, +18.3 kHz",
+                bench(0.15, 0.03, 500),
+                18_300.0,
+            ),
+            ("always 0.1, +300 Hz", bench(0.0, 0.1, 500), 300.0),
+            (
+                "acquire as above, --cfo-reset-ms 1000",
+                reset(bench(0.15, 0.03, 500), 1000),
+                18_300.0,
+            ),
+            (
+                "acquire as above, --rx-filter on --rx-notch-db 25",
+                improved(bench(0.15, 0.03, 500)),
+                18_300.0,
+            ),
+        ] {
+            for seed in 1..=10u64 {
+                let r = jam(&c, seed, hz, (0.5, 2.0, 1.0), 40.0, None);
+                println!(
+                    "| {name} | {seed} | 40 | {}/{} | {}/{} | {:?} | {:?} | {} | {} | {}/{} | {:.0} | {} | {:.2} |",
+                    r.sent_before, r.good_before, r.good_during, r.bad_during,
+                    r.unlocks.iter().map(|(t, w)| format!("{t:.0} {}", w.name())).collect::<Vec<_>>(),
+                    r.locks.iter().map(|t| format!("{t:.1}")).collect::<Vec<_>>(),
+                    r.first_after_ok,
+                    r.back_ms.map(|v| format!("{v:.2}")).unwrap_or("never".into()),
+                    r.sent_after, r.good_after, r.cfo_hz, r.clipped, r.load
+                );
+            }
+        }
     }
 }
