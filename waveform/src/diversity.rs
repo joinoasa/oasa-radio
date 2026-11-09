@@ -102,7 +102,7 @@ impl Modem {
         let mut out: Vec<RxFrame> = Vec::new();
         for f in all {
             match out.last_mut() {
-                Some(last) if f.start.abs_diff(last.start) <= sps => {
+                Some(last) if f.start.abs_diff(last.start) <= sps as u64 => {
                     // the same frame on another channel: a good CRC wins, then the stronger preamble
                     if (f.crc_ok && !last.crc_ok)
                         || (f.crc_ok == last.crc_ok && f.metric > last.metric)
@@ -174,30 +174,22 @@ impl Modem {
                 continue;
             }
             let tau_c = i * g.step;
-            if tau_c < tally.busy_until {
+            if (tau_c as u64) < tally.busy_until {
                 tally.skipped();
                 continue;
             }
+            // Positions here count from the start of the channels, so the span fits a usize.
+            let busy = tally.busy_until as usize;
             let got = match how {
-                Combine::Mrc => {
-                    self.mrc_candidate(chans, tau_c, f, g.step, &fine, frame_len, tally.busy_until)
-                }
+                Combine::Mrc => self.mrc_candidate(chans, tau_c, f, g.step, &fine, frame_len, busy),
                 _ => self
-                    .coarse_candidate(
-                        chans[ch],
-                        tau_c,
-                        f,
-                        g.step,
-                        &fine,
-                        frame_len,
-                        tally.busy_until,
-                    )
+                    .coarse_candidate(chans[ch], tau_c, f, g.step, &fine, frame_len, busy)
                     .map(|(res, tau, _)| (res, tau)),
             };
             let Some((res, tau)) = got else {
                 continue;
             };
-            if let Some(fr) = self.record(res, tau, rx, &mut tally) {
+            if let Some(fr) = self.record(res, tau as u64, rx, &mut tally) {
                 out.push(fr);
             }
         }
@@ -280,8 +272,8 @@ impl Modem {
             .collect();
         let metric = fm[j] / chans.len() as f32;
         let res = self.decode_at(&y, j, mu, metric, fine).map(|mut fr| {
-            fr.start += lo;
-            fr.end += lo;
+            fr.start += lo as u64;
+            fr.end += lo as u64;
             fr.cfo_cycles_per_symbol += f;
             let turns = (w * fr.start as f64).rem_euclid(1.0);
             let ph = fr.phase_rad as f64 + 2.0 * PI * turns;

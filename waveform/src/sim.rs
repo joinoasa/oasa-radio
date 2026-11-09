@@ -173,7 +173,7 @@ pub fn run_ber(
         let found = modem
             .demodulate_with(&y, &rx)
             .into_iter()
-            .find(|f| f.start.abs_diff(lead) <= opts.sps);
+            .find(|f| f.start.abs_diff(lead as u64) <= opts.sps as u64);
         if let Some(f) = found {
             detected += 1;
             crc_ok += f.crc_ok as u64;
@@ -335,7 +335,10 @@ pub fn run_found(
             rx_seconds += t0.elapsed().as_secs_f64();
         }
         report.add(&rep);
-        if let Some(f) = got.iter().find(|f| f.start.abs_diff(lead) <= opts.sps) {
+        if let Some(f) = got
+            .iter()
+            .find(|f| f.start.abs_diff(lead as u64) <= opts.sps as u64)
+        {
             found += 1;
             crc_ok += f.crc_ok as u64;
         }

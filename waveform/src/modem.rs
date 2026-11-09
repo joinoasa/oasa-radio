@@ -252,10 +252,12 @@ fn check_len(payload: &[u8]) -> Result<(), ConfigError> {
 /// One frame found by [`Modem::demodulate`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct RxFrame {
-    /// Sample index where the frame's first symbol pulse starts.
-    pub start: usize,
+    /// Sample index where the frame's first symbol pulse starts. `u64`, not `usize`: a live
+    /// receiver counts from the start of the stream, which passes 2^32 samples in 72 minutes at
+    /// 1 MS/s (a 32-bit `usize` on the E310's ARM would wrap).
+    pub start: u64,
     /// Sample index just past the frame's last sample.
-    pub end: usize,
+    pub end: u64,
     pub payload: Vec<u8>,
     /// The CRC-16 matched. Treat a frame with `crc_ok == false` as damaged.
     pub crc_ok: bool,
@@ -318,9 +320,9 @@ impl RxReport {
 pub(crate) struct Tally {
     pub(crate) rep: RxReport,
     /// Candidates before this sample are not tried: a frame is surely there.
-    pub(crate) busy_until: usize,
+    pub(crate) busy_until: u64,
     /// Rejections of candidates before this sample count as `inside_frame`.
-    pub(crate) span_until: usize,
+    pub(crate) span_until: u64,
 }
 
 impl Tally {
@@ -657,13 +659,13 @@ impl Modem {
             if !is_peak {
                 continue;
             }
-            if tau < tally.busy_until {
+            if (tau as u64) < tally.busy_until {
                 tally.skipped();
                 continue;
             }
             let mu = parabola_peak(&metric, tau);
             let res = self.decode_at(samples, tau, mu, m, rx);
-            if let Some(f) = self.record(res, tau, rx, &mut tally) {
+            if let Some(f) = self.record(res, tau as u64, rx, &mut tally) {
                 out.push(f);
             }
         }
@@ -675,7 +677,7 @@ impl Modem {
     pub(crate) fn record(
         &self,
         res: Result<RxFrame, Reject>,
-        tau: usize,
+        tau: u64,
         rx: &RxConfig,
         tally: &mut Tally,
     ) -> Option<RxFrame> {
@@ -683,7 +685,9 @@ impl Modem {
         let inside = tau < tally.span_until;
         let reserve = |tally: &mut Tally| {
             // no length known: reserve the longest frame (or the expected one)
-            tally.span_until = tally.span_until.max(tau + self.longest_frame_samples(rx));
+            tally.span_until = tally
+                .span_until
+                .max(tau + self.longest_frame_samples(rx) as u64);
         };
         let count = |tally: &mut Tally, field: fn(&mut RxReport) -> &mut usize| {
             if inside {
@@ -944,16 +948,18 @@ impl Modem {
             if !is_peak {
                 continue;
             }
-            if tau_c < tally.busy_until {
+            if (tau_c as u64) < tally.busy_until {
                 tally.skipped();
                 continue;
             }
+            // Positions here count from the start of `r`, so the span fits a usize.
+            let busy = tally.busy_until as usize;
             let Some((res, tau, _)) =
-                self.coarse_candidate(r, tau_c, f, cs.step, &fine, frame_len, tally.busy_until)
+                self.coarse_candidate(r, tau_c, f, cs.step, &fine, frame_len, busy)
             else {
                 continue;
             };
-            if let Some(fr) = self.record(res, tau, rx, tally) {
+            if let Some(fr) = self.record(res, tau as u64, rx, tally) {
                 out.push(fr);
             }
         }
@@ -996,8 +1002,8 @@ impl Modem {
         let j = (0..fm.len()).max_by(|&a, &b| fm[a].total_cmp(&fm[b]).then(b.cmp(&a)))?;
         let mu = parabola_peak(&fm, j);
         let res = self.decode_at(&d, j, mu, fm[j], fine).map(|mut fr| {
-            fr.start += lo;
-            fr.end += lo;
+            fr.start += lo as u64;
+            fr.end += lo as u64;
             fr.cfo_cycles_per_symbol += f;
             let turns = (w * fr.start as f64).rem_euclid(1.0);
             let ph = fr.phase_rad as f64 + 2.0 * PI * turns;
@@ -1355,8 +1361,8 @@ impl Modem {
             }
         };
         Ok(RxFrame {
-            start: tau,
-            end: tau + end_needed(total_syms),
+            start: tau as u64,
+            end: (tau + end_needed(total_syms)) as u64,
             payload,
             crc_ok,
             sync_errors,

@@ -109,8 +109,8 @@ fn noiseless_round_trip_is_exact() {
             assert_eq!(got.len(), 1, "{m:?} {n}");
             assert!(got[0].crc_ok && got[0].payload == payload, "{m:?} {n}");
             assert_eq!(got[0].header, Some(light_header(m, n)), "{m:?} {n}");
-            assert_eq!(got[0].start, lead, "{m:?} {n}");
-            assert_eq!(got[0].end, lead + tx.len(), "{m:?} {n}");
+            assert_eq!(got[0].start, lead as u64, "{m:?} {n}");
+            assert_eq!(got[0].end, (lead + tx.len()) as u64, "{m:?} {n}");
         }
     }
 }
@@ -147,7 +147,7 @@ fn delivered(
             tail: 50,
         };
         let got = md.demodulate_with(&ch.apply(&tx, &imp), rx);
-        if let Some(f) = got.iter().find(|f| f.start.abs_diff(lead) <= 8) {
+        if let Some(f) = got.iter().find(|f| f.start.abs_diff(lead as u64) <= 8) {
             found += 1;
             ok += (f.crc_ok && f.payload == payload) as usize;
         }

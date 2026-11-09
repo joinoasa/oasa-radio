@@ -479,7 +479,10 @@ fn loss_with(
             ..Default::default()
         };
         let got = md.demodulate_with(&ch.apply(&faded, &imp), &rx);
-        match got.iter().find(|f| f.start.abs_diff(lead) <= SPS) {
+        match got
+            .iter()
+            .find(|f| f.start.abs_diff(lead as u64) <= SPS as u64)
+        {
             Some(f) if f.crc_ok && f.payload == payload => {}
             Some(_) => lost += 1,
             None => {

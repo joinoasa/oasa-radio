@@ -108,14 +108,14 @@ impl StreamReceiver {
         let (frames, _) = self.modem.demodulate_report(&self.buf, &self.rx);
         let mut out = Vec::new();
         for mut f in frames {
-            let start = self.base + f.start as u64;
+            let start = self.base + f.start;
             if start < self.next || start >= limit {
                 continue;
             }
-            let end = self.base + f.end as u64;
+            let end = self.base + f.end;
             self.running.push((start, end));
-            f.start = start as usize;
-            f.end = end as usize;
+            f.start = start;
+            f.end = end;
             out.push(f);
         }
         out
@@ -212,6 +212,21 @@ impl LiveReceiver {
             tally: Tally::default(),
             work: SearchWork::default(),
         })
+    }
+
+    /// Start counting at stream sample `sample` (rounded down to the coarse grid) instead of 0,
+    /// as if that many samples had gone before. Only before the first `push`. For tests of
+    /// positions past 2^32 without feeding hours of samples.
+    #[doc(hidden)]
+    pub fn starting_at(mut self, sample: u64) -> Self {
+        assert_eq!(self.total, 0, "starting_at before the first push");
+        let step = self.cs.step as u64;
+        let pos = sample / step;
+        self.base = pos * step;
+        self.total = pos * step;
+        self.cm_first = pos;
+        self.test_next = pos;
+        self
     }
 
     /// The coarse search range now, cycles per symbol.
@@ -317,7 +332,7 @@ impl LiveReceiver {
             if v < self.cs.threshold {
                 continue;
             }
-            let lo = i.saturating_sub(self.reach);
+            let lo = i.saturating_sub(self.reach).max(self.cm_first);
             let hi = (i + self.reach + 1).min(have);
             let is_peak = (lo..hi).all(|j| {
                 let c = self.cm[(j - self.cm_first) as usize].0;
@@ -342,7 +357,7 @@ impl LiveReceiver {
         let step = self.cs.step as u64;
         let mut out = Vec::new();
         while let Some(&(tau_c, f)) = self.pending.front() {
-            if tau_c < self.tally.busy_until as u64 {
+            if tau_c < self.tally.busy_until {
                 self.tally.skipped();
                 self.pending.pop_front();
                 continue;
@@ -351,7 +366,7 @@ impl LiveReceiver {
             if !end && self.total < tau_c + sps + step + m {
                 break;
             }
-            let busy = (self.tally.busy_until as u64).saturating_sub(self.base) as usize;
+            let busy = self.tally.busy_until.saturating_sub(self.base) as usize;
             let got = self.modem.coarse_candidate(
                 &self.buf,
                 (tau_c - self.base) as usize,
@@ -369,7 +384,7 @@ impl LiveReceiver {
                 break; // the frame is still arriving
             }
             self.pending.pop_front();
-            let base = self.base as usize;
+            let base = self.base;
             let res = res.map(|mut fr| {
                 fr.start += base;
                 fr.end += base;
@@ -377,7 +392,7 @@ impl LiveReceiver {
             });
             if let Some(fr) = self
                 .modem
-                .record(res, tau + base, &self.rx, &mut self.tally)
+                .record(res, tau as u64 + base, &self.rx, &mut self.tally)
             {
                 out.push(fr);
             }
