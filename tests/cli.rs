@@ -732,6 +732,55 @@ fn waveform_per_with_the_channel_tracker() {
     assert!(loss(&on) < 0.08, "{on}");
 }
 
+/// `waveform per --equalizer on` (B15): a -3 dB echo one symbol late at 20 dB loses most frames
+/// without it and none with it; the field shows only when it is on.
+#[test]
+fn per_equalizer_option() {
+    let args = |eq: bool| {
+        let mut a = vec![
+            "waveform",
+            "per",
+            "--mod",
+            "qpsk",
+            "--sps",
+            "4",
+            "--frame",
+            "v1",
+            "--payload-len",
+            "54",
+            "--ebn0-db",
+            "20",
+            "--frames",
+            "100",
+            "--channel",
+            "tworay",
+            "--ray-delay-us",
+            "4",
+            "--ray-gain-db",
+            "-3",
+        ];
+        if eq {
+            a.extend(["--equalizer", "on"]);
+        }
+        run(&a)
+    };
+    let (off, on) = (args(false), args(true));
+    assert!(
+        on.status.success(),
+        "{}",
+        String::from_utf8_lossy(&on.stderr)
+    );
+    let (off, on) = (
+        String::from_utf8_lossy(&off.stdout).to_string(),
+        String::from_utf8_lossy(&on.stdout).to_string(),
+    );
+    assert!(!off.contains("equalizer"), "{off}");
+    assert_eq!(field(&on, "equalizer"), "true");
+    let loss = |l: &str| field(l, "packet_loss").parse::<f64>().unwrap();
+    assert!(loss(&off) > 0.5, "{off}");
+    assert!(loss(&on) < 0.03, "{on}");
+}
+
 #[test]
 fn waveform_bad_arguments_fail_cleanly() {
     for args in [

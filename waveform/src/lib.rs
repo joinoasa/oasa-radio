@@ -25,6 +25,7 @@
 
 pub mod channel;
 pub mod df;
+mod equalize;
 pub mod fading;
 pub mod fec;
 pub mod fft;

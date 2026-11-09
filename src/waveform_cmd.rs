@@ -35,7 +35,7 @@ WAVEFORM (W0, simulation):
                           [--cfo-search MAX] [--frame w0|v1] [--code none|light] [--json]
                           [--channel awgn|tworay|rayleigh] [--doppler-hz 0] [--ray-delay-us 1]
                           [--ray-gain-db -3] [--symbol-rate 250000] [--frame-interval-ms 10]
-                          [--phase-track-hz 0]
+                          [--phase-track-hz 0] [--equalizer off|on]
   oasa-radio waveform per --mod bpsk|qpsk|fsk2 --ebn0-db 3,3.5,4 [--frames 400] [--sync-max-errors 3]
                           [same options as ber, except --bits]
   oasa-radio waveform iq --mod bpsk|qpsk|fsk2 --out BASE [--ebn0-db X] [--payload-len 32 | --payload-hex HEX]
@@ -120,6 +120,11 @@ WAVEFORM (W0, simulation):
   tracker for fading up to HZ Doppler at --symbol-rate: the gain is followed block by block through
   the frame instead of one phase line. Receiver only, nothing changes on the air. 0 (default): off.
 
+  --equalizer on (bpsk, qpsk, --frame v1, even --sps; B15, docs/equalizer.md) turns on the
+  receiver's decision feedback equalizer for strong echoes (--channel tworay): its taps are solved
+  from the preamble, sync word and decoded header of each frame. Receiver only, nothing changes on
+  the air. Not with --phase-track-hz. off (default): as before.
+
   Frequency offsets (--cfo, --cfo-random, --cfo-search) are in cycles per symbol: 1.0 is one symbol
   rate. --cfo-search MAX turns on the coarse frequency search (an FFT over the preamble) for offsets
   up to +-MAX (see docs/waveform-w0.md for its cost). --cfo-bins is the older narrow search; give
@@ -145,6 +150,8 @@ pub struct BerArgs {
     pub channel: ChannelArgs,
     /// Receiver channel tracking for fading up to this Doppler, Hz (0: off; B12, docs/phase-tracking.md).
     pub phase_track_hz: f64,
+    /// Receiver equalizer for strong echoes (B15, docs/equalizer.md).
+    pub equalizer: bool,
 }
 
 /// `--channel awgn|tworay|rayleigh` and its options, in physical units (the sample rate comes from
@@ -449,6 +456,7 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
                     0.0,
                     1e6,
                 )?,
+                equalizer: on_off("equalizer", named.remove("equalizer"))?,
             };
             if sub == "ber" {
                 WaveformCommand::Ber(a)
@@ -540,6 +548,16 @@ pub fn parse(args: &[String]) -> R<WaveformCommand> {
             }
             if a.phase_track_hz > 0.0 && a.modulation == Modulation::Fsk2 {
                 return Err("--phase-track-hz is for bpsk and qpsk".into());
+            }
+            if a.equalizer
+                && (a.modulation == Modulation::Fsk2
+                    || a.frame != FrameFormat::V1
+                    || a.sps % 2 != 0)
+            {
+                return Err("--equalizer is for bpsk and qpsk, --frame v1, even --sps".into());
+            }
+            if a.equalizer && a.phase_track_hz > 0.0 {
+                return Err("give --equalizer or --phase-track-hz, not both".into());
             }
             if a.phase_track_hz > MAX_TRACK_CYCLES * a.channel.symbol_rate {
                 return Err(format!(
@@ -816,6 +834,7 @@ fn ber_options(a: &BerArgs) -> BerOptions {
             cfo_bins: a.cfo_bins,
             cfo_search: a.cfo_search as f32,
             phase_track: (a.phase_track_hz / a.channel.symbol_rate) as f32,
+            equalizer: a.equalizer,
             ..RxConfig::default()
         },
         fading: a.channel.fading(a.channel.symbol_rate * a.sps as f64),
@@ -824,12 +843,25 @@ fn ber_options(a: &BerArgs) -> BerOptions {
     }
 }
 
-/// `,"phase_track_hz":...` when the tracker is on (so the default output is unchanged).
+/// `,"phase_track_hz":...` when the tracker is on and `,"equalizer":true` when the equalizer is (so
+/// the default output is unchanged).
 fn track_json(a: &BerArgs) -> String {
+    let mut s = String::new();
     if a.phase_track_hz > 0.0 {
-        format!(",\"phase_track_hz\":{}", num(a.phase_track_hz))
-    } else {
-        String::new()
+        s += &format!(",\"phase_track_hz\":{}", num(a.phase_track_hz));
+    }
+    if a.equalizer {
+        s += ",\"equalizer\":true";
+    }
+    s
+}
+
+/// `--NAME on|off`, off when not given.
+fn on_off(name: &str, v: Option<String>) -> R<bool> {
+    match v.as_deref() {
+        None | Some("off") => Ok(false),
+        Some("on") => Ok(true),
+        Some(_) => Err(format!("--{name} must be on or off")),
     }
 }
 
@@ -1233,6 +1265,21 @@ mod tests {
     }
 
     #[test]
+    fn equalizer_option() {
+        match parse(&v("per --mod qpsk --frame v1 --ebn0-db 15 --equalizer on")).unwrap() {
+            WaveformCommand::Per(p) => {
+                assert!(p.ber.equalizer);
+                assert!(ber_options(&p.ber).rx.equalizer);
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&v("ber --mod bpsk --ebn0-db 3")).unwrap() {
+            WaveformCommand::Ber(a) => assert!(!ber_options(&a).rx.equalizer),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn bad_arguments_are_refused() {
         for bad in [
             "ber --ebn0-db 3",
@@ -1249,6 +1296,11 @@ mod tests {
             "ber --mod bpsk --ebn0-db 3 --cfo 3 --cfo-random 2",
             "ber --mod bpsk --ebn0-db 3 --cfo-bins 2 --cfo-search 1",
             "per --mod qpsk --ebn0-db 3 --phase-track-hz -1",
+            "per --mod qpsk --ebn0-db 3 --frame v1 --equalizer yes",
+            "per --mod fsk2 --ebn0-db 3 --frame v1 --equalizer on",
+            "per --mod qpsk --ebn0-db 3 --equalizer on",
+            "per --mod qpsk --ebn0-db 3 --frame v1 --sps 5 --equalizer on",
+            "per --mod qpsk --ebn0-db 3 --frame v1 --equalizer on --phase-track-hz 200",
             "per --mod fsk2 --ebn0-db 3 --phase-track-hz 200",
             "per --mod qpsk --ebn0-db 3 --symbol-rate 250000 --phase-track-hz 2501",
             "decode --mod bpsk --in x --cfo-bins 2 --cfo-search 1",
