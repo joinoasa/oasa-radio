@@ -1041,17 +1041,14 @@ impl RxChain {
                     .shifts
                     .iter()
                     .rev()
-                    .find(|s| s.0 <= fr.start as u64)
+                    .find(|s| s.0 <= fr.start)
                     .map_or(self.cfo_hz, |s| s.1);
                 self.cfo_hz += gain * (shift + resid - self.cfo_hz);
                 self.cfo_hz = self
                     .cfo_hz
                     .clamp(-self.sample_rate / 8.0, self.sample_rate / 8.0);
             }
-            let change = self
-                .lock
-                .as_mut()
-                .and_then(|l| l.frame(fr.crc_ok, fr.end as u64));
+            let change = self.lock.as_mut().and_then(|l| l.frame(fr.crc_ok, fr.end));
             if let Some(c) = change {
                 self.apply(c, &mut pass);
             }
@@ -1146,7 +1143,7 @@ fn rx_thread(cfg: &SdrConfig, shared: &Shared, receiver: LiveReceiver, out: Sync
         let decided = Instant::now();
         for (fr, cfo_hz) in pass.frames {
             // when the frame's last sample arrived
-            let end = fr.end as u64;
+            let end = fr.end;
             let arrived = arrivals.iter().find(|(k, _)| *k >= end).map(|(_, t)| *t);
             let wait_ms = arrived.map(|t| decided.duration_since(t).as_secs_f64() * 1e3);
             let resid = f64::from(fr.cfo_cycles_per_symbol);

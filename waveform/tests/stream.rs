@@ -43,7 +43,7 @@ fn recording(
     ch.apply(&tx, &imp)
 }
 
-fn key(f: &RxFrame) -> (usize, Vec<u8>, bool) {
+fn key(f: &RxFrame) -> (u64, Vec<u8>, bool) {
     (f.start, f.payload.clone(), f.crc_ok)
 }
 
@@ -199,7 +199,7 @@ fn a_frame_cut_off_by_the_end_is_not_returned_and_nothing_twice() {
     let (got, _) = stream(
         modem(Modulation::Bpsk, FrameFormat::W0),
         &RxConfig::default(),
-        &x[..cut],
+        &x[..cut as usize],
         &[1500],
     );
     assert_eq!(
