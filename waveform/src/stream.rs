@@ -16,7 +16,7 @@
 use crate::iq::Complex32;
 use std::collections::VecDeque;
 
-use crate::modem::{Modem, Reject, RxConfig, RxFrame, RxReport, Tally};
+use crate::modem::{quick, Modem, Reject, RxConfig, RxFrame, RxReport, Tally};
 
 /// Samples kept beyond the frame itself: timing and frequency refinement look a few symbols around a
 /// candidate, and the matched filter runs past the last symbol.
@@ -151,6 +151,8 @@ impl StreamReceiver {
 pub struct LiveReceiver {
     modem: Modem,
     fine: RxConfig,
+    /// `fine` for candidates inside the span a frame with a bad CRC-16 claims.
+    quick_fine: RxConfig,
     rx: RxConfig,
     cs: crate::modem::CoarseSearch,
     /// Samples a frame of the longest kind takes (what `full` is measured against).
@@ -199,6 +201,7 @@ impl LiveReceiver {
             frame_len: modem.longest_frame_samples(&rx),
             reach: m.div_ceil(cs.step) as u64,
             cs,
+            quick_fine: quick(&fine),
             fine,
             rx,
             modem,
@@ -367,12 +370,19 @@ impl LiveReceiver {
                 break;
             }
             let busy = self.tally.busy_until.saturating_sub(self.base) as usize;
+            let Some(use_rx) =
+                self.tally
+                    .settings(tau_c, &self.fine, &self.quick_fine, self.frame_len)
+            else {
+                self.pending.pop_front();
+                continue;
+            };
             let got = self.modem.coarse_candidate(
                 &self.buf,
                 (tau_c - self.base) as usize,
                 f,
                 self.cs.step,
-                &self.fine,
+                use_rx,
                 self.frame_len,
                 busy,
             );

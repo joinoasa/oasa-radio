@@ -323,6 +323,15 @@ pub(crate) struct Tally {
     pub(crate) busy_until: u64,
     /// Rejections of candidates before this sample count as `inside_frame`.
     pub(crate) span_until: u64,
+    /// Candidates before this sample lie inside the span claimed by a frame whose CRC-16 failed:
+    /// they are tried, but with the quick decode (see [`quick`]) and within a work budget.
+    pub(crate) bad_until: u64,
+    /// The budget: samples of frame decoded inside such spans and not yet paid back. It goes down
+    /// by one per sample of stream, from `debt_at` on.
+    debt: u64,
+    debt_at: u64,
+    /// The candidate being decoded now is inside such a span: charge its frame to `debt`.
+    charge: bool,
 }
 
 impl Tally {
@@ -330,6 +339,54 @@ impl Tally {
     pub(crate) fn skipped(&mut self) {
         self.rep.preambles += 1;
         self.rep.inside_frame += 1;
+    }
+
+    /// The settings to decode a candidate at `tau` with: `full`, or `quick` inside the span claimed
+    /// by a frame whose CRC-16 failed. `None`: inside such a span with the budget spent; the
+    /// candidate is counted as skipped and not tried.
+    ///
+    /// The budget bounds the extra work. Every frame decoded inside such a span adds its length
+    /// to a debt that the stream pays back one sample per sample; candidates are tried while the
+    /// debt is under `BAD_SPAN_CREDIT` longest frames (`frame_len`). So those decodes cover at
+    /// most as many samples as the stream brings, plus that allowance: a run of headers sent one
+    /// after another, each claiming a long span, costs at most about twice what a channel full of
+    /// real frames does. A lone header (or a few) never runs it out.
+    pub(crate) fn settings<'a>(
+        &mut self,
+        tau: u64,
+        full: &'a RxConfig,
+        quick: &'a RxConfig,
+        frame_len: usize,
+    ) -> Option<&'a RxConfig> {
+        self.charge = false;
+        if tau >= self.bad_until {
+            return Some(full);
+        }
+        self.debt = self.debt.saturating_sub(tau.saturating_sub(self.debt_at));
+        self.debt_at = self.debt_at.max(tau);
+        if self.debt >= BAD_SPAN_CREDIT * frame_len as u64 {
+            self.skipped();
+            return None;
+        }
+        self.charge = true;
+        Some(quick)
+    }
+}
+
+/// The work budget inside spans claimed by frames whose CRC-16 failed, in longest frames (see
+/// [`Tally::settings`]).
+const BAD_SPAN_CREDIT: u64 = 4;
+
+/// `rx` without the body's phase refinement and channel tracking: the decode for candidates inside
+/// the span claimed by a frame whose CRC-16 failed. A header is not authenticated, so such a span is
+/// searched (a real frame may start inside it), but headers can be sent one after another, each
+/// claiming a long span, and every one costs a body decode. The refinement (the phase line search
+/// and the timing correction) is most of that cost. A real frame there still decodes on the
+/// carrier estimate from its own preamble and header.
+pub(crate) fn quick(rx: &RxConfig) -> RxConfig {
+    RxConfig {
+        refine_phase: false,
+        ..rx.clone()
     }
 }
 
@@ -647,6 +704,8 @@ impl Modem {
         }
         let metric = self.metric(samples, rx);
         let sps = self.cfg.sps;
+        let quick_rx = quick(rx);
+        let frame_len = self.longest_frame_samples(rx);
         let mut out: Vec<RxFrame> = Vec::new();
         for tau in 0..metric.len() {
             let m = metric[tau];
@@ -664,7 +723,10 @@ impl Modem {
                 continue;
             }
             let mu = parabola_peak(&metric, tau);
-            let res = self.decode_at(samples, tau, mu, m, rx);
+            let Some(use_rx) = tally.settings(tau as u64, rx, &quick_rx, frame_len) else {
+                continue;
+            };
+            let res = self.decode_at(samples, tau, mu, m, use_rx);
             if let Some(f) = self.record(res, tau as u64, rx, &mut tally) {
                 out.push(f);
             }
@@ -682,6 +744,11 @@ impl Modem {
         tally: &mut Tally,
     ) -> Option<RxFrame> {
         tally.rep.preambles += 1;
+        if std::mem::take(&mut tally.charge) {
+            if let Ok(f) = &res {
+                tally.debt += f.end - f.start;
+            }
+        }
         let inside = tau < tally.span_until;
         let reserve = |tally: &mut Tally| {
             // no length known: reserve the longest frame (or the expected one)
@@ -698,15 +765,22 @@ impl Modem {
         };
         match res {
             Ok(f) => {
+                // A v1 header that passed its CRC-8 and rules gives the length, so the frame's span
+                // is reserved for counting whatever its CRC-16 says.
                 tally.span_until = tally.span_until.max(f.end);
-                // A v1 header that passed its CRC-8 and rules gives the length: the frame is
-                // there whatever its CRC-16 says. W0 trusts only a good CRC-16.
-                // With the length known, a frame whose sync word matched is skipped past even
-                // with a bad CRC-16, so its body is not searched again for false starts.
-                let sure = skip_past(&f, rx)
-                    || (self.cfg.frame == FrameFormat::V1 && rx.expected_len.is_none());
-                if sure {
-                    tally.busy_until = f.end;
+                if skip_past(&f, rx) {
+                    // A good CRC-16 (or, in BER measurement, a given length and a matched sync
+                    // word): the body is not searched again for false starts.
+                    tally.busy_until = tally.busy_until.max(f.end);
+                } else if f.header.is_some() && rx.expected_len.is_none() {
+                    // A bad CRC-16 vouches only for the preamble, sync word and header: the length
+                    // the header claims is not trusted to hide anything after it. The search goes
+                    // on after the header; a frame found inside the claimed span is returned (its
+                    // own CRC-16 still decides whether it is delivered), but with the quick decode.
+                    let header_end = f.start
+                        + (self.ref_bits.len() + self.header_syms()) as u64 * self.cfg.sps as u64;
+                    tally.busy_until = tally.busy_until.max(header_end);
+                    tally.bad_until = tally.bad_until.max(f.end);
                 }
                 Some(f)
             }
@@ -935,6 +1009,7 @@ impl Modem {
             cfo_search: 0.0,
             ..rx.clone()
         };
+        let quick_fine = quick(&fine);
         let mut out: Vec<RxFrame> = Vec::new();
         for i in 0..cm.len() {
             let (v, f) = cm[i];
@@ -954,8 +1029,11 @@ impl Modem {
             }
             // Positions here count from the start of `r`, so the span fits a usize.
             let busy = tally.busy_until as usize;
+            let Some(use_rx) = tally.settings(tau_c as u64, &fine, &quick_fine, frame_len) else {
+                continue;
+            };
             let Some((res, tau, _)) =
-                self.coarse_candidate(r, tau_c, f, cs.step, &fine, frame_len, busy)
+                self.coarse_candidate(r, tau_c, f, cs.step, use_rx, frame_len, busy)
             else {
                 continue;
             };
@@ -2014,7 +2092,9 @@ const SKIP_SYNC_MAX_ERRORS: u32 = 3;
 /// Whether the search skips past this frame. A frame's extent is known when its CRC passes, or when
 /// the length is given and its sync word matched: then the body of a damaged frame is not searched
 /// again for false starts. With sync rejection off (BER measurement), a false start in the noise
-/// before a frame must not hide the frame, so its sync word must match.
+/// before a frame must not hide the frame, so its sync word must match. A length read from a v1
+/// header is not enough on its own: the header is not authenticated, so a frame with a bad CRC-16
+/// is skipped only up to the end of its header (see [`Modem::record`]).
 fn skip_past(f: &RxFrame, rx: &RxConfig) -> bool {
     f.crc_ok || (rx.expected_len.is_some() && f.sync_errors <= SKIP_SYNC_MAX_ERRORS)
 }
