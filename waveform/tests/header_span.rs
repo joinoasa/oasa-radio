@@ -155,6 +155,52 @@ fn controls_alone_and_after_the_span() {
     assert_eq!(run(Case::After, -10.0, 10), [10; 5]);
 }
 
+/// The live receiver fed as the `sdr` radio feeds it: small pieces, pushed at `block` samples or
+/// as soon as the frame being received is complete ([`LiveReceiver::decision_at`]). The header-only
+/// burst makes it wait for the span it claims; the real frame inside that span is still found.
+fn live_early(x: &[Complex32]) -> Vec<RxFrame> {
+    let mut s = LiveReceiver::new(modem(), coarse()).unwrap();
+    let (mut out, mut from) = (Vec::new(), 0usize);
+    for i in (50..x.len()).step_by(50).chain([x.len()]) {
+        let have = i as u64;
+        if i - from >= 512 || s.decision_at().is_some_and(|at| have >= at) {
+            out.extend(s.push(&x[from..i]));
+            from = i;
+        }
+    }
+    out.extend(s.push(&x[from..]));
+    out.extend(s.finish());
+    out
+}
+
+#[test]
+fn a_bad_crc_16_does_not_hide_a_frame_from_the_live_receiver_in_small_pieces() {
+    let md = modem();
+    for (case, rel_db) in [
+        (Case::Inside, 0.0),
+        (Case::Inside, -10.0),
+        (Case::After, -10.0),
+    ] {
+        for t in 0..10 {
+            let (x, start, p) = scene(&md, case, rel_db, 3000 + t);
+            assert!(
+                delivered(&live_early(&x), start, &p),
+                "scene {t} at {rel_db} dB"
+            );
+            let mut s = LiveReceiver::new(modem(), coarse()).unwrap();
+            let mut fr = Vec::new();
+            for b in x.chunks(37) {
+                fr.extend(s.push(b));
+            }
+            fr.extend(s.finish());
+            assert!(
+                delivered(&fr, start, &p),
+                "scene {t} at {rel_db} dB, 37-sample blocks"
+            );
+        }
+    }
+}
+
 /// A real frame whose body is damaged is returned with a bad CRC-16, and the search through its
 /// body (now tried, not skipped) delivers nothing false.
 #[test]

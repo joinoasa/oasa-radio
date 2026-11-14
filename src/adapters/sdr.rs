@@ -18,7 +18,10 @@
 //! Both streams sit at a digital IF (`if_hz`, default 250 kHz at 1 MS/s): the DC offset and LO
 //! leakage of a direct-conversion radio then fall outside the signal (oasa-radio docs/waveform-w0.md,
 //! W1). The receive side shifts back by `if_hz` plus the tracked clock offset, low-pass filters,
-//! keeps every `decimate`-th sample and hands blocks to [`LiveReceiver`], which releases each frame as soon as its own samples are in. Every frame whose CRC
+//! keeps every `decimate`-th sample and hands blocks to [`LiveReceiver`], which releases each frame as soon as its own samples are in. A block is
+//! `block` samples, or fewer once the last samples of the frame being received are in (the
+//! receiver says when, from the frame's header), so a frame does not wait for a block to fill. Each
+//! frame goes to the bridge the moment it is decided. Every frame whose CRC
 //! passes is one packet; a frame with a bad CRC is dropped and counted (`bad_frame`).
 //!
 //! The radio never looks inside a packet and never logs one. Its optional log (`log`) has sizes,
@@ -1084,18 +1087,22 @@ impl RxChain {
         &self.pending[before..]
     }
 
-    /// A block is waiting for the receiver.
+    /// A block is waiting for the receiver, or the last samples of the frame now arriving are in
+    /// (then a short block: the frame does not wait for the block to fill).
     fn ready(&self) -> bool {
+        let have = self.fed + self.pending.len() as u64;
         self.pending.len() >= self.block
+            || (!self.pending.is_empty() && self.receiver.decision_at().is_some_and(|n| have >= n))
     }
 
-    /// Run the receiver on what is waiting.
-    fn run(&mut self) -> Pass {
+    /// Run the receiver on what is waiting. `each` sees every frame as soon as it is decided
+    /// (before the rest of the block is searched); the pass gives them all again at the end.
+    fn run(&mut self, each: impl FnMut(&RxFrame)) -> Pass {
         self.fed += self.pending.len() as u64;
         if let Some(db) = self.notch_db {
             self.notched += cancel_tone(&mut self.pending, db).is_some() as u64;
         }
-        let frames = self.receiver.push(&self.pending);
+        let frames = self.receiver.push_each(&self.pending, each);
         self.pending.clear();
         let mut pass = Pass::default();
         for fr in frames {
@@ -1214,14 +1221,11 @@ fn rx_thread(cfg: &SdrConfig, shared: &Shared, receiver: LiveReceiver, out: Sync
         let now = Instant::now();
         let fed = chain.fed + chain.pending.len() as u64;
         arrivals.push_back((fed, now));
-        let pass = chain.run();
-        let decided = Instant::now();
-        for (fr, cfo_hz) in pass.frames {
-            // when the frame's last sample arrived
-            let end = fr.end;
-            let arrived = arrivals.iter().find(|(k, _)| *k >= end).map(|(_, t)| *t);
-            let wait_ms = arrived.map(|t| decided.duration_since(t).as_secs_f64() * 1e3);
-            let resid = f64::from(fr.cfo_cycles_per_symbol);
+        // Each frame goes to the bridge the moment it is decided; the log and the offset
+        // tracking follow after the pass.
+        let mut decided_at: Vec<Instant> = Vec::new();
+        let pass = chain.run(|fr| {
+            decided_at.push(Instant::now());
             if fr.crc_ok {
                 shared.rx_frames.fetch_add(1, Ordering::Relaxed);
                 if out.try_send(fr.payload.clone()).is_err() {
@@ -1230,6 +1234,15 @@ fn rx_thread(cfg: &SdrConfig, shared: &Shared, receiver: LiveReceiver, out: Sync
             } else {
                 shared.bad_frames.fetch_add(1, Ordering::Relaxed);
             }
+        });
+        let pass_end = Instant::now();
+        for (i, (fr, cfo_hz)) in pass.frames.into_iter().enumerate() {
+            let decided = decided_at.get(i).copied().unwrap_or(pass_end);
+            // when the frame's last sample arrived
+            let end = fr.end;
+            let arrived = arrivals.iter().find(|(k, _)| *k >= end).map(|(_, t)| *t);
+            let wait_ms = arrived.map(|t| decided.duration_since(t).as_secs_f64() * 1e3);
+            let resid = f64::from(fr.cfo_cycles_per_symbol);
             shared.event(
                 "rx_frame",
                 &format!(
@@ -1241,7 +1254,7 @@ fn rx_thread(cfg: &SdrConfig, shared: &Shared, receiver: LiveReceiver, out: Sync
                     resid,
                     cfo_hz,
                     wait_ms.map(|v| format!("{v:.1}")).unwrap_or_else(|| "null".into()),
-                    decided.duration_since(now).as_secs_f64() * 1e3,
+                    pass_end.duration_since(now).as_secs_f64() * 1e3,
                 ),
             );
         }
@@ -1703,7 +1716,7 @@ mod acquire {
             let locked = ch.lock.as_ref().is_some_and(|l| l.locked);
             let w0 = ch.receiver.search_work();
             let t0 = Instant::now();
-            let pass = ch.run();
+            let pass = ch.run(|_| {});
             let dt = t0.elapsed().as_secs_f64();
             let w1 = ch.receiver.search_work();
             let acc = if locked { &mut r.narrow } else { &mut r.wide };
@@ -2021,7 +2034,7 @@ mod acquire {
             if !ch.ready() {
                 continue;
             }
-            let pass = ch.run();
+            let pass = ch.run(|_| {});
             for (fr, _) in pass.frames {
                 let during = fr.end > j0 as u64 && fr.start < j1 as u64;
                 match (during, fr.crc_ok) {
@@ -2209,6 +2222,185 @@ mod acquire {
                     r.first_after_ok,
                     r.back_ms.map(|v| format!("{v:.2}")).unwrap_or("never".into()),
                     r.sent_after, r.good_after, r.cfo_hz, r.clipped, r.load
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod early_pass {
+    //! A pass runs as soon as the frame being received is complete, not only when a block is full.
+    //! The whole receive chain at the bench's settings, fed in the helper's 500-sample pieces: the
+    //! frames delivered are the same as with whole blocks, and each comes out with the piece that
+    //! holds its last sample. The sweep: `cargo test --release --lib early_pass::sweep -- --ignored
+    //! --nocapture`.
+    use super::*;
+    use oasa_waveform::channel::Channel;
+    use oasa_waveform::rng::Rng;
+
+    /// The bench's settings with `code`.
+    fn bench(code: PayloadCode) -> SdrConfig {
+        let mut c = SdrConfig::new("/dev/null".into(), "/dev/null".into());
+        c.sample_rate = 1e6;
+        c.symbol_rate = 250e3;
+        c.if_hz = 175e3;
+        c.decimate = 1;
+        c.coarse_step = 4;
+        c.code = code;
+        c.check().unwrap();
+        c
+    }
+
+    fn chain(c: &SdrConfig) -> RxChain {
+        let md = Modem::new(ModemConfig {
+            sps: c.sps().unwrap() / c.decimate,
+            frame: FrameFormat::V1,
+            code: c.code,
+            ..ModemConfig::new(c.modulation)
+        })
+        .unwrap();
+        let rx = RxConfig {
+            cfo_search: c.cfo_search,
+            max_len: Some(c.mtu),
+            only_code: Some(c.code),
+            coarse_step: c.coarse_step,
+            ..RxConfig::default()
+        };
+        RxChain::new(c, LiveReceiver::new(md, rx).unwrap())
+    }
+
+    /// `n` 32-byte frames about 10 ms apart (each gap random, so frames end anywhere against the
+    /// pieces) at the IF with a `hz` offset, at Es/N0 `esn0` dB.
+    fn stream(c: &SdrConfig, n: usize, esn0: f64, hz: f64, seed: u64) -> Vec<Complex32> {
+        let tx = Modem::new(ModemConfig {
+            sps: c.sps().unwrap(),
+            frame: FrameFormat::V1,
+            code: c.code,
+            ..ModemConfig::new(c.modulation)
+        })
+        .unwrap();
+        let mut rng = Rng::new(seed);
+        let mut x = vec![Complex32::ZERO; 3000];
+        for _ in 0..n {
+            x.extend(tx.modulate(&rng.bytes(32)).unwrap());
+            let gap = 8000 + rng.below(1000) as usize;
+            x.extend(std::iter::repeat_n(Complex32::ZERO, gap));
+        }
+        let g = 0.05f32;
+        let mut ph = 0.0f64;
+        for v in x.iter_mut() {
+            let (sn, co) = ph.sin_cos();
+            *v = *v * Complex32::new(co as f32 * g, sn as f32 * g);
+            ph = (ph + std::f64::consts::TAU * (c.if_hz + hz) / c.sample_rate)
+                .rem_euclid(std::f64::consts::TAU);
+        }
+        // Es = g^2 per symbol (the modem's symbols have unit energy)
+        let n0 = f64::from(g * g) / 10f64.powf(esn0 / 10.0);
+        Channel::new(seed + 1).add_awgn(&mut x, n0);
+        x
+    }
+
+    /// Feed `x` in `piece`-sample reads; a pass when a block is in or (with `early`) when the chain
+    /// is ready. Each frame (start, payload, CRC) with the samples read when it came out.
+    fn feed(
+        c: &SdrConfig,
+        x: &[Complex32],
+        piece: usize,
+        early: bool,
+    ) -> Vec<(u64, Vec<u8>, bool, u64)> {
+        let mut ch = chain(c);
+        let mut out = Vec::new();
+        let mut read = 0u64;
+        for p in x.chunks(piece) {
+            let mut v = p.to_vec();
+            ch.feed(&mut v);
+            read += p.len() as u64;
+            let go = if early {
+                ch.ready()
+            } else {
+                ch.pending.len() >= ch.block
+            };
+            if !go {
+                continue;
+            }
+            for (f, _) in ch.run(|_| {}).frames {
+                out.push((f.start, f.payload, f.crc_ok, read));
+            }
+        }
+        out
+    }
+
+    fn good(v: &[(u64, Vec<u8>, bool, u64)]) -> Vec<(u64, Vec<u8>)> {
+        v.iter()
+            .filter(|f| f.2)
+            .map(|f| (f.0, f.1.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn early_passes_deliver_the_same_frames_sooner() {
+        let piece = 500;
+        for (code, esn0) in [(PayloadCode::Light, 3.0), (PayloadCode::None, 11.0)] {
+            let c = bench(code);
+            let x = stream(&c, 40, esn0, 1500.0, 7);
+            let (late, soon) = (feed(&c, &x, piece, false), feed(&c, &x, piece, true));
+            assert_eq!(good(&soon), good(&late), "{code:?}");
+            assert!(good(&soon).len() >= 25, "{code:?}: {}", good(&soon).len());
+            // with the piece that holds the frame's last sample (the stream's samples count from
+            // its first; a frame's end is in the piece that ends at or after it)
+            let md = chain(&c).receiver.modem().clone();
+            let len = md.frame_samples(32) as u64;
+            for f in soon.iter().filter(|f| f.2) {
+                let end = f.0 + len;
+                assert_eq!(f.3, end.div_ceil(piece as u64) * piece as u64, "{code:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn sweep() {
+        let frames: usize = std::env::var("EARLY_FRAMES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4000);
+        for (code, points) in [
+            (PayloadCode::Light, vec![2.0, 3.0, 4.0, 5.0]),
+            (PayloadCode::None, vec![8.0, 10.0, 12.0]),
+        ] {
+            let c = bench(code);
+            for esn0 in points {
+                let (mut late_all, mut soon_all) = (Vec::new(), Vec::new());
+                let (mut wait_late, mut wait_soon, mut n) = (0u64, 0u64, 0u64);
+                let len = chain(&c).receiver.modem().frame_samples(32) as u64;
+                for k in 0..frames.div_ceil(200) {
+                    let x = stream(&c, 200, esn0, 1500.0, 100 + k as u64);
+                    let (late, soon) = (feed(&c, &x, 500, false), feed(&c, &x, 500, true));
+                    for f in late.iter().filter(|f| f.2) {
+                        wait_late += f.3 - f.0 - len;
+                        n += 1;
+                    }
+                    for f in soon.iter().filter(|f| f.2) {
+                        wait_soon += f.3 - f.0 - len;
+                    }
+                    late_all.extend(late.into_iter().map(|f| (k, f.0, f.1, f.2)));
+                    soon_all.extend(soon.into_iter().map(|f| (k, f.0, f.1, f.2)));
+                }
+                let good = |v: &[(usize, u64, Vec<u8>, bool)]| v.iter().filter(|f| f.3).count();
+                println!(
+                    "{{\"code\":\"{}\",\"esn0_db\":{esn0},\"sent\":{},\"good_blocks\":{},\"good_early\":{},\"bad_blocks\":{},\"bad_early\":{},\"same_frames\":{},\"same_good\":{},\"read_after_end_mean_samples_blocks\":{:.1},\"read_after_end_mean_samples_early\":{:.1}}}",
+                    code.name(),
+                    frames.div_ceil(200) * 200,
+                    good(&late_all),
+                    good(&soon_all),
+                    late_all.len() - good(&late_all),
+                    soon_all.len() - good(&soon_all),
+                    late_all == soon_all,
+                    late_all.iter().filter(|f| f.3).collect::<Vec<_>>()
+                        == soon_all.iter().filter(|f| f.3).collect::<Vec<_>>(),
+                    wait_late as f64 / n.max(1) as f64,
+                    wait_soon as f64 / n.max(1) as f64,
                 );
             }
         }

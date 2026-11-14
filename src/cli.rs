@@ -75,7 +75,8 @@ RADIOS:
             --rx-notch-db DB     cancel the strongest carrier in each receiver block when it
                                  stands DB over the mean FFT bin (25 is safe). Default 0 (off)
             --decimate 1|2       default 2
-            --block N            samples per receiver pass after decimation, default 512 (1 ms)
+            --block N            samples per receiver pass after decimation, default 512 (1 ms);
+                                 a pass runs sooner once a frame's last samples are in
             --coarse-step N      samples between the positions the detector tests, 0 (default)
                                  = a quarter symbol; one symbol (4 at 4 samples per symbol)
                                  costs 57 % less CPU, same frames on the bench sims

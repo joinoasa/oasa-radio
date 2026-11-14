@@ -395,7 +395,12 @@ pub(crate) fn quick(rx: &RxConfig) -> RxConfig {
 pub(crate) enum Reject {
     Sync,
     Header,
-    TooShort,
+    /// The buffer ended first. `need`: samples from the frame start that the next attempt must
+    /// have to get further (the rest of the header, or the whole frame once the header gave its
+    /// length). With fewer, an attempt on the same samples ends here again.
+    TooShort {
+        need: usize,
+    },
 }
 
 /// Carrier estimate of one frame: frequency (radians per sample), phase at the frame start, amplitude
@@ -793,7 +798,7 @@ impl Modem {
                 reserve(tally);
                 None
             }
-            Err(Reject::TooShort) => {
+            Err(Reject::TooShort { .. }) => {
                 count(tally, |r| &mut r.too_short);
                 None
             }
@@ -1048,6 +1053,8 @@ impl Modem {
     /// window of `r` back by `f`, find the fine peak and decode there. Returns the decode, the
     /// sample the candidate counts at, and whether `r` held all the samples the longest frame
     /// could need (if not, `TooShort` may only mean "wait for more"). `None`: no fine peak.
+    /// After a `TooShort` that is not `full`, [`Modem::retry_len`] gives how long `r` must be
+    /// before another attempt can end differently.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn coarse_candidate(
         &self,
@@ -1089,6 +1096,23 @@ impl Modem {
             fr
         });
         Some((res, lo + j, full))
+    }
+
+    /// For a [`Modem::coarse_candidate`] attempt at `tau_c` that gave `TooShort { need }` at sample
+    /// `tau` of `r`, not `full`: the length `r` must reach before an attempt on the same samples
+    /// (same start of `r`, same `busy_until`) can end differently. Until then every attempt reads
+    /// the same samples, makes the same choices and stops at the same point; the only other way
+    /// out, `full`, comes no sooner than this either.
+    pub(crate) fn retry_len(
+        &self,
+        tau_c: usize,
+        step: usize,
+        tau: usize,
+        need: usize,
+        frame_len: usize,
+    ) -> usize {
+        let hi = tau_c + self.cfg.sps + step;
+        (tau + need).min(hi + frame_len + 1)
     }
 
     /// The known waveform of preamble, sync word and v1 header `h`, up to where the body's first
@@ -1209,7 +1233,9 @@ impl Modem {
             .find(|&s| end_needed(s) <= avail)
             .unwrap_or(0);
         if usable_syms < body_start + 16 / bps {
-            return Err(Reject::TooShort);
+            return Err(Reject::TooShort {
+                need: end_needed(body_start + 16 / bps),
+            });
         }
         // derotate and normalize the part we use: W0 all of it now; v1 up to the end of the header
         // now, and the body once the header has given its length and code
@@ -1307,7 +1333,9 @@ impl Modem {
         let total_syms = body_start + self.body_len_bits(n, code) / bps;
         if end_needed(total_syms) > avail || (rx.expected_len.is_none() && total_syms > usable_syms)
         {
-            return Err(Reject::TooShort);
+            return Err(Reject::TooShort {
+                need: end_needed(total_syms),
+            });
         }
         if self.cfg.frame == FrameFormat::V1 {
             rr = derotate(omega, psi, amp, end_needed(total_syms));
@@ -1478,8 +1506,8 @@ impl Modem {
             return (a, b);
         }
         let ll = |a: f64, b: f64| line_log_likelihood(m, z, known, rho, a, b);
-        let (ma, mb) = ml_line(m, z, known, rho);
-        if ll(ma, mb) > ll(a, b) {
+        let (ma, mb, best) = ml_line(m, z, known, rho);
+        if best > ll(a, b) {
             (ma, mb)
         } else {
             (a, b)
@@ -1940,7 +1968,13 @@ fn line_log_likelihood(
 /// per symbol), and for each the phase within 16 degrees of what the
 /// known symbols alone give at that slope (they are long and strong enough that the truth is well
 /// inside that); then a finer search around the best.
-fn ml_line(m: Modulation, z: &[Complex32], known: &[(f64, Complex32)], rho: f64) -> (f64, f64) {
+/// Also returns the log-likelihood of the line found.
+fn ml_line(
+    m: Modulation,
+    z: &[Complex32],
+    known: &[(f64, Complex32)],
+    rho: f64,
+) -> (f64, f64, f64) {
     let anchor = |b: f64| {
         let (mut sr, mut si) = (0.0f64, 0.0f64);
         for &(k, w) in known {
@@ -1981,6 +2015,9 @@ fn ml_line(m: Modulation, z: &[Complex32], known: &[(f64, Complex32)], rho: f64)
         let (ca, cb) = (ba, bb);
         for i in -1..=1 {
             for j in -1..=1 {
+                if i == 0 && j == 0 {
+                    continue; // the centre is the best so far: its value is `best` already
+                }
                 let (a, b) = (ca + j as f64 * sa, cb + i as f64 * sb);
                 let v = ll(a, b);
                 if v > best {
@@ -1991,7 +2028,7 @@ fn ml_line(m: Modulation, z: &[Complex32], known: &[(f64, Complex32)], rho: f64)
         sa /= 2.0;
         sb /= 2.0;
     }
-    (ba, bb)
+    (ba, bb, best)
 }
 
 /// Largest residual frequency [`power_law_slope`] searches, in cycles per symbol. After the

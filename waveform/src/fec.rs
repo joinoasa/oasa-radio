@@ -58,29 +58,42 @@ pub fn conv_encode(bits: &[u8]) -> Vec<u8> {
 pub fn viterbi_decode(soft: &[f32], n_info: usize) -> Vec<u8> {
     assert_eq!(soft.len(), coded_len(n_info), "wrong number of soft values");
     let steps = n_info + TAIL_BITS;
+    // State `ns` is entered from states `2 * (ns % 32)` (dropped bit 0) and that plus 1 (dropped
+    // bit 1), with input `ns / 32`. Which of the four output pairs each branch sends is the same
+    // for every step, so it is worked out once.
+    let mut pair_of = [[0usize; 2]; STATES];
+    for (ns, p) in pair_of.iter_mut().enumerate() {
+        let u = (ns >> (K - 2)) as u8;
+        for (b, slot) in p.iter_mut().enumerate() {
+            let o = outputs(((ns & (STATES / 2 - 1)) << 1) | b, u);
+            *slot = 2 * o[0] as usize + o[1] as usize;
+        }
+    }
     // the best way into each state: the encoder starts in state 0
     let mut metric = [f32::NEG_INFINITY; STATES];
     metric[0] = 0.0;
     // for each step and state, the bit that fell out of the register on the best path
     let mut dropped = vec![[0u8; STATES]; steps];
     for (t, pair) in soft.chunks_exact(2).enumerate() {
+        // the branch metric of each output pair (00, 01, 10, 11) at this step
+        let bm: [f32; 4] =
+            std::array::from_fn(|i| branch_metric([(i >> 1) as u8, (i & 1) as u8], pair));
         let mut next = [f32::NEG_INFINITY; STATES];
-        for (ns, slot) in next.iter_mut().enumerate() {
-            let u = (ns >> (K - 2)) as u8;
-            for b in 0..2usize {
-                let ps = ((ns & (STATES / 2 - 1)) << 1) | b;
-                let o = outputs(ps, u);
-                let bm: f32 = o
-                    .iter()
-                    .zip(pair)
-                    .map(|(&bit, &s)| if bit == 0 { s } else { -s })
-                    .sum();
-                let cand = metric[ps] + bm;
-                if cand > *slot || (b == 0 && cand == *slot) {
-                    *slot = cand;
-                    dropped[t][ns] = b as u8;
-                }
+        let drop_t = &mut dropped[t];
+        for ns in 0..STATES {
+            let ps = (ns & (STATES / 2 - 1)) << 1;
+            let c0 = metric[ps] + bm[pair_of[ns][0] & 3];
+            let c1 = metric[ps | 1] + bm[pair_of[ns][1] & 3];
+            // as one comparison per branch from minus infinity: the first branch wins ties
+            let mut slot = f32::NEG_INFINITY;
+            if c0 >= slot {
+                slot = c0;
             }
+            if c1 > slot {
+                slot = c1;
+                drop_t[ns] = 1;
+            }
+            next[ns] = slot;
         }
         // Keep the numbers small: only differences between states matter.
         let best = next.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -98,6 +111,14 @@ pub fn viterbi_decode(soft: &[f32], n_info: usize) -> Vec<u8> {
     }
     bits.truncate(n_info);
     bits
+}
+
+/// Correlation of the output pair `o` with the two soft values `pair`.
+fn branch_metric(o: [u8; 2], pair: &[f32]) -> f32 {
+    o.iter()
+        .zip(pair)
+        .map(|(&bit, &s)| if bit == 0 { s } else { -s })
+        .sum()
 }
 
 #[cfg(test)]
@@ -185,6 +206,78 @@ mod tests {
         }
         assert_eq!(soft_wins, 200, "soft decoding failed on weak errors");
         assert!(hard_wins < soft_wins, "hard {hard_wins} soft {soft_wins}");
+    }
+
+    /// The decoder as first written: every branch metric worked out where it is used. The table
+    /// version must make the very same choices.
+    fn viterbi_reference(soft: &[f32], n_info: usize) -> Vec<u8> {
+        let steps = n_info + TAIL_BITS;
+        let mut metric = [f32::NEG_INFINITY; STATES];
+        metric[0] = 0.0;
+        let mut dropped = vec![[0u8; STATES]; steps];
+        for (t, pair) in soft.chunks_exact(2).enumerate() {
+            let mut next = [f32::NEG_INFINITY; STATES];
+            for (ns, slot) in next.iter_mut().enumerate() {
+                let u = (ns >> (K - 2)) as u8;
+                for b in 0..2usize {
+                    let ps = ((ns & (STATES / 2 - 1)) << 1) | b;
+                    let o = outputs(ps, u);
+                    let bm: f32 = o
+                        .iter()
+                        .zip(pair)
+                        .map(|(&bit, &s)| if bit == 0 { s } else { -s })
+                        .sum();
+                    let cand = metric[ps] + bm;
+                    if cand > *slot || (b == 0 && cand == *slot) {
+                        *slot = cand;
+                        dropped[t][ns] = b as u8;
+                    }
+                }
+            }
+            let best = next.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            for m in next.iter_mut() {
+                *m -= best;
+            }
+            metric = next;
+        }
+        let mut state = 0usize;
+        let mut bits = vec![0u8; steps];
+        for t in (0..steps).rev() {
+            bits[t] = (state >> (K - 2)) as u8;
+            state = ((state & (STATES / 2 - 1)) << 1) | dropped[t][state] as usize;
+        }
+        bits.truncate(n_info);
+        bits
+    }
+
+    #[test]
+    fn table_decoder_matches_the_reference_on_noisy_and_tied_input() {
+        let mut rng = Rng::new(4);
+        for trial in 0..2000 {
+            let n = [1usize, 8, 32, 100, 272][trial % 5];
+            let bits = random_bits(&mut rng, n);
+            let sigma = [0.3f64, 0.8, 1.2, 2.0][trial % 4];
+            let mut soft: Vec<f32> = hard(&conv_encode(&bits))
+                .iter()
+                .map(|&x| x + (sigma * rng.gaussian()) as f32)
+                .collect();
+            // coarse values make ties between paths common; zeros and negative zeros too
+            if trial % 3 == 0 {
+                for v in soft.iter_mut() {
+                    *v = (*v * 2.0).round() / 2.0;
+                }
+            }
+            if trial % 7 == 0 {
+                for v in soft.iter_mut().step_by(5) {
+                    *v = if rng.below(2) == 0 { 0.0 } else { -0.0 };
+                }
+            }
+            assert_eq!(
+                viterbi_decode(&soft, n),
+                viterbi_reference(&soft, n),
+                "trial {trial}"
+            );
+        }
     }
 
     #[test]
