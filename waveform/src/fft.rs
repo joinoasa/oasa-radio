@@ -44,8 +44,8 @@ impl Fft {
     /// Transform `x` (length `n`) in place.
     pub fn forward(&self, x: &mut [Complex32]) {
         assert_eq!(x.len(), self.n);
-        for i in 0..self.n {
-            let j = self.rev[i] as usize;
+        for (i, &j) in self.rev.iter().enumerate() {
+            let j = j as usize;
             if i < j {
                 x.swap(i, j);
             }
