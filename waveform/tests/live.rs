@@ -270,3 +270,109 @@ fn positions_past_two_to_the_32_samples() {
         });
     }
 }
+
+/// As the `sdr` radio feeds it: samples arrive in small pieces and are pushed once `block` are in,
+/// or as soon as the stream reaches [`LiveReceiver::decision_at`] (the piece is cut there).
+/// Returns each frame with the stream length when it came out, and the receiver.
+fn early(
+    md: Modem,
+    rx: &RxConfig,
+    x: &[Complex32],
+    piece: usize,
+    block: usize,
+) -> (Vec<(RxFrame, u64)>, LiveReceiver) {
+    let mut s = LiveReceiver::new(md, rx.clone()).unwrap();
+    let (mut out, mut pending, mut i) = (Vec::new(), 0usize, 0usize);
+    while i < x.len() {
+        let have = s.samples_seen() + pending as u64;
+        let mut n = piece.min(x.len() - i);
+        if let Some(at) = s.decision_at().filter(|&at| at > have) {
+            n = n.min((at - have) as usize);
+        }
+        pending += n;
+        i += n;
+        let have = s.samples_seen() + pending as u64;
+        if pending >= block || s.decision_at().is_some_and(|at| have >= at) {
+            let from = i - pending;
+            for f in s.push(&x[from..i]) {
+                let at = s.samples_seen();
+                out.push((f, at));
+            }
+            pending = 0;
+        }
+    }
+    let from = i - pending;
+    out.extend(s.push(&x[from..i]).into_iter().map(|f| (f, u64::MAX)));
+    out.extend(s.finish().into_iter().map(|f| (f, u64::MAX)));
+    (out, s)
+}
+
+/// With the push cut at `decision_at`, every frame comes out with its own last sample: no wait for
+/// a block to fill. The frames are the same as from whole blocks.
+#[test]
+fn a_frame_comes_out_with_its_last_sample() {
+    for (code, ebn0, seed) in [(PayloadCode::None, 10.0, 21), (PayloadCode::Light, 4.0, 22)] {
+        let md = Modem::new(v1(Modulation::Qpsk, code)).unwrap();
+        let rx = radio_rx(200, code);
+        let x = recording(&md, 30, 200, ebn0, 0.004, seed);
+        let (want, _, _) = live(md.clone(), &rx, &x, &[512]);
+        let (got, s) = early(md, &rx, &x, 500, 512);
+        assert_eq!(
+            got.iter().map(|(f, _)| key(f)).collect::<Vec<_>>(),
+            want.iter().map(key).collect::<Vec<_>>(),
+            "{code:?}"
+        );
+        let good: Vec<_> = got.iter().filter(|(f, _)| f.crc_ok).collect();
+        assert!(good.len() >= 25, "{code:?}: {} good frames", good.len());
+        for (f, at) in good {
+            assert_eq!(*at, f.end, "{code:?}: frame at {} out late", f.start);
+        }
+        assert_eq!(s.decision_at(), None);
+    }
+}
+
+/// A candidate still arriving is not decoded again on every small block: a few decodes per
+/// candidate (header, then the frame), however small the blocks.
+#[test]
+fn small_blocks_do_not_decode_a_candidate_again_and_again() {
+    let code = PayloadCode::Light;
+    let md = Modem::new(v1(Modulation::Qpsk, code)).unwrap();
+    let rx = radio_rx(200, code);
+    let x = recording(&md, 20, 200, 8.0, 0.004, 23);
+    let (want, _, _) = live(md.clone(), &rx, &x, &[512]);
+    let mut s = LiveReceiver::new(md, rx).unwrap();
+    let mut got = Vec::new();
+    for b in x.chunks(16) {
+        got.extend(s.push(b));
+    }
+    got.extend(s.finish());
+    assert_eq!(
+        got.iter().map(key).collect::<Vec<_>>(),
+        want.iter().map(key).collect::<Vec<_>>()
+    );
+    let (decodes, skipped) = s.attempts();
+    let candidates = s.report().preambles as u64;
+    assert!(
+        decodes <= 4 * candidates,
+        "{decodes} decodes for {candidates} candidates"
+    );
+    assert!(
+        skipped > 20 * decodes,
+        "{skipped} skipped, {decodes} decodes"
+    );
+}
+
+/// `push_each` hands out every frame once, in order, the same frames `push` returns.
+#[test]
+fn push_each_sees_the_frames_push_returns() {
+    let md = Modem::new(v1(Modulation::Qpsk, PayloadCode::None)).unwrap();
+    let rx = radio_rx(200, PayloadCode::None);
+    let x = recording(&md, 30, 120, 10.0, 0.004, 24);
+    let mut s = LiveReceiver::new(md, rx).unwrap();
+    let (mut seen, mut returned) = (Vec::new(), Vec::new());
+    for b in x.chunks(700) {
+        returned.extend(s.push_each(b, |f| seen.push(key(f))));
+    }
+    assert!(seen.len() >= 25, "{} frames", seen.len());
+    assert_eq!(seen, returned.iter().map(key).collect::<Vec<_>>());
+}

@@ -144,7 +144,11 @@ impl StreamReceiver {
 ///   [`StreamReceiver`] searches its whole window again on every block, so small blocks cost the
 ///   window each time and the receiver falls behind);
 /// - a frame comes out as soon as its own samples are in. The v1 header gives its length, so a
-///   short frame does not wait for room for the longest one.
+///   short frame does not wait for room for the longest one;
+/// - a candidate still arriving is not decoded again until the samples it waits for are in
+///   ([`LiveReceiver::decision_at`] says when), so small blocks cost no repeated work;
+/// - candidates already found are decided before a new block is searched, and
+///   [`LiveReceiver::push_each`] hands each frame out the moment it is decided.
 ///
 /// Candidates are decided in stream order: a frame still arriving holds back the ones after it.
 /// Needs `rx.cfo_search > 0`.
@@ -174,6 +178,12 @@ pub struct LiveReceiver {
     tally: Tally,
     /// Coarse search work done so far.
     work: SearchWork,
+    /// The front candidate ran out of samples: (its position, `base` then, the stream length its
+    /// next attempt needs). Until the stream is that long, an attempt would read the same samples
+    /// and stop at the same point, so none is made.
+    wait: Option<(u64, u64, u64)>,
+    /// Attempts made on candidates, and those skipped because of `wait` (for tests).
+    attempts: (u64, u64),
 }
 
 /// Work the coarse frequency search has done: positions tested, FFT points computed and frequency
@@ -214,6 +224,8 @@ impl LiveReceiver {
             pending: VecDeque::new(),
             tally: Tally::default(),
             work: SearchWork::default(),
+            wait: None,
+            attempts: (0, 0),
         })
     }
 
@@ -290,13 +302,48 @@ impl LiveReceiver {
     /// Add samples; returns the frames now complete, in order, `start` and `end` counted from the
     /// first sample of the stream.
     pub fn push(&mut self, block: &[Complex32]) -> Vec<RxFrame> {
+        self.push_each(block, |_| {})
+    }
+
+    /// [`LiveReceiver::push`], and `each` sees every frame the moment it is decided, before the
+    /// rest of the block is searched. The frames and their order are the same as `push` gives.
+    ///
+    /// Candidates found in earlier blocks are decided first: a frame whose last samples came in
+    /// this block does not wait for the new samples' detection metric. Then the new samples are
+    /// searched and the candidates found there decided. Deciding in two steps changes nothing:
+    /// candidates are decided in stream order either way, and the search does not depend on what
+    /// was decided.
+    pub fn push_each(
+        &mut self,
+        block: &[Complex32],
+        mut each: impl FnMut(&RxFrame),
+    ) -> Vec<RxFrame> {
         self.buf.extend_from_slice(block);
         self.total += block.len() as u64;
+        let mut out = self.decide(false);
+        out.iter().for_each(&mut each);
         self.metric();
         self.candidates(false);
-        let out = self.decide(false);
+        let more = self.decide(false);
+        more.iter().for_each(&mut each);
+        out.extend(more);
         self.trim();
         out
+    }
+
+    /// The stream length (samples pushed) at which the candidate now being received can be
+    /// decided, if one is waiting for its last samples. Pushing before then gives no frame from it
+    /// (a new candidate may still be found). For a caller that collects samples into blocks: push
+    /// as soon as this many are in instead of waiting for a whole block.
+    pub fn decision_at(&self) -> Option<u64> {
+        self.wait.map(|(_, _, need)| need)
+    }
+
+    /// Candidate decodes made so far, and attempts skipped because the samples a candidate waits
+    /// for were not in yet.
+    #[doc(hidden)]
+    pub fn attempts(&self) -> (u64, u64) {
+        self.attempts
     }
 
     /// End of stream: decide what is left, as the whole-buffer receiver would at the buffer's end.
@@ -305,6 +352,7 @@ impl LiveReceiver {
         let out = self.decide(true);
         self.buf.clear();
         self.base = self.total;
+        self.wait = None;
         out
     }
 
@@ -375,8 +423,20 @@ impl LiveReceiver {
                     .settings(tau_c, &self.fine, &self.quick_fine, self.frame_len)
             else {
                 self.pending.pop_front();
+                self.wait = None;
                 continue;
             };
+            // Still short of what the last attempt on this candidate needed: the same samples
+            // would give the same `TooShort`.
+            if !end
+                && self
+                    .wait
+                    .is_some_and(|(t, b, need)| t == tau_c && b == self.base && self.total < need)
+            {
+                self.attempts.1 += 1;
+                break;
+            }
+            self.attempts.0 += 1;
             let got = self.modem.coarse_candidate(
                 &self.buf,
                 (tau_c - self.base) as usize,
@@ -388,12 +448,23 @@ impl LiveReceiver {
             );
             let Some((res, tau, full)) = got else {
                 self.pending.pop_front();
+                self.wait = None;
                 continue;
             };
-            if matches!(res, Err(Reject::TooShort)) && !full && !end {
-                break; // the frame is still arriving
+            if let (Err(Reject::TooShort { need }), false, false) = (&res, full, end) {
+                // the frame is still arriving
+                let len = self.modem.retry_len(
+                    (tau_c - self.base) as usize,
+                    self.cs.step,
+                    tau,
+                    *need,
+                    self.frame_len,
+                );
+                self.wait = Some((tau_c, self.base, self.base + len as u64));
+                break;
             }
             self.pending.pop_front();
+            self.wait = None;
             let base = self.base;
             let res = res.map(|mut fr| {
                 fr.start += base;
