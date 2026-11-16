@@ -1,0 +1,5 @@
+# Stable Rust and the Cortex-M4F target. rustup adds the target on first use.
+[toolchain]
+channel = "stable"
+targets = ["thumbv7em-none-eabihf"]
+components = ["rustfmt", "clippy"]

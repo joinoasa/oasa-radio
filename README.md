@@ -42,7 +42,7 @@ Packets from `oasa-link` arrive on `--udp-listen` and go out the radio. Packets 
 |---|---|---|
 | `udp` | Simulation (put the lab's simulated channel between two bridges), Wi-Fi, Ethernet | Works |
 | `serial` | SiK, mLRS, RFD900x, any transparent UART modem | Works. Framing: [docs/serial-framing.md](docs/serial-framing.md). SiK: `oasa-radio sik show/set` and `--sik-expect`, [docs/sik.md](docs/sik.md) |
-| `lora` | Our LoRa modem firmware for the Heltec WiFi LoRa 32 V3. It speaks the serial framing: use `--radio serial --baud 115200 --mtu 255`, and `oasa-radio lora` for settings and counters | Works in simulation; real board untested. [firmware/heltec-v3](firmware/heltec-v3/README.md) |
+| `lora` | Our LoRa modem firmware for the Heltec WiFi LoRa 32 V3 and the RAK4631. It speaks the serial framing: use `--radio serial --baud 115200 --mtu 255`, and `oasa-radio lora` for settings and counters | Works in simulation; real boards untested. [firmware/heltec-v3](firmware/heltec-v3/README.md), [firmware/rak4631](firmware/rak4631/README.md) (USB serial: `/dev/ttyACM*`) |
 | `sdr` | OASA's own waveforms on SDRs | Works on the bench (B200mini and E310, not yet a counted lab run): frame v1 over two continuous IQ streams, [docs/sdr-adapter.md](docs/sdr-adapter.md). The modem (W0) runs in simulation: `oasa-radio waveform`, [docs/waveform-w0.md](docs/waveform-w0.md). Frame format v1 (protected header): [docs/frame-v1.md](docs/frame-v1.md). Light error correction for v1 (`--code light`): [docs/fec-light.md](docs/fec-light.md). Two-channel direction finding: [docs/direction-finding.md](docs/direction-finding.md). Fading in simulation: [docs/fading.md](docs/fading.md); channel tracking for fast fading (`--phase-track-hz`): [docs/phase-tracking.md](docs/phase-tracking.md); two-antenna receive diversity in simulation (`--diversity`): [docs/diversity.md](docs/diversity.md). Interferers and a jammer in simulation (B8): [docs/interference.md](docs/interference.md) |
 
 ## Quick start
@@ -121,6 +121,8 @@ CI runs both, plus `cargo fmt`, `clippy -D warnings`, `cargo deny` and `cargo au
 | `oasa-waveform` (ours, in `waveform/`) | 0.1 | Apache-2.0 | OASA's own modem for milestone W0: 2-FSK, BPSK, QPSK, framing, a convolutional code with soft Viterbi decoding, channel model and theory curves. Pure Rust, no dependencies; erfc, the random generator and the CRC are written here with known-answer tests |
 | [embedded-hal](https://crates.io/crates/embedded-hal) | 1.0 | MIT or Apache-2.0 | SPI and pin traits for the `no_std` modem core |
 | esp-hal, esp-rtos, esp-bootloader-esp-idf, embassy-executor, embassy-time, embassy-futures, embassy-sync | see `firmware/heltec-v3/Cargo.toml` | MIT or Apache-2.0 | Heltec V3 firmware only (not in the host build) |
+| embassy-nrf, embassy-usb, embassy-executor, embassy-time, embassy-futures, embassy-sync, cortex-m, cortex-m-rt, static_cell | see `firmware/rak4631/Cargo.toml` | MIT or Apache-2.0 | RAK4631 firmware only (not in the host build) |
+| nrf-pac | via embassy-nrf | BSD-3-Clause | nRF52840 register definitions, generated from Nordic's SVD files. RAK4631 firmware only |
 
 `lora-phy` was looked at and not used: it reports a CRC-failed packet as good and cannot set an arbitrary sync word. The SX126x driver is in `firmware/modem-core/src/sx126x.rs`.
 

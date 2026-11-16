@@ -17,6 +17,7 @@ docs = [
   "docs/security-review-r-com1.md",
   "docs/phone-radio-board-requirements.md",
   "firmware/heltec-v3/README.md",
+  "firmware/rak4631/README.md",
   "research/t-rf3-array/README.md",
 ]
 
@@ -77,6 +78,36 @@ name = "firmware-audit"
 run = "cargo audit --file firmware/heltec-v3/Cargo.lock"
 needs = ["cargo-audit", "network access to the advisory database"]
 
+# The RAK4631 firmware (nRF52840, Cortex-M4F). Outside the workspace with its own lock file and
+# deny.toml. Stable Rust; rust-toolchain.toml there adds the thumbv7em-none-eabihf target.
+[[check]]
+name = "rak4631-fmt"
+run = "cargo fmt --check"
+dir = "firmware/rak4631"
+
+[[check]]
+name = "rak4631-clippy"
+run = "cargo clippy --release --locked -- -D warnings"
+dir = "firmware/rak4631"
+needs = ["thumbv7em-none-eabihf target (rustup target add thumbv7em-none-eabihf)"]
+
+[[check]]
+name = "rak4631-build"
+run = "cargo build --release --locked"
+dir = "firmware/rak4631"
+needs = ["thumbv7em-none-eabihf target (rustup target add thumbv7em-none-eabihf)"]
+
+[[check]]
+name = "rak4631-deny"
+run = "cargo deny --locked --target thumbv7em-none-eabihf check"
+dir = "firmware/rak4631"
+needs = ["cargo-deny"]
+
+[[check]]
+name = "rak4631-audit"
+run = "cargo audit --file firmware/rak4631/Cargo.lock"
+needs = ["cargo-audit", "network access to the advisory database"]
+
 # T-RF3 array simulation (Python prototype). Nothing here touches the Rust code.
 [[check]]
 name = "t-rf3-pytest"
@@ -114,4 +145,4 @@ hardware = true   # real run needs 2 LoRa modems and an RTL-SDR; OASA_LAB_SIM=1 
 
 [hardware]
 needed = false
-optional = ["2x Heltec LoRa V3", "RTL-SDR V4L", "Ettus E310 (T-RF3 hardware test)"]
+optional = ["2x Heltec LoRa V3", "2x RAK4631 on a WisBlock base", "RTL-SDR V4L", "Ettus E310 (T-RF3 hardware test)"]
