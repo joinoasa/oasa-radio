@@ -15,6 +15,7 @@ docs = [
   "docs/waveform-w0.md",
   "docs/frame-v1.md",
   "docs/security-review-r-com1.md",
+  "docs/phone-radio-board-requirements.md",
   "firmware/heltec-v3/README.md",
   "research/t-rf3-array/README.md",
 ]
