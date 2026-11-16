@@ -57,7 +57,7 @@ Prices fetched 2026-11-15. "Stock" is the number the page showed that day.
 
 > Modular Approval. Output power listed is conducted. This transmitter is approved for use in mobile RF exposure category configurations with the antenna(s) installed to provide a separation distance of at least 20 cm from all persons. [...] Installation of this device into portable RF Exposure category host devices requires the submission of a Class II permissive change or new application.
 
-Frequency and power on the grants: 902.3-914.9 MHz, 0.036 W (DSS); 903.0-914.2 MHz, 0.038 W and 2402-2480 MHz, 0.003 W (DTS) **[GR]**. A RAK forum user reports the FCC filing used a 3.0 dBi antenna ([forum](https://forum.rakwireless.com/t/rak4631-fcc-antenna-options/13586)); not checked against the test report, whose antenna pages are images. Whatever this means for a pocket device is for the owner and an attorney; we only record the text.
+Frequency and power on the grants: 902.3-914.9 MHz, 0.036 W (DSS); 903.0-914.2 MHz, 0.038 W and 2402-2480 MHz, 0.003 W (DTS) **[GR]**. A RAK forum user reports the FCC filing used a 3.0 dBi antenna ([forum](https://forum.rakwireless.com/t/rak4631-fcc-antenna-options/13586)); not checked against the test report, whose antenna pages are images. What this means for a device carried in a pocket is not judged here; we only record the text.
 
 **Supply limits that shape the power design (RAK4630)** **[VP]** ([datasheet page](https://docs.rakwireless.com/product-categories/wisduo/rak4630-module/datasheet/)): VBAT_SX and VBAT_IO_SX 2.0-3.7 V; VDD_NRF 2.0-3.6 V; VBAT_NRF (nRF VDDH) 2.5-5.5 V; VBUS 4.35-5.5 V. A full Li-ion cell (4.2 V) is above the SX1262 limit, so the board needs a 3.3 V regulator. BLE TX power is listed as -20 to +4 dBm.
 
