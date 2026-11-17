@@ -61,5 +61,9 @@ dependencies = [
 ]
 
 [[package]]
+name = "oasa-usbnet-core"
+version = "0.1.0"
+
+[[package]]
 name = "oasa-waveform"
 version = "0.1.0"

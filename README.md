@@ -123,6 +123,8 @@ CI runs both, plus `cargo fmt`, `clippy -D warnings`, `cargo deny` and `cargo au
 | esp-hal, esp-rtos, esp-bootloader-esp-idf, embassy-executor, embassy-time, embassy-futures, embassy-sync | see `firmware/heltec-v3/Cargo.toml` | MIT or Apache-2.0 | Heltec V3 firmware only (not in the host build) |
 | embassy-nrf, embassy-usb, embassy-executor, embassy-time, embassy-futures, embassy-sync, cortex-m, cortex-m-rt, static_cell | see `firmware/rak4631/Cargo.toml` | MIT or Apache-2.0 | RAK4631 firmware only (not in the host build) |
 | nrf-pac | via embassy-nrf | BSD-3-Clause | nRF52840 register definitions, generated from Nordic's SVD files. RAK4631 firmware only |
+| [embassy-net](https://crates.io/crates/embassy-net) | 0.9 (see `firmware/rak4631-usbnet/Cargo.toml`) | MIT or Apache-2.0 | IPv4, UDP and TCP for the RAK4631 USB network test firmware only |
+| [smoltcp](https://crates.io/crates/smoltcp), managed | via embassy-net | 0BSD | The TCP/IP stack under embassy-net. 0BSD is not on the allowed list yet: an exception for these two crates in `firmware/rak4631-usbnet/deny.toml`, waiting for owner approval. USB network test firmware only |
 
 `lora-phy` was looked at and not used: it reports a CRC-failed packet as good and cannot set an arbitrary sync word. The SX126x driver is in `firmware/modem-core/src/sx126x.rs`.
 

@@ -1,0 +1,48 @@
+[package]
+name = "oasa-usbnet-rak4631"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "OASA USB network adapter test firmware for the RAK4631 (CDC-NCM, one DHCP lease, one test page). Never uses the radio."
+repository = "https://github.com/joinoasa/oasa-radio"
+publish = false
+
+# The firmware is its own workspace: its own target and lock file.
+[workspace]
+
+[[bin]]
+name = "oasa-usbnet-rak4631"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+oasa-usbnet-core = { version = "0.1.0", path = "../usbnet-core" }
+# Only for hex_id (the USB serial number), shared with the modem firmware.
+oasa-modem-core = { version = "0.1.0", path = "../modem-core" }
+
+# unstable-pac: to read the chip ID (FICR) for the USB serial number and MACs.
+embassy-nrf = { version = "0.11.0", features = ["nrf52840", "time-driver-rtc1", "unstable-pac"] }
+embassy-usb = { version = "0.6.0", default-features = false }
+# IPv4 over Ethernet, UDP (DHCP) and TCP (the page). No DHCP client, no DNS, no IPv6.
+embassy-net = { version = "0.9.1", features = ["proto-ipv4", "medium-ethernet", "udp", "tcp"] }
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread"] }
+embassy-time = "0.5.1"
+embassy-sync = "0.8.0"
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+# set-vtor: point VTOR at our own vector table at reset (see memory.x).
+cortex-m-rt = { version = "0.7.5", features = ["set-vtor"] }
+static_cell = "2.1.1"
+
+# No nrf-softdevice (no Bluetooth), no defmt or RTT logging, no radio driver.
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+opt-level = "s"
+overflow-checks = true

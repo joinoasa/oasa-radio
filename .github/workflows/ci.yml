@@ -20,6 +20,7 @@ jobs:
           cargo fmt --all --check
           (cd firmware/heltec-v3 && RUSTUP_TOOLCHAIN=stable cargo fmt --check)
           (cd firmware/rak4631 && cargo fmt --check)
+          (cd firmware/rak4631-usbnet && cargo fmt --check)
       - name: Lint
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       # Includes the modem core (no_std) and the host side against the real
@@ -38,6 +39,9 @@ jobs:
           # The RAK4631 firmware: own lock file and exceptions (firmware/rak4631/deny.toml).
           (cd firmware/rak4631 && cargo deny --locked --target thumbv7em-none-eabihf check)
           cargo audit --file firmware/rak4631/Cargo.lock
+          # The RAK4631 USB network test firmware: adds 0BSD for smoltcp and managed only.
+          (cd firmware/rak4631-usbnet && cargo deny --locked --target thumbv7em-none-eabihf check)
+          cargo audit --file firmware/rak4631-usbnet/Cargo.lock
 
   # Two real oasa-link processes through two serial bridges and a pty relay.
   serial-e2e:
@@ -123,6 +127,36 @@ jobs:
         run: |
           ls -l target/thumbv7em-none-eabihf/release/oasa-lora-modem-rak4631
           sha256sum target/thumbv7em-none-eabihf/release/oasa-lora-modem-rak4631
+
+  # The RAK4631 USB network adapter test firmware (CDC-NCM), on stable Rust.
+  firmware-rak4631-usbnet:
+    name: firmware build (rak4631-usbnet, thumbv7em)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --target thumbv7em-none-eabihf && rustup default stable
+      - name: Cache crates and build output
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            firmware/rak4631-usbnet/target
+          key: rak4631-usbnet-${{ hashFiles('firmware/rak4631-usbnet/Cargo.lock') }}
+          restore-keys: rak4631-usbnet-
+      - name: Lint
+        working-directory: firmware/rak4631-usbnet
+        run: cargo clippy --release --locked -- -D warnings
+      - name: Build
+        working-directory: firmware/rak4631-usbnet
+        run: cargo build --release --locked
+      - name: Size and hash
+        working-directory: firmware/rak4631-usbnet
+        run: |
+          ls -l target/thumbv7em-none-eabihf/release/oasa-usbnet-rak4631
+          sha256sum target/thumbv7em-none-eabihf/release/oasa-usbnet-rak4631
 
   # Validates oasa.toml. It downloads the tool from the website repo and checks node IDs against the
   # live tech tree, so it fails until the OASA-FILES pull request merges and T-FILES1 is on the live tree.

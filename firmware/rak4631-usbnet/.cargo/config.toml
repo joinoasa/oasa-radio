@@ -1,0 +1,7 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+# --nmagic: no page alignment, so the ELF headers are not loaded below the
+# application (at 0x20000 they would land in the SoftDevice).
+rustflags = ["-C", "link-arg=--nmagic", "-C", "link-arg=-Tlink.x"]
