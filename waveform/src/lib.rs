@@ -48,3 +48,6 @@ pub use iq::Complex32;
 pub use modem::{
     CoarseSearch, ConfigError, Modem, ModemConfig, Modulation, RxConfig, RxFrame, RxReport,
 };
+
+#[cfg(test)]
+mod sync_first_tests;

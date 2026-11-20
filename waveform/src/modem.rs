@@ -14,7 +14,9 @@
 //!    two tone correlators for 2-FSK. BPSK and QPSK payloads are tracked by a small decision-directed
 //!    phase-locked loop.
 //! 4. **Check.** The sync word (up to `sync_max_errors` wrong bits), the length byte against its
-//!    complement, and the CRC-16.
+//!    complement, and the CRC-16. The sync word is checked as soon as the preamble and sync word
+//!    are derotated: the rest of a candidate is derotated only if it passes. This saves work on
+//!    false starts and changes no output.
 //!
 //! Frame format v1 (`ModemConfig::frame`, see `docs/frame-v1.md`) changes step 4: after the sync word
 //! the receiver takes soft values for the 152 header symbols, decodes the protected header, and
@@ -387,6 +389,77 @@ pub(crate) fn quick(rx: &RxConfig) -> RxConfig {
     RxConfig {
         refine_phase: false,
         ..rx.clone()
+    }
+}
+
+/// `r[tau + from .. tau + to]` turned back by the carrier estimate (phase `psi + omega * n` at
+/// sample `n` from `tau`) and scaled by `1 / amp`. Each sample depends only on its own index, so a
+/// buffer made in pieces equals one made at once.
+fn derotate_normalize(
+    r: &[Complex32],
+    tau: usize,
+    omega: f64,
+    psi: f64,
+    amp: f64,
+    from: usize,
+    to: usize,
+) -> Vec<Complex32> {
+    count_derotated(to - from);
+    (from..to)
+        .map(|n| {
+            let (s, co) = (-(psi + omega * n as f64)).sin_cos();
+            r[tau + n] * Complex32::new((co / amp) as f32, (s / amp) as f32)
+        })
+        .collect()
+}
+
+/// Check the sync word before derotating the rest of a candidate. Always on; tests can turn it
+/// off to compare with the previous order (derotate first, then check).
+fn check_sync_first() -> bool {
+    #[cfg(test)]
+    {
+        work::sync_first()
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+/// Count `n` derotated samples (tests only: a deterministic measure of decoder work).
+#[inline]
+fn count_derotated(_n: usize) {
+    #[cfg(test)]
+    work::add(_n);
+}
+
+/// Test hooks: the work counter and the switch back to the previous order. Per thread, so tests
+/// running in parallel do not see each other.
+#[cfg(test)]
+pub(crate) mod work {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DEROTATED: Cell<u64> = const { Cell::new(0) };
+        static SYNC_FIRST: Cell<bool> = const { Cell::new(true) };
+    }
+
+    pub(crate) fn add(n: usize) {
+        DEROTATED.with(|c| c.set(c.get() + n as u64));
+    }
+
+    /// Samples derotated on this thread since the last call; resets the count.
+    pub(crate) fn take() -> u64 {
+        DEROTATED.with(|c| c.replace(0))
+    }
+
+    pub(crate) fn sync_first() -> bool {
+        SYNC_FIRST.with(|c| c.get())
+    }
+
+    /// `false`: the previous order (derotate the whole candidate, then check the sync word).
+    pub(crate) fn set_sync_first(on: bool) {
+        SYNC_FIRST.with(|c| c.set(on));
     }
 }
 
@@ -1074,18 +1147,35 @@ impl Modem {
         let full = hi + frame_len < r.len();
         let end = (hi + frame_len + 1).min(r.len());
         let w = f as f64 / sps as f64;
-        let d: Vec<Complex32> = r[lo..end]
-            .iter()
-            .enumerate()
-            .map(|(j, s)| {
-                let turns = (w * (lo + j) as f64).rem_euclid(1.0);
-                let (sn, co) = (-2.0 * PI * turns).sin_cos();
-                *s * Complex32::new(co as f32, sn as f32)
-            })
-            .collect();
+        let turn_back = |from: usize, to: usize| -> Vec<Complex32> {
+            count_derotated(to - from);
+            r[from..to]
+                .iter()
+                .enumerate()
+                .map(|(j, s)| {
+                    let turns = (w * (from + j) as f64).rem_euclid(1.0);
+                    let (sn, co) = (-2.0 * PI * turns).sin_cos();
+                    *s * Complex32::new(co as f32, sn as f32)
+                })
+                .collect()
+        };
+        // First only what the fine search and the sync word need; the rest of the longest frame
+        // only if the sync word passes.
+        let first_end = if check_sync_first() {
+            (hi + self.waveform_len(self.ref_bits.len()) + 1).min(end)
+        } else {
+            end
+        };
+        let mut d = turn_back(lo, first_end);
         let fm = self.metric(&d[..hi - lo + m], fine);
         let j = (0..fm.len()).max_by(|&a, &b| fm[a].total_cmp(&fm[b]).then(b.cmp(&a)))?;
         let mu = parabola_peak(&fm, j);
+        if first_end < end {
+            if self.sync_rejects(&d, j, mu, fine, end - lo - j) == Some(true) {
+                return Some((Err(Reject::Sync), lo + j, full));
+            }
+            d.extend(turn_back(first_end, end));
+        }
         let res = self.decode_at(&d, j, mu, fm[j], fine).map(|mut fr| {
             fr.start += lo as u64;
             fr.end += lo as u64;
@@ -1201,6 +1291,79 @@ impl Modem {
         }
     }
 
+    /// Frame symbols a candidate with `avail` samples from its start can be read to (at most the
+    /// longest frame), or `TooShort` if that does not reach the length field.
+    fn usable_syms(&self, avail: usize, rx: &RxConfig) -> Result<usize, Reject> {
+        let bps = self.bps();
+        let n_ref = self.ref_bits.len();
+        let body_start = n_ref + self.header_syms();
+        let max_bits = match rx.expected_len {
+            Some(n) => self.body_len_bits(n, self.cfg.code),
+            None => self.body_len_bits(self.longest_len(rx), self.longest_code(rx)),
+        };
+        let want_syms = body_start + max_bits / bps;
+        let usable_syms = (n_ref..=want_syms)
+            .rev()
+            .find(|&s| self.waveform_len(s) <= avail)
+            .unwrap_or(0);
+        if usable_syms < body_start + 16 / bps {
+            return Err(Reject::TooShort {
+                need: self.waveform_len(body_start + 16 / bps),
+            });
+        }
+        Ok(usable_syms)
+    }
+
+    /// Matched filter taps at timing offset `mu` (none for 2-FSK).
+    fn taps_at(&self, mu: f64) -> Vec<f32> {
+        if self.cfg.modulation == Modulation::Fsk2 {
+            Vec::new()
+        } else {
+            rrc_shifted(self.cfg.sps, self.cfg.rrc_span, self.cfg.rolloff as f64, mu)
+        }
+    }
+
+    /// Wrong bits in the sync word (symbols `PREAMBLE_LEN..n_ref`, one bit each) of `rr`, a
+    /// derotated buffer from the frame start that holds at least the preamble and sync word
+    /// (`waveform_len(n_ref)` samples).
+    fn sync_errors(&self, taps: &[f32], rr: &[Complex32]) -> u32 {
+        let dem = SymbolDemod::new(self, taps, rr);
+        self.ref_bits[PREAMBLE_LEN..]
+            .iter()
+            .enumerate()
+            .filter(|&(i, &want)| dem.one_bit_symbol(PREAMBLE_LEN + i) != want)
+            .count() as u32
+    }
+
+    /// Whether [`Modem::decode_at`] at `tau` of `r` would stop at the sync word, judged from the
+    /// first samples only: `r` must hold the preamble and sync word from `tau` on. `avail` is how
+    /// many samples from `tau` on the full buffer will hold. `None` when `decode_at` would stop
+    /// earlier (`TooShort`); the caller then decodes as usual. The decision is the one `decode_at`
+    /// makes: the same estimate, the same samples, the same rule.
+    fn sync_rejects(
+        &self,
+        r: &[Complex32],
+        tau: usize,
+        mu: f64,
+        rx: &RxConfig,
+        avail: usize,
+    ) -> Option<bool> {
+        self.usable_syms(avail, rx).ok()?;
+        let Estimate {
+            omega, psi, amp, ..
+        } = self.estimate(r, tau, &self.refw);
+        let rr = derotate_normalize(
+            r,
+            tau,
+            omega,
+            psi,
+            amp,
+            0,
+            self.waveform_len(self.ref_bits.len()),
+        );
+        Some(self.sync_errors(&self.taps_at(mu), &rr) > rx.sync_max_errors)
+    }
+
     pub(crate) fn decode_at(
         &self,
         r: &[Complex32],
@@ -1221,57 +1384,37 @@ impl Modem {
         let n_ref = self.ref_bits.len();
         // the body starts after the preamble, the sync word and (v1) the header symbols
         let body_start = n_ref + self.header_syms();
-        let max_bits = match rx.expected_len {
-            Some(n) => self.body_len_bits(n, self.cfg.code),
-            None => self.body_len_bits(self.longest_len(rx), self.longest_code(rx)),
-        };
-        let want_syms = body_start + max_bits / bps;
         let avail = r.len() - tau;
         let end_needed = |nsym: usize| self.waveform_len(nsym);
-        let usable_syms = (n_ref..=want_syms)
-            .rev()
-            .find(|&s| end_needed(s) <= avail)
-            .unwrap_or(0);
-        if usable_syms < body_start + 16 / bps {
-            return Err(Reject::TooShort {
-                need: end_needed(body_start + 16 / bps),
-            });
-        }
-        // derotate and normalize the part we use: W0 all of it now; v1 up to the end of the header
-        // now, and the body once the header has given its length and code
+        let usable_syms = self.usable_syms(avail, rx)?;
+        // derotate and normalize the part we use: W0 all of it; v1 up to the end of the header,
+        // and the body once the header has given its length and code. First only the preamble and
+        // sync word: the rest is derotated only for a candidate whose sync word passes.
         let take = end_needed(match self.cfg.frame {
             FrameFormat::W0 => usable_syms,
             FrameFormat::V1 => body_start,
         });
-        let derotate = |omega: f64, psi: f64, amp: f64, take: usize| -> Vec<Complex32> {
-            (0..take)
-                .map(|n| {
-                    let (s, co) = (-(psi + omega * n as f64)).sin_cos();
-                    r[tau + n] * Complex32::new((co / amp) as f32, (s / amp) as f32)
-                })
-                .collect()
+        let derotate = |omega: f64, psi: f64, amp: f64, from: usize, to: usize| {
+            derotate_normalize(r, tau, omega, psi, amp, from, to)
         };
-        let mut rr = derotate(omega, psi, amp, take);
+        let sync_take = if check_sync_first() {
+            end_needed(n_ref).min(take)
+        } else {
+            take
+        };
+        let mut rr = derotate(omega, psi, amp, 0, sync_take);
         let tracking =
             rx.phase_track > 0.0 && rx.refine_phase && self.cfg.modulation != Modulation::Fsk2;
         let q_track = track::rate_noise(rx.phase_track as f64);
-        let taps = if self.cfg.modulation == Modulation::Fsk2 {
-            Vec::new()
-        } else {
-            rrc_shifted(sps, self.cfg.rrc_span, self.cfg.rolloff as f64, mu)
-        };
-        // sync word: symbols n_ref-16 .. n_ref, one bit each
-        let mut sync_errors = 0;
-        let want_sync = &self.ref_bits[PREAMBLE_LEN..];
-        let dem = SymbolDemod::new(self, &taps, &rr);
-        for (i, &want) in want_sync.iter().enumerate() {
-            if dem.one_bit_symbol(PREAMBLE_LEN + i) != want {
-                sync_errors += 1;
-            }
-        }
+        let taps = self.taps_at(mu);
+        let sync_errors = self.sync_errors(&taps, &rr);
         if sync_errors > rx.sync_max_errors {
             return Err(Reject::Sync);
         }
+        if rr.len() < take {
+            rr.extend(derotate(omega, psi, amp, rr.len(), take));
+        }
+        let dem = SymbolDemod::new(self, &taps, &rr);
 
         // 3. body. The length comes first: W0 reads its 16 header bits, v1 decodes the header
         // symbols. With `expected_len` the length is given and a header is not checked (v1 still
@@ -1338,7 +1481,7 @@ impl Modem {
             });
         }
         if self.cfg.frame == FrameFormat::V1 {
-            rr = derotate(omega, psi, amp, end_needed(total_syms));
+            rr = derotate(omega, psi, amp, 0, end_needed(total_syms));
         }
         let dem = SymbolDemod::new(self, &taps, &rr);
         z.clear();
