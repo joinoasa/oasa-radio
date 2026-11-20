@@ -10,8 +10,8 @@ publish = false
 
 [workspace]
 members = [".", "firmware/modem-core", "waveform"]
-# The firmware has its own toolchain (Xtensa) and lock file.
-exclude = ["firmware/heltec-v3"]
+# Each firmware crate has its own target, toolchain and lock file.
+exclude = ["firmware/heltec-v3", "firmware/rak4631"]
 
 [dependencies]
 oasa-modem-core = { version = "0.1.0", path = "firmware/modem-core" }

@@ -1,8 +1,8 @@
 //! OASA LoRa modem core (tech tree node R-COM1, LoRa side).
 //!
 //! Everything here is `no_std` and has no hardware in it, so `cargo test`
-//! checks the logic on a PC. The firmware crate (`firmware/heltec-v3`) adds
-//! pins, the clock and the USB serial port.
+//! checks the logic on a PC. The board crates (`firmware/heltec-v3`,
+//! `firmware/rak4631`) add pins, the clock and the serial port.
 //!
 //! The modem never encrypts and never reads a payload. It carries the bytes
 //! oasa-link already encrypted: one framed serial packet becomes one LoRa
@@ -16,6 +16,7 @@
 //! - `queue`: the fixed TX queue.
 //! - `modem`: the engine that ties them together.
 //! - `sx126x`: the SX1262 driver.
+//! - `board`: small helpers the board crates share.
 //! - `voice`: voice timing (transmit scheduler, playout buffer).
 //! - `sim` (feature `sim`): a simulated radio and air for tests.
 
@@ -25,6 +26,7 @@
 #[cfg(any(test, feature = "sim"))]
 extern crate std;
 
+pub mod board;
 pub mod cobs;
 pub mod control;
 pub mod crc;

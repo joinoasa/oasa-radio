@@ -80,6 +80,19 @@ pub const HELTEC_V3: Config = Config {
     rx_boost: true,
 };
 
+/// The RAK4631 (RAK4630 module): TCXO on DIO3, antenna switch on DIO2,
+/// DC-DC. TCXO voltage 3.0 V (code 0x06). RAK's SX126x-Arduino library and
+/// Zephyr's `rak4630.dtsi` ask for 3.3 V, but the SX1262 datasheet wants the
+/// supply at least 200 mV above the TCXO setting and the module runs the chip
+/// from 3.3 V, so 3.0 V is the highest setting inside that rule. Meshtastic's
+/// `rak4631` variant uses 1.8 V. Not checked on a board.
+pub const RAK4631: Config = Config {
+    tcxo_code: Some(0x06),
+    dcdc: true,
+    dio2_rf_switch: true,
+    rx_boost: true,
+};
+
 /// Polls of BUSY (10 us apart) before giving up: 200 ms.
 const BUSY_POLLS: u32 = 20_000;
 
@@ -568,6 +581,26 @@ mod tests {
         );
         assert!(c.log.iter().any(|w| w == &[0x89, 0x7F]), "calibrate all");
         // The TCXO is set before the calibration that depends on it.
+        let ops = c.ops();
+        let tcxo = ops.iter().position(|&o| o == 0x97).unwrap();
+        let cal = ops.iter().position(|&o| o == 0x89).unwrap();
+        assert!(tcxo < cal);
+    }
+
+    #[test]
+    fn init_sets_up_the_rak4631() {
+        let mut d = Sx126x::new(Chip::new(), Pin(true), Pin(true), Busy(0), NoDelay, RAK4631);
+        d.init().unwrap();
+        let c = d.bus();
+        assert!(c.log.iter().any(|w| w == &[0x96, 0x01]), "DC-DC");
+        assert!(
+            c.log.iter().any(|w| w == &[0x9D, 0x01]),
+            "DIO2 antenna switch"
+        );
+        assert!(
+            c.log.iter().any(|w| w == &[0x97, 0x06, 0x00, 0x02, 0x80]),
+            "TCXO 3.0 V, 10 ms"
+        );
         let ops = c.ops();
         let tcxo = ops.iter().position(|&o| o == 0x97).unwrap();
         let cal = ops.iter().position(|&o| o == 0x89).unwrap();

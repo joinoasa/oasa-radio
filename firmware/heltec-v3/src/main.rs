@@ -33,6 +33,7 @@ use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::{Config as UartConfig, Uart, UartTx};
+use oasa_modem_core::board::OutFrame;
 use oasa_modem_core::modem::{FrameSink, Info, Modem};
 use oasa_modem_core::settings::{Limits, Settings};
 use oasa_modem_core::sx126x::{self, Sx126x};
@@ -50,33 +51,21 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 const BAUD: u32 = 115_200;
 /// Packets that may wait for the radio.
 const TX_QUEUE: usize = 8;
-/// Longest frame the engine writes (see `oasa_modem_core::modem`).
-const FRAME_MAX: usize = 300;
 /// Frames waiting for the serial port.
 const OUT_FRAMES: usize = 6;
 const BOARD: &str = "heltec-wifi-lora-32-v3";
 
-struct WireFrame {
-    len: usize,
-    buf: [u8; FRAME_MAX],
-}
-
-static OUT: Channel<CriticalSectionRawMutex, WireFrame, OUT_FRAMES> = Channel::new();
+static OUT: Channel<CriticalSectionRawMutex, OutFrame, OUT_FRAMES> = Channel::new();
 
 /// Hands frames from the engine to the serial writer task.
 struct ChannelSink;
 
 impl FrameSink for ChannelSink {
     fn frame(&mut self, wire: &[u8]) -> bool {
-        if wire.len() > FRAME_MAX {
-            return false;
+        match OutFrame::new(wire) {
+            Some(f) => OUT.try_send(f).is_ok(),
+            None => false,
         }
-        let mut f = WireFrame {
-            len: wire.len(),
-            buf: [0; FRAME_MAX],
-        };
-        f.buf[..wire.len()].copy_from_slice(wire);
-        OUT.try_send(f).is_ok()
     }
 }
 
@@ -86,7 +75,7 @@ impl FrameSink for ChannelSink {
 async fn serial_writer(mut tx: UartTx<'static, Async>) {
     loop {
         let f = OUT.receive().await;
-        let mut rest = &f.buf[..f.len];
+        let mut rest = f.bytes();
         while !rest.is_empty() {
             match tx.write_async(rest).await {
                 Ok(n) => rest = &rest[n..],
@@ -96,21 +85,7 @@ async fn serial_writer(mut tx: UartTx<'static, Async>) {
     }
 }
 
-const fn version_part(s: &str) -> u8 {
-    let b = s.as_bytes();
-    let (mut i, mut n) = (0, 0u32);
-    while i < b.len() {
-        n = n * 10 + (b[i] - b'0') as u32;
-        i += 1;
-    }
-    if n > 255 { 255 } else { n as u8 }
-}
-
-const FW: [u8; 3] = [
-    version_part(env!("CARGO_PKG_VERSION_MAJOR")),
-    version_part(env!("CARGO_PKG_VERSION_MINOR")),
-    version_part(env!("CARGO_PKG_VERSION_PATCH")),
-];
+const FW: [u8; 3] = oasa_modem_core::fw_version!();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
