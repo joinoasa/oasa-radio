@@ -16,6 +16,7 @@ docs = [
   "docs/frame-v1.md",
   "docs/security-review-r-com1.md",
   "docs/phone-radio-board-requirements.md",
+  "docs/voice-timing.md",
   "firmware/heltec-v3/README.md",
   "firmware/rak4631/README.md",
   "firmware/rak4631-usbnet/README.md",

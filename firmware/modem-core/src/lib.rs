@@ -17,6 +17,7 @@
 //! - `modem`: the engine that ties them together.
 //! - `sx126x`: the SX1262 driver.
 //! - `board`: small helpers the board crates share.
+//! - `voice`: voice timing (transmit scheduler, playout buffer).
 //! - `sim` (feature `sim`): a simulated radio and air for tests.
 
 #![no_std]
@@ -35,6 +36,7 @@ pub mod queue;
 pub mod settings;
 pub mod stats;
 pub mod sx126x;
+pub mod voice;
 
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
