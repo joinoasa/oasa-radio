@@ -1,0 +1,42 @@
+# Dependency gates for the firmware. Same rules as the repo's deny.toml, plus
+# the exceptions below. They need the owner's approval (see the header of
+# ../../deny.toml) and a software register entry.
+#
+# Run: cargo deny --locked --target thumbv7em-none-eabihf check
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # bare-metal is a dependency of cortex-m 0.7, which every Cortex-M crate
+    # uses (embassy-nrf, embassy-executor). Deprecated, not a vulnerability;
+    # no cortex-m release without it exists yet.
+    { id = "RUSTSEC-2026-0110", reason = "deprecated dependency of cortex-m 0.7; not a vulnerability" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    # nrf-pac (embassy-nrf's register definitions), generated from Nordic's
+    # SVD files. Also allowed in oasa-sec's deny.toml.
+    "BSD-3-Clause",
+    # unicode-ident (a proc-macro dependency), "(MIT OR Apache-2.0) AND Unicode-3.0".
+    # Same exception as firmware/heltec-v3.
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

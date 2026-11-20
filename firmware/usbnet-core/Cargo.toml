@@ -1,0 +1,11 @@
+[package]
+name = "oasa-usbnet-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "OASA USB network adapter test logic: CDC-NCM setup requests, a one-client DHCP server and one test page. no_std, tested on the host."
+repository = "https://github.com/joinoasa/oasa-radio"
+publish = false
+
+[dependencies]

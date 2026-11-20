@@ -81,6 +81,13 @@ impl Limits {
         freq_max_hz: 928_000_000,
         ..Limits::SX1262
     };
+    /// The RAK4631(H) (RAK4630 module, 863 to 928 MHz plans EU868 to AS923).
+    /// RAK lists 22 dBm as the most it puts out, the same as the chip.
+    pub const RAK4631: Limits = Limits {
+        freq_min_hz: 863_000_000,
+        freq_max_hz: 928_000_000,
+        ..Limits::SX1262
+    };
 }
 
 /// Setting keys on the control channel.
@@ -283,6 +290,23 @@ mod tests {
         assert_eq!(s.bw.hz(), 125_000);
         assert!((0..=2).contains(&s.tx_power_dbm));
         assert!(!s.air_mode);
+    }
+
+    #[test]
+    fn rak4631_limits_stay_within_the_chip() {
+        let r = Limits::RAK4631;
+        let c = Limits::SX1262;
+        assert_eq!((r.power_min_dbm, r.power_max_dbm), (-9, 22));
+        assert!(r.power_max_dbm <= c.power_max_dbm);
+        assert!(r.power_max_dbm <= Limits::HELTEC_V3.power_max_dbm);
+        assert!(r.freq_min_hz >= c.freq_min_hz && r.freq_max_hz <= c.freq_max_hz);
+        let mut s = Settings::LAB_SF7_BW125;
+        assert_eq!(s.validate(&r), Ok(()));
+        s.tx_power_dbm = 23;
+        assert_eq!(s.validate(&r), Err(key::POWER));
+        s = Settings::LAB_SF7_BW125;
+        s.freq_hz = 433_000_000;
+        assert_eq!(s.validate(&r), Err(key::FREQ));
     }
 
     #[test]

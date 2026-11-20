@@ -77,8 +77,8 @@ pub struct Info {
 
 /// How long to wait before restarting a failed radio.
 pub const RETRY_MS: u32 = 1000;
-/// Scratch for one outgoing wire frame.
-const WIRE: usize = 300;
+/// Longest frame the engine writes to a [`FrameSink`].
+pub const MAX_OUT_FRAME: usize = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -102,7 +102,7 @@ struct Core<R, const Q: usize> {
     flash_until: Option<u32>,
     tx_buf: [u8; MAX_LORA_PAYLOAD],
     rx_buf: [u8; MAX_LORA_PAYLOAD],
-    wire: [u8; WIRE],
+    wire: [u8; MAX_OUT_FRAME],
 }
 
 /// The engine. `Q` is the TX queue length.
@@ -127,7 +127,7 @@ impl<R: RadioDriver, const Q: usize> Modem<R, Q> {
                 flash_until: None,
                 tx_buf: [0; MAX_LORA_PAYLOAD],
                 rx_buf: [0; MAX_LORA_PAYLOAD],
-                wire: [0; WIRE],
+                wire: [0; MAX_OUT_FRAME],
             },
         }
     }
