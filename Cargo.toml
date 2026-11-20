@@ -16,7 +16,7 @@ exclude = ["firmware/heltec-v3"]
 [dependencies]
 oasa-modem-core = { version = "0.1.0", path = "firmware/modem-core" }
 oasa-waveform = { version = "0.1.0", path = "waveform" }
-nix = { version = "0.31", default-features = false, features = ["term", "poll", "fs"] }
+nix = { version = "0.32", default-features = false, features = ["term", "poll", "fs"] }
 
 [dev-dependencies]
 oasa-modem-core = { version = "0.1.0", path = "firmware/modem-core", features = ["sim"] }
