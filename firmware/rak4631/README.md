@@ -102,7 +102,7 @@ Sources:
 | P1.07 (also on the switch) | Not touched | RAK-DS, MESH ("should not be initialized") | Sources agree |
 | RF switch direction | SX1262 DIO2 | RAK-DS, RAK-LIB, MESH, ZEPHYR (`dio2-tx-enable`) | Sources agree |
 | SX1262 reference | TCXO powered from DIO3 | RAK-DS, RAK-LIB, MESH, ZEPHYR | Sources agree |
-| TCXO voltage | **3.3 V** (code 0x07), 10 ms start-up | RAK-LIB (default `TCXO_CTRL_3_3V`, not changed for the RAK4630), ZEPHYR (`SX126X_DIO3_TCXO_3V3`). MESH uses 1.8 V. RAK-DS gives no value | **Unconfirmed: sources disagree.** Both values are in wide use on this board |
+| TCXO voltage | **3.0 V** (code 0x06), 10 ms start-up | SEMTECH: the supply must be at least 200 mV above the TCXO setting, and the module runs the chip from 3.3 V, so 3.0 V is the highest setting inside the rule. RAK-LIB (default `TCXO_CTRL_3_3V`) and ZEPHYR (`SX126X_DIO3_TCXO_3V3`) ask for 3.3 V; MESH uses 1.8 V. RAK-DS gives no value | **Unconfirmed: sources disagree,** and the TCXO part's own rating is not known |
 | TCXO frequency | 32 MHz | SEMTECH (the chip's PLL needs a 32 MHz reference). RAK-DS does not state it | Not stated by RAK |
 | SX1262 regulator | DC-DC | RAK-DS, RAK-LIB (`USE_LDO = false`), MESH | Sources agree |
 | nRF52840 32 MHz crystal (HFXO) | Used (USB needs it) | Implied: the stock bootloader runs USB, which needs the HFXO. Not stated in RAK-DS | Inferred |
@@ -145,7 +145,7 @@ All of it. First-flash risks first:
 1. Hand-off from the bootloader: start address 0x26000, VTOR, RAM from 0x20008000, and the state the bootloader leaves USB and the clocks in. If wrong, no serial port appears; double reset recovers.
 2. USB enumeration (VBUS detect, CDC-ACM), the DTR rule for frames to the host, and old frames after a reopen.
 3. HFXO start: if the 32 MHz crystal did not start, the firmware would hang before USB.
-4. TCXO voltage (3.3 V chosen; Meshtastic uses 1.8 V). If wrong, the radio fails to start and the LED blinks fast.
+4. TCXO voltage (3.0 V chosen; RAK's library asks for 3.3 V, Meshtastic uses 1.8 V). If wrong, the radio fails to start and the LED blinks fast.
 5. Antenna switch power on P1.05, and the RF path through DIO2.
 6. Pin map, SPI at 8 MHz, DIO1 interrupt through GPIOTE.
 7. LED colours and polarity.
