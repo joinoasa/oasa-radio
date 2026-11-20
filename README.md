@@ -9,6 +9,7 @@ Tech tree nodes **R-COM1** (basic radio link) and the radio side of **R-COM2**. 
 - Security review (R-COM1, internal): [docs/security-review-r-com1.md](docs/security-review-r-com1.md)
 - SiK radios (setup and the settings check): [docs/sik.md](docs/sik.md)
 - Phone radio board requirements (T-MSG1, on paper): [docs/phone-radio-board-requirements.md](docs/phone-radio-board-requirements.md)
+- Voice timing on the radio (T-MSG1, host tests only): [docs/voice-timing.md](docs/voice-timing.md)
 
 Status: v0 adapters (`udp`, `serial`), tested on Linux with pseudo-terminals. Not yet tried on real radios. Licensed under [Apache-2.0](LICENSE).
 
